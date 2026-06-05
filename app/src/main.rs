@@ -28,14 +28,12 @@
  */
 
 use hpvca::{BitDepth, ChromaFormat, EncodeConfig, PixelLayout};
+use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
-use image::imageops::FilterType;
 
 fn main() {
-    let img = image::open("./assets/abstract_alpha.png")
-        .unwrap()
-        .to_rgba16();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgba16();
     let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
@@ -46,7 +44,7 @@ fn main() {
         PixelLayout::Rgba,
         &EncodeConfig::default()
             .with_bit_depth(BitDepth::Ten)
-            .with_chroma(ChromaFormat::Yuv420),
+            .with_chroma(ChromaFormat::Yuv444),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

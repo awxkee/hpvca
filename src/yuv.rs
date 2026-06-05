@@ -159,7 +159,7 @@ impl Yuv {
     }
 }
 
-/// Q0.13 fixed-point helpers.
+/// Q0.13 fixed-point scale.
 const Q13: i32 = 1 << 13;
 const Q13_HALF: i32 = 1 << 12;
 
@@ -169,36 +169,42 @@ const KG: i32 = (0.7152_f64 * Q13 as f64) as i32; // 5865
 const KB: i32 = (0.0722_f64 * Q13 as f64) as i32; // 592
 
 /// Chroma reciprocal scales in Q0.13.
+/// diff is Q0 (±maxv), so diff * REC_*_Q13 fits in i32 at 12-bit:
+/// 4095 * 5202 = 21_302_490 < 2^25. Safe.
 const REC_CB_Q13: i32 = (Q13 as f64 / 1.8556_f64) as i32; // 4416
 const REC_CR_Q13: i32 = (Q13 as f64 / 1.5748_f64) as i32; // 5202
 
+/// Luma dot product in Q13. Call q13_round() to get a pixel value.
 #[inline(always)]
-fn q13_round(v: i32) -> i32 {
-    (v + Q13_HALF) >> 13
-}
-
-#[inline(always)]
-fn rgb_to_y(r: i32, g: i32, b: i32) -> i32 {
+fn rgb_to_y_q13(r: i32, g: i32, b: i32) -> i32 {
     KR * r + KG * g + KB * b
 }
 
+/// Luma pixel value (Q0, rounded).
 #[inline(always)]
-fn y_q0(r: i32, g: i32, b: i32) -> i32 {
-    (rgb_to_y(r, g, b) + Q13_HALF) >> 13
+fn rgb_to_y(r: i32, g: i32, b: i32) -> i32 {
+    (rgb_to_y_q13(r, g, b) + Q13_HALF) >> 13
 }
 
+/// Cb pixel value (Q0). neutral is the bit-depth midpoint (128 / 512 / 2048).
 #[inline(always)]
-fn rgb_to_cb_q13(r: i32, g: i32, b: i32, neutral_q13: i32) -> i32 {
-    let y = y_q0(r, g, b);
-    neutral_q13 + (((b - y) * REC_CB_Q13 + Q13_HALF) >> 13)
+fn rgb_to_cb(r: i32, g: i32, b: i32, neutral: i32) -> i32 {
+    let y = rgb_to_y(r, g, b);
+    neutral + (((b - y) * REC_CB_Q13 + Q13_HALF) >> 13)
 }
 
+/// Cr pixel value (Q0).
 #[inline(always)]
-fn rgb_to_cr_q13(r: i32, g: i32, b: i32, neutral_q13: i32) -> i32 {
-    let y = y_q0(r, g, b);
-    neutral_q13 + (((r - y) * REC_CR_Q13 + Q13_HALF) >> 13)
+fn rgb_to_cr(r: i32, g: i32, b: i32, neutral: i32) -> i32 {
+    let y = rgb_to_y(r, g, b);
+    neutral + (((r - y) * REC_CR_Q13 + Q13_HALF) >> 13)
 }
 
+/// Convert planar RGB samples to planar YCbCr in the requested chroma format.
+///
+/// For subsampled formats (4:2:0, 4:2:2) the dimensions do NOT need to be
+/// pre-aligned — odd widths and heights are handled via the `chunks_exact`
+/// remainder path exactly as the reference YUV library does.
 pub(crate) fn rgb_to_yuv(
     rgb: &[u16],
     width: u32,
@@ -210,7 +216,6 @@ pub(crate) fn rgb_to_yuv(
     let h = height as usize;
     let maxv = bit_depth.max_val() as i32;
     let neutral = bit_depth.neutral() as i32;
-    let neutral_q13 = neutral << 13;
 
     // ── Monochrome ────────────────────────────────────────────────────────
     if chroma.is_monochrome() {
@@ -221,7 +226,7 @@ pub(crate) fn rgb_to_yuv(
             rgb.chunks_exact(channels)
                 .map(|px| {
                     let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-                    q13_round(rgb_to_y(r, g, b)).clamp(0, maxv) as u16
+                    rgb_to_y(r, g, b).clamp(0, maxv) as u16
                 })
                 .collect()
         };
@@ -238,6 +243,7 @@ pub(crate) fn rgb_to_yuv(
         };
     }
 
+    // ── Plane allocation ──────────────────────────────────────────────────
     let sw = chroma.sub_w();
     let sh = chroma.sub_h();
     let cw = w.div_ceil(sw);
@@ -247,43 +253,39 @@ pub(crate) fn rgb_to_yuv(
     let mut cb_plane = vec![0u16; cw * ch];
     let mut cr_plane = vec![0u16; cw * ch];
 
+    // ── Inner helpers (capture maxv, neutral by value) ────────────────────
+
+    // Write luma for every pixel in one source row.
+    // Write chroma (horizontal average of pixel pairs) when cb/cr are Some.
+    // Handles odd-width rows via chunks_exact remainder — no bounds issues.
     let process_row = |src: &[u16],
                        y_dst: &mut [u16],
                        cb_dst: Option<&mut [u16]>,
-                       cr_dst: Option<&mut [u16]>,
-                       neutral_q13: i32,
-                       maxv: i32| {
+                       cr_dst: Option<&mut [u16]>| {
         // Luma — every pixel.
         for (y_out, px) in y_dst.iter_mut().zip(src.chunks_exact(3)) {
             let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-            *y_out = q13_round(rgb_to_y(r, g, b)).clamp(0, maxv) as u16;
+            *y_out = rgb_to_y(r, g, b).clamp(0, maxv) as u16;
         }
 
-        // Chroma — only when requested (444: every col, 422/420: pairs).
+        // Chroma — only when this row contributes a chroma row.
         if let (Some(cb_out), Some(cr_out)) = (cb_dst, cr_dst) {
             let pairs = src.chunks_exact(6);
-            let remainder = pairs.remainder();
+            let remainder = pairs.remainder(); // 0 or 3 samples (odd width)
 
             for ((cb_out, cr_out), pair) in cb_out.iter_mut().zip(cr_out.iter_mut()).zip(pairs) {
                 let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
                 let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
-                *cb_out = q13_round(
-                    (rgb_to_cb_q13(r0, g0, b0, neutral_q13)
-                        + rgb_to_cb_q13(r1, g1, b1, neutral_q13)
-                        + 1)
-                        >> 1,
-                )
-                .clamp(0, maxv) as u16;
-                *cr_out = q13_round(
-                    (rgb_to_cr_q13(r0, g0, b0, neutral_q13)
-                        + rgb_to_cr_q13(r1, g1, b1, neutral_q13)
-                        + 1)
-                        >> 1,
-                )
-                .clamp(0, maxv) as u16;
+                // Horizontal average of two adjacent pixels (Q0).
+                *cb_out = ((rgb_to_cb(r0, g0, b0, neutral) + rgb_to_cb(r1, g1, b1, neutral) + 1)
+                    >> 1)
+                    .clamp(0, maxv) as u16;
+                *cr_out = ((rgb_to_cr(r0, g0, b0, neutral) + rgb_to_cr(r1, g1, b1, neutral) + 1)
+                    >> 1)
+                    .clamp(0, maxv) as u16;
             }
 
-            // Odd width remainder — single pixel, no horizontal neighbour.
+            // Odd-width trailing pixel: no horizontal neighbour, use as-is.
             if !remainder.is_empty() {
                 let (r, g, b) = (
                     remainder[0] as i32,
@@ -291,16 +293,54 @@ pub(crate) fn rgb_to_yuv(
                     remainder[2] as i32,
                 );
                 if let Some(cb) = cb_out.last_mut() {
-                    *cb = q13_round(rgb_to_cb_q13(r, g, b, neutral_q13)).clamp(0, maxv) as u16;
+                    *cb = rgb_to_cb(r, g, b, neutral).clamp(0, maxv) as u16;
                 }
                 if let Some(cr) = cr_out.last_mut() {
-                    *cr = q13_round(rgb_to_cr_q13(r, g, b, neutral_q13)).clamp(0, maxv) as u16;
+                    *cr = rgb_to_cr(r, g, b, neutral).clamp(0, maxv) as u16;
                 }
             }
         }
     };
 
+    // Blend a second row's horizontal chroma into an already-written chroma
+    // row (vertical average for 4:2:0). Values are Q0 throughout.
+    let blend_chroma_row = |src: &[u16], cb_row: &mut [u16], cr_row: &mut [u16]| {
+        let pairs = src.chunks_exact(6);
+        let remainder = pairs.remainder();
+
+        for ((cb_out, cr_out), pair) in cb_row.iter_mut().zip(cr_row.iter_mut()).zip(pairs) {
+            let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
+            let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
+            let cb1 = ((rgb_to_cb(r0, g0, b0, neutral) + rgb_to_cb(r1, g1, b1, neutral) + 1) >> 1)
+                .clamp(0, maxv);
+            let cr1 = ((rgb_to_cr(r0, g0, b0, neutral) + rgb_to_cr(r1, g1, b1, neutral) + 1) >> 1)
+                .clamp(0, maxv);
+            // Vertical average with row0 value already stored.
+            *cb_out = ((*cb_out as i32 + cb1 + 1) >> 1) as u16;
+            *cr_out = ((*cr_out as i32 + cr1 + 1) >> 1) as u16;
+        }
+
+        // Odd-width remainder.
+        if !remainder.is_empty() {
+            let (r, g, b) = (
+                remainder[0] as i32,
+                remainder[1] as i32,
+                remainder[2] as i32,
+            );
+            if let Some(cb_out) = cb_row.last_mut() {
+                let cb1 = rgb_to_cb(r, g, b, neutral).clamp(0, maxv);
+                *cb_out = ((*cb_out as i32 + cb1 + 1) >> 1) as u16;
+            }
+            if let Some(cr_out) = cr_row.last_mut() {
+                let cr1 = rgb_to_cr(r, g, b, neutral).clamp(0, maxv);
+                *cr_out = ((*cr_out as i32 + cr1 + 1) >> 1) as u16;
+            }
+        }
+    };
+
     match chroma {
+        // ── 4:4:4 ─────────────────────────────────────────────────────────
+        // One chroma sample per luma pixel — no averaging at all.
         ChromaFormat::Yuv444 => {
             for (row, ((y_row, cb_row), cr_row)) in y_plane
                 .chunks_exact_mut(w)
@@ -309,7 +349,6 @@ pub(crate) fn rgb_to_yuv(
                 .enumerate()
             {
                 let src = &rgb[row * w * 3..(row + 1) * w * 3];
-                // 4:4:4: chroma per pixel — zip all three together.
                 for (((y_out, cb_out), cr_out), px) in y_row
                     .iter_mut()
                     .zip(cb_row.iter_mut())
@@ -317,13 +356,15 @@ pub(crate) fn rgb_to_yuv(
                     .zip(src.chunks_exact(3))
                 {
                     let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-                    *y_out = q13_round(rgb_to_y(r, g, b)).clamp(0, maxv) as u16;
-                    *cb_out = q13_round(rgb_to_cb_q13(r, g, b, neutral_q13)).clamp(0, maxv) as u16;
-                    *cr_out = q13_round(rgb_to_cr_q13(r, g, b, neutral_q13)).clamp(0, maxv) as u16;
+                    *y_out = rgb_to_y(r, g, b).clamp(0, maxv) as u16;
+                    *cb_out = rgb_to_cb(r, g, b, neutral).clamp(0, maxv) as u16;
+                    *cr_out = rgb_to_cr(r, g, b, neutral).clamp(0, maxv) as u16;
                 }
             }
         }
 
+        // ── 4:2:2 ─────────────────────────────────────────────────────────
+        // One chroma sample per horizontal pair of luma pixels, full height.
         ChromaFormat::Yuv422 => {
             for (row, ((y_row, cb_row), cr_row)) in y_plane
                 .chunks_exact_mut(w)
@@ -332,89 +373,54 @@ pub(crate) fn rgb_to_yuv(
                 .enumerate()
             {
                 let src = &rgb[row * w * 3..(row + 1) * w * 3];
-                process_row(src, y_row, Some(cb_row), Some(cr_row), neutral_q13, maxv);
+                process_row(src, y_row, Some(cb_row), Some(cr_row));
             }
         }
 
+        // ── 4:2:0 ─────────────────────────────────────────────────────────
+        // One chroma sample per 2×2 luma block.
+        // Process two luma rows at a time → one chroma row.
+        // Handles odd height: the last unpaired row is treated as 4:2:2.
         ChromaFormat::Yuv420 => {
-            let y_chunks = y_plane.chunks_exact_mut(w * 2);
-            let cb_chunks = cb_plane.chunks_exact_mut(cw);
-            let cr_chunks = cr_plane.chunks_exact_mut(cw);
-
             // Full pairs of luma rows.
-            for (chroma_row, ((y_pair, cb_row), cr_row)) in
-                y_chunks.zip(cb_chunks).zip(cr_chunks).enumerate()
-            {
+            let full_pairs = h / 2;
+
+            for chroma_row in 0..full_pairs {
                 let luma_row0 = chroma_row * 2;
                 let luma_row1 = luma_row0 + 1;
+
                 let src0 = &rgb[luma_row0 * w * 3..luma_row1 * w * 3];
                 let src1 = &rgb[luma_row1 * w * 3..(luma_row1 + 1) * w * 3];
 
-                let (y_row0, y_row1) = y_pair.split_at_mut(w);
+                let y_dst = &mut y_plane[luma_row0 * w..(luma_row1 + 1) * w];
+                let (y_row0, y_row1) = y_dst.split_at_mut(w);
+                let cb_row = &mut cb_plane[chroma_row * cw..(chroma_row + 1) * cw];
+                let cr_row = &mut cr_plane[chroma_row * cw..(chroma_row + 1) * cw];
 
-                process_row(src0, y_row0, Some(cb_row), Some(cr_row), neutral_q13, maxv);
+                // Row 0: luma + first chroma estimate (horizontal pair average).
+                process_row(src0, y_row0, Some(cb_row), Some(cr_row));
 
-                process_row(src1, y_row1, None, None, neutral_q13, maxv);
+                // Row 1: luma only.
+                process_row(src1, y_row1, None, None);
 
-                let pairs1 = src1.chunks_exact(6);
-                let remainder1 = pairs1.remainder();
-
-                for ((cb_out, cr_out), pair) in cb_row
-                    .iter_mut()
-                    .zip(cr_row.iter_mut())
-                    .zip(src1.chunks_exact(6))
-                {
-                    let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
-                    let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
-                    let cb1 = q13_round(
-                        (rgb_to_cb_q13(r0, g0, b0, neutral_q13)
-                            + rgb_to_cb_q13(r1, g1, b1, neutral_q13)
-                            + 1)
-                            >> 1,
-                    )
-                    .clamp(0, maxv);
-                    let cr1 = q13_round(
-                        (rgb_to_cr_q13(r0, g0, b0, neutral_q13)
-                            + rgb_to_cr_q13(r1, g1, b1, neutral_q13)
-                            + 1)
-                            >> 1,
-                    )
-                    .clamp(0, maxv);
-                    // Vertical average with row0 estimate already in *cb_out.
-                    *cb_out = ((*cb_out as i32 + cb1 + 1) >> 1) as u16;
-                    *cr_out = ((*cr_out as i32 + cr1 + 1) >> 1) as u16;
-                }
-
-                // Odd width remainder for row1.
-                if !remainder1.is_empty() {
-                    let (r, g, b) = (
-                        remainder1[0] as i32,
-                        remainder1[1] as i32,
-                        remainder1[2] as i32,
-                    );
-                    if let Some(cb_out) = cb_row.last_mut() {
-                        let cb1 = q13_round(rgb_to_cb_q13(r, g, b, neutral_q13)).clamp(0, maxv);
-                        *cb_out = ((*cb_out as i32 + cb1 + 1) >> 1) as u16;
-                    }
-                    if let Some(cr_out) = cr_row.last_mut() {
-                        let cr1 = q13_round(rgb_to_cr_q13(r, g, b, neutral_q13)).clamp(0, maxv);
-                        *cr_out = ((*cr_out as i32 + cr1 + 1) >> 1) as u16;
-                    }
-                }
+                // Vertically blend row1's chroma into the row0 estimate.
+                blend_chroma_row(src1, cb_row, cr_row);
             }
 
-            // Odd height remainder — single luma row, treat like 4:2:2.
+            // Odd height: single trailing luma row with no vertical neighbour.
+            // Treat as 4:2:2 — horizontal pair average only.
             if h & 1 != 0 {
-                let last_luma_row = h - 1;
-                let src = &rgb[last_luma_row * w * 3..(last_luma_row + 1) * w * 3];
-                let y_row = &mut y_plane[last_luma_row * w..last_luma_row * w + w];
-                let cb_row = &mut cb_plane[(ch - 1) * cw..];
-                let cr_row = &mut cr_plane[(ch - 1) * cw..];
-                process_row(src, y_row, Some(cb_row), Some(cr_row), neutral_q13, maxv);
+                let last_row = h - 1;
+                let last_chroma = ch - 1;
+                let src = &rgb[last_row * w * 3..(last_row + 1) * w * 3];
+                let y_row = &mut y_plane[last_row * w..last_row * w + w];
+                let cb_row = &mut cb_plane[last_chroma * cw..last_chroma * cw + cw];
+                let cr_row = &mut cr_plane[last_chroma * cw..last_chroma * cw + cw];
+                process_row(src, y_row, Some(cb_row), Some(cr_row));
             }
         }
 
-        ChromaFormat::Monochrome => unreachable!(),
+        ChromaFormat::Monochrome => unreachable!("handled above"),
     }
 
     Yuv {
