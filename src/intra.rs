@@ -51,7 +51,33 @@ pub fn predict_planar(above: &[u8], left: &[u8], n: usize) -> Vec<u8> {
     pred
 }
 
-/// Apply the HEVC intra reference smoothing filter ([1 2 1]/4) per §8.4.4.2.3.
+/// Rectangular PLANAR prediction for a `w`×`h` block (HEVC §8.4.4.2.4 generalised
+/// to non-square blocks, as used for 4:2:2 chroma where the block is 4 wide × 8
+/// tall). `above` has length ≥ w+1 (above[0..w] plus top-right at above[w]); `left`
+/// has length ≥ h+1 (left[0..h] plus bottom-left at left[h]). Returns row-major w*h.
+pub fn predict_planar_rect(above: &[u8], left: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut pred = vec![0u8; w * h];
+    let top_right = above[w] as i32;
+    let bottom_left = left[h] as i32;
+    // HEVC planar: predSamples[x][y] =
+    //   ( (W-1-x)*p[-1][y] + (x+1)*p[W][-1] + (H-1-y)*p[x][-1] + (y+1)*p[-1][H]
+    //     + W (when... ) ) — the standard uses normalisation by (W*H) with shift.
+    // For W,H powers of two we use: (h_term*H + v_term*W ...) Simpler: use the
+    // separable form with rounding by (w*h):
+    let wh = (w * h) as i32;
+    let shift = (w * h).trailing_zeros(); // log2(w*h)
+    for y in 0..h {
+        for x in 0..w {
+            let horiz = (w as i32 - 1 - x as i32) * left[y] as i32 + (x as i32 + 1) * top_right;
+            let vert = (h as i32 - 1 - y as i32) * above[x] as i32 + (y as i32 + 1) * bottom_left;
+            // predV scaled by W, predH scaled by H → combine and normalise by 2*W*H.
+            let val = (horiz * h as i32 + vert * w as i32 + wh) >> (shift + 1);
+            pred[y * w + x] = val as u8;
+        }
+    }
+    pred
+}
+
 ///
 /// Inputs use the layout: `corner` = above-left sample, `above[0..=n]` =
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
@@ -176,6 +202,133 @@ fn is_available(
 /// `ctu` is the CTU size in this plane and `ctus_x` the CTUs per row; together
 /// with the block size `n` these drive the decode-order availability test so the
 /// encoder never references a neighbour the decoder has not yet reconstructed.
+/// Public wrapper exposing luma decode order for chroma availability mapping.
+pub fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
+    decode_order(r, c, 8, 64, ctus_x)
+}
+
+/// Reference samples for a chroma N×N block, with availability computed in LUMA
+/// space. Chroma TBs are decoded in lockstep with their co-located luma CU, so a
+/// chroma neighbour is available iff the luma block covering the corresponding luma
+/// position was decoded before the current luma CU. This is correct for both 4:2:0
+/// (sub_h = 2) and 4:2:2 (sub_h = 1), where the chroma CTB is non-square and a plain
+/// chroma Morton scan would be wrong.
+///
+/// `sub_w`/`sub_h` are the subsampling factors; `luma_w`/`luma_h` the luma picture
+/// dimensions; `luma_ctus_x` the luma CTUs per row.
+#[allow(clippy::too_many_arguments)]
+pub fn get_reference_samples_chroma(
+    plane: &[u8],
+    stride: usize,
+    block_row: usize,
+    block_col: usize,
+    chroma_h: usize,
+    n: usize,
+    sub_w: usize,
+    sub_h: usize,
+    luma_w: usize,
+    luma_h: usize,
+    luma_ctus_x: usize,
+    cur_luma_row: usize,
+    cur_luma_col: usize,
+) -> (u8, Vec<u8>, Vec<u8>) {
+    let width = stride;
+    let ext = 2 * n;
+    let mut above = vec![0u8; ext + 1];
+    let mut left = vec![0u8; ext + 1];
+    let mut avail_above = vec![false; ext + 1];
+    let mut avail_left = vec![false; ext + 1];
+    let mut corner = 0u8;
+    let mut avail_corner = false;
+
+    let cur_luma = luma_decode_order(cur_luma_row, cur_luma_col, luma_ctus_x);
+    let avail = |nr: i64, nc: i64, block_row: usize| -> bool {
+        if nr < 0 || nc < 0 || nr as usize >= chroma_h || nc as usize >= width {
+            return false;
+        }
+        let lr = (nr as usize) * sub_h;
+        let lc = (nc as usize) * sub_w;
+        if lr >= luma_h || lc >= luma_w {
+            return false;
+        }
+        let nb_luma = luma_decode_order(lr, lc, luma_ctus_x);
+        if nb_luma < cur_luma {
+            return true;
+        }
+        nb_luma == cur_luma && (nr as usize) < block_row
+    };
+
+    {
+        let nr = block_row as i64 - 1;
+        let nc = block_col as i64 - 1;
+        if avail(nr, nc, block_row) {
+            corner = plane[(nr as usize) * stride + nc as usize];
+            avail_corner = true;
+        }
+    }
+    {
+        let nr = block_row as i64 - 1;
+        for i in 0..=ext {
+            let nc = block_col as i64 + i as i64;
+            if avail(nr, nc, block_row) {
+                above[i] = plane[(nr as usize) * stride + nc as usize];
+                avail_above[i] = true;
+            }
+        }
+    }
+    {
+        let nc = block_col as i64 - 1;
+        for i in 0..=ext {
+            let nr = block_row as i64 + i as i64;
+            if avail(nr, nc, block_row) {
+                left[i] = plane[(nr as usize) * stride + nc as usize];
+                avail_left[i] = true;
+            }
+        }
+    }
+
+    let any = avail_corner || avail_above.iter().any(|&a| a) || avail_left.iter().any(|&a| a);
+    if !any {
+        return (128, vec![128; ext + 1], vec![128; ext + 1]);
+    }
+
+    // Same substitution scan as the luma path.
+    let total = (ext + 1) + 1 + (ext + 1);
+    let mut vals = vec![0u8; total];
+    let mut av = vec![false; total];
+    for i in 0..=ext {
+        vals[i] = left[ext - i];
+        av[i] = avail_left[ext - i];
+    }
+    vals[ext + 1] = corner;
+    av[ext + 1] = avail_corner;
+    for i in 0..=ext {
+        vals[(ext + 2) + i] = above[i];
+        av[(ext + 2) + i] = avail_above[i];
+    }
+    let first = av.iter().position(|&a| a).unwrap();
+    let firstval = vals[first];
+    for k in 0..first {
+        vals[k] = firstval;
+        av[k] = true;
+    }
+    for k in 1..total {
+        if !av[k] {
+            vals[k] = vals[k - 1];
+            av[k] = true;
+        }
+    }
+    for i in 0..=ext {
+        left[ext - i] = vals[i];
+    }
+    corner = vals[ext + 1];
+    for i in 0..=ext {
+        above[i] = vals[(ext + 2) + i];
+    }
+
+    (corner, above, left)
+}
+
 pub fn get_reference_samples(
     plane: &[u8],
     stride: usize,

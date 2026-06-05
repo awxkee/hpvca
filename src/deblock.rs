@@ -67,6 +67,13 @@ pub fn deblock(
     }
 }
 
+/// Luma-only deblocking, for monochrome (4:0:0) pictures that have no chroma.
+pub fn deblock_luma_only(y: &mut [u8], w: usize, h: usize, qp: u8) {
+    for &vertical in &[true, false] {
+        deblock_luma(y, w, h, qp, vertical);
+    }
+}
+
 /// Luma deblocking for all edges of one orientation on the 8-sample grid.
 fn deblock_luma(y: &mut [u8], w: usize, h: usize, qp: u8, vertical: bool) {
     let q_qp = qp as i32;

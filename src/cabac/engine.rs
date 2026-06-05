@@ -62,7 +62,7 @@ pub struct CtxModel {
 impl CtxModel {
     /// Initialise from HEVC spec §9.3.2.2.
     pub fn init(init_value: u8, qp: u8) -> Self {
-        // HEVC §9.3.2.2 context initialization.
+        // HEVC §9.3.2.2 context initialisation.
         let slope_idx = (init_value >> 4) as i32;
         let offset_idx = (init_value & 0x0F) as i32;
         let m = slope_idx * 5 - 45;
