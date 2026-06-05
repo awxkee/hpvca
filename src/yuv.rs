@@ -13,12 +13,21 @@
 use crate::fmt::{BitDepth, ChromaFormat};
 
 /// Planar YCbCr image. Samples are u16 (valid range depends on bit depth).
+///
+/// `width`/`height` are the *coded/conformance* dimensions the planes are stored at
+/// — rounded up to the chroma subsampling grid so chroma planes are well-defined.
+/// `display_w`/`display_h` are the *true visible* dimensions (which may be odd); the
+/// HEIF `ispe` box reports these so the decoder shows exactly the original size even
+/// when the coded picture is one pixel larger. They equal `width`/`height` unless the
+/// source had odd dimensions under a subsampled chroma format.
 pub struct Yuv {
     pub y: Vec<u16>,
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
     pub width: u32,
     pub height: u32,
+    pub display_w: u32,
+    pub display_h: u32,
     pub chroma: ChromaFormat,
     pub bit_depth: BitDepth,
 }
@@ -62,9 +71,21 @@ impl Yuv {
             cr,
             width,
             height,
+            display_w: width,
+            display_h: height,
             chroma,
             bit_depth,
         })
+    }
+
+    /// Override the visible/display dimensions (reported via the HEIF `ispe` box),
+    /// for sources whose true size is smaller than the coded planes — e.g. an odd
+    /// width/height under a subsampled chroma format. Must be ≤ the coded
+    /// `width`/`height`; otherwise the call is a no-op-safe clamp.
+    pub fn with_display(mut self, display_w: u32, display_h: u32) -> Self {
+        self.display_w = display_w.min(self.width);
+        self.display_h = display_h.min(self.height);
+        self
     }
 
     pub fn luma_stride(&self) -> usize {
@@ -117,6 +138,8 @@ pub fn rgb_to_yuv(
             cr: Vec::new(),
             width,
             height,
+            display_w: width,
+            display_h: height,
             chroma,
             bit_depth,
         };
@@ -165,6 +188,8 @@ pub fn rgb_to_yuv(
         cr: cr_plane,
         width,
         height,
+        display_w: width,
+        display_h: height,
         chroma,
         bit_depth,
     }

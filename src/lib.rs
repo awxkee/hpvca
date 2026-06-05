@@ -21,7 +21,7 @@ pub use yuv::Yuv;
 /// latest source and aren't running a stale checkpoint.
 pub const BUILD_ID: &str = "apple-compat-2026-06-04: 64x64 CTB, IDR_N_LP(20), \
 slice-only mdat, iloc-before-iinf, array_completeness=0, BT.709 full-range, \
-configurable-colr(nclx+ICC), even-dim rounding, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10+12-bit, EncodeConfig-builder, YUV-direct-API";
+configurable-colr(nclx+ICC), true-display-dims-via-ispe, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10+12-bit, EncodeConfig-builder, YUV-direct-API";
 
 /// Encoder configuration. Build with [`EncodeConfig::new`] and the `with_*` methods,
 /// then pass to [`encode`] / [`encode_with_alpha`] / [`encode_yuv`].
@@ -113,12 +113,15 @@ pub fn encode(
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
-    let yuv = if enc_w != width || enc_h != height {
+    let mut yuv = if enc_w != width || enc_h != height {
         let padded = pad_rgb_to_even(rgb, width, height, enc_w, enc_h);
         yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, cfg.bit_depth)
     } else {
         yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, cfg.bit_depth)
     };
+    // The planes are stored at the chroma-even (coded) size, but the image must be
+    // displayed at its true — possibly odd — size. Carry that through to `ispe`.
+    yuv = yuv.with_display(width, height);
     encode_yuv(&yuv, cfg)
 }
 
@@ -134,7 +137,15 @@ pub fn encode_yuv(yuv: &yuv::Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeE
     let enc_w = yuv.width;
     let enc_h = yuv.height;
     let nalu_stream = hevc::encode_intra(yuv, enc_w, enc_h, cfg.quality)?;
-    isobmff::wrap_hevc_image(&nalu_stream, enc_w, enc_h, yuv.bit_depth, &cfg.color)
+    // ispe carries the true visible size (may be odd); the SPS conformance window
+    // crops the coded picture to the chroma-even plane size.
+    isobmff::wrap_hevc_image(
+        &nalu_stream,
+        yuv.display_w,
+        yuv.display_h,
+        yuv.bit_depth,
+        &cfg.color,
+    )
 }
 
 /// Encode native-depth planar RGBA (`u16` per channel) to HEIC with an alpha channel,
@@ -174,11 +185,12 @@ pub fn encode_with_alpha(
         cfg.bit_depth,
     );
     let alpha_stream = hevc::encode_intra(&alpha_yuv, enc_w, enc_h, cfg.quality)?;
+    // ispe reports the true visible size (may be odd); both items share it.
     isobmff::wrap_hevc_image_with_alpha(
         &color_stream,
         &alpha_stream,
-        enc_w,
-        enc_h,
+        width,
+        height,
         cfg.bit_depth,
         &cfg.color,
     )
@@ -338,5 +350,23 @@ mod tests {
         let out = encode_yuv(&yuv, &cfg).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
+    }
+
+    #[test]
+    fn odd_dimensions_reported_in_ispe() {
+        // 281x181 under 4:2:0: planes round up to 282x182, but ispe must report the
+        // true odd size. Find the ispe box and check its width/height fields.
+        let rgb = vec![100u16; 281 * 181 * 3];
+        let cfg = EncodeConfig::new().with_chroma(ChromaFormat::Yuv420);
+        let out = encode(&rgb, 281, 181, &cfg).unwrap();
+        let ispe = out
+            .windows(4)
+            .position(|w| w == b"ispe")
+            .expect("ispe present");
+        // ispe payload: fullbox header (4) then width(4) height(4).
+        let wpos = ispe + 4 + 4;
+        let w = u32::from_be_bytes(out[wpos..wpos + 4].try_into().unwrap());
+        let h = u32::from_be_bytes(out[wpos + 4..wpos + 8].try_into().unwrap());
+        assert_eq!((w, h), (281, 181), "ispe must report the true odd size");
     }
 }
