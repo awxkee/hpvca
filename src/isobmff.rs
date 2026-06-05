@@ -11,23 +11,19 @@
 //!            ipma
 //!   mdat  ← offset stored in iloc is patched after mdat position is known
 
-use crate::{error::EncodeError, hevc::NaluStream};
 use std::io::Write;
+use crate::{error::EncodeError, hevc::NaluStream};
 
-fn w32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_be_bytes());
-}
-fn w16(buf: &mut Vec<u8>, v: u16) {
-    buf.extend_from_slice(&v.to_be_bytes());
-}
+fn w32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_be_bytes()); }
+fn w16(buf: &mut Vec<u8>, v: u16) { buf.extend_from_slice(&v.to_be_bytes()); }
 
 fn write_fullbox(buf: &mut Vec<u8>, cc: &[u8; 4], ver: u8, flags: u32) {
     w32(buf, 0); // size placeholder
     buf.extend_from_slice(cc);
     buf.push(ver);
     buf.push((flags >> 16) as u8);
-    buf.push((flags >> 8) as u8);
-    buf.push(flags as u8);
+    buf.push((flags >>  8) as u8);
+    buf.push( flags        as u8);
 }
 
 fn write_box(buf: &mut Vec<u8>, cc: &[u8; 4]) {
@@ -37,7 +33,200 @@ fn write_box(buf: &mut Vec<u8>, cc: &[u8; 4]) {
 
 fn patch(buf: &mut Vec<u8>, start: usize) {
     let size = (buf.len() - start) as u32;
-    buf[start..start + 4].copy_from_slice(&size.to_be_bytes());
+    buf[start..start+4].copy_from_slice(&size.to_be_bytes());
+}
+
+/// Wrap a color HEVC image plus a monochrome HEVC alpha image into a HEIC file.
+///
+/// The alpha channel is a standalone monochrome (4:0:0) HEVC image item, linked to
+/// the master color item per ISO/IEC 23008-12:
+///   - item 1 = color (primary), item 2 = alpha (auxiliary)
+///   - `iref` box, reference type `auxl`: alpha → color
+///   - the alpha item carries an `auxC` property with the alpha URN
+///   - `ipma` associates {hvcC,ispe,pixi,colr} to color and {hvcC,ispe,pixi,auxC} to alpha
+pub fn wrap_hevc_image_with_alpha(
+    color: &NaluStream,
+    alpha: &NaluStream,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    let color_sample = color.to_length_prefixed_slices();
+    let alpha_sample = alpha.to_length_prefixed_slices();
+    let color_hvcC = build_hvcC(color)?;
+    let alpha_hvcC = build_hvcC(alpha)?;
+
+    const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
+
+    let mut f: Vec<u8> = Vec::new();
+
+    // ── ftyp ────────────────────────────────────────────────────────────────
+    let s = f.len();
+    write_box(&mut f, b"ftyp");
+    f.extend_from_slice(b"heic");
+    w32(&mut f, 0);
+    f.extend_from_slice(b"heic");
+    f.extend_from_slice(b"mif1");
+    f.extend_from_slice(b"miaf");
+    f.extend_from_slice(b"iso8");
+    patch(&mut f, s);
+
+    // ── meta ──────────────────────────────────────────────────────────────────
+    let meta_start = f.len();
+    write_fullbox(&mut f, b"meta", 0, 0);
+
+    // hdlr
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"hdlr", 0, 0);
+        w32(&mut f, 0);
+        f.extend_from_slice(b"pict");
+        w32(&mut f, 0); w32(&mut f, 0); w32(&mut f, 0);
+        f.push(0);
+        patch(&mut f, s);
+    }
+
+    // pitm → primary (color) item is ID 1
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"pitm", 0, 0);
+        w16(&mut f, 1);
+        patch(&mut f, s);
+    }
+
+    // iloc — two items. Offsets patched after mdat is laid out.
+    let color_offset_patch_pos;
+    let alpha_offset_patch_pos;
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iloc", 1, 0);
+        f.push(0x44); // offset_size=4, length_size=4
+        f.push(0x00); // base_offset_size=0, index_size=0
+        w16(&mut f, 2); // item_count = 2
+        // item 1: color
+        w16(&mut f, 1);
+        w16(&mut f, 0); // construction_method
+        w16(&mut f, 0); // data_reference_index
+        w16(&mut f, 1); // extent_count
+        color_offset_patch_pos = f.len();
+        w32(&mut f, 0);
+        w32(&mut f, color_sample.len() as u32);
+        // item 2: alpha
+        w16(&mut f, 2);
+        w16(&mut f, 0);
+        w16(&mut f, 0);
+        w16(&mut f, 1);
+        alpha_offset_patch_pos = f.len();
+        w32(&mut f, 0);
+        w32(&mut f, alpha_sample.len() as u32);
+        patch(&mut f, s);
+    }
+
+    // iinf — two infe entries
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        w16(&mut f, 2); // entry_count
+        for id in [1u16, 2u16] {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, id);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"hvc1");
+            f.push(0); // item_name (empty)
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iref — alpha (2) is auxiliary-for color (1): 'auxl' from_id=2 → to_id=1
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iref", 0, 0);
+        {
+            let sr = f.len();
+            write_box(&mut f, b"auxl");
+            w16(&mut f, 2); // from_item_ID = alpha
+            w16(&mut f, 1); // reference_count
+            w16(&mut f, 1); // to_item_ID = color
+            patch(&mut f, sr);
+        }
+        patch(&mut f, s);
+    }
+
+    // iprp
+    {
+        let s = f.len();
+        write_box(&mut f, b"iprp");
+
+        // ipco — property container. Indices (1-based):
+        //   1 hvcC(color)  2 ispe  3 pixi(3ch)  4 colr
+        //   5 hvcC(alpha)  6 pixi(1ch)  7 auxC
+        {
+            let si = f.len();
+            write_box(&mut f, b"ipco");
+
+            // 1: hvcC (color)
+            { let sh=f.len(); write_box(&mut f, b"hvcC"); f.extend_from_slice(&color_hvcC); patch(&mut f, sh); }
+            // 2: ispe (shared — same extents for color and alpha)
+            { let sh=f.len(); write_fullbox(&mut f, b"ispe", 0, 0); w32(&mut f, width); w32(&mut f, height); patch(&mut f, sh); }
+            // 3: pixi (color, 3 channels)
+            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(3); f.push(8); f.push(8); f.push(8); patch(&mut f, sh); }
+            // 4: colr (color ICC)
+            { let sh=f.len(); write_box(&mut f, b"colr"); f.extend_from_slice(b"prof"); f.extend_from_slice(&crate::icc_profile::SRGB_ICC); patch(&mut f, sh); }
+            // 5: hvcC (alpha)
+            { let sh=f.len(); write_box(&mut f, b"hvcC"); f.extend_from_slice(&alpha_hvcC); patch(&mut f, sh); }
+            // 6: pixi (alpha, 1 channel)
+            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(1); f.push(8); patch(&mut f, sh); }
+            // 7: auxC (alpha auxiliary type)
+            {
+                let sh=f.len();
+                write_fullbox(&mut f, b"auxC", 0, 0);
+                f.extend_from_slice(ALPHA_URN); // aux_type (null-terminated URN)
+                patch(&mut f, sh);
+            }
+            patch(&mut f, si);
+        }
+
+        // ipma — associations for both items
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"ipma", 0, 0);
+            w32(&mut f, 2); // entry_count
+            // color item 1: hvcC(1,essential), ispe(2), pixi(3), colr(4)
+            w16(&mut f, 1);
+            f.push(4);
+            f.push(0x80 | 1);
+            f.push(2);
+            f.push(3);
+            f.push(4);
+            // alpha item 2: hvcC(5,essential), ispe(2), pixi(6), auxC(7)
+            w16(&mut f, 2);
+            f.push(4);
+            f.push(0x80 | 5);
+            f.push(2);
+            f.push(6);
+            f.push(7);
+            patch(&mut f, si);
+        }
+
+        patch(&mut f, s);
+    }
+
+    patch(&mut f, meta_start);
+
+    // ── mdat — both samples concatenated; record each absolute offset ─────────
+    let mdat_start = f.len();
+    write_box(&mut f, b"mdat");
+    let color_abs = f.len() as u32;
+    f.extend_from_slice(&color_sample);
+    let alpha_abs = f.len() as u32;
+    f.extend_from_slice(&alpha_sample);
+    patch(&mut f, mdat_start);
+
+    f[color_offset_patch_pos..color_offset_patch_pos+4].copy_from_slice(&color_abs.to_be_bytes());
+    f[alpha_offset_patch_pos..alpha_offset_patch_pos+4].copy_from_slice(&alpha_abs.to_be_bytes());
+
+    Ok(f)
 }
 
 pub fn wrap_hevc_image(
@@ -46,7 +235,7 @@ pub fn wrap_hevc_image(
     height: u32,
 ) -> Result<Vec<u8>, EncodeError> {
     let hevc_sample = stream.to_length_prefixed_slices();
-    let hvcC_data = build_hvcC(stream)?;
+    let hvcC_data   = build_hvcC(stream)?;
 
     let mut f: Vec<u8> = Vec::new();
 
@@ -54,7 +243,7 @@ pub fn wrap_hevc_image(
     let s = f.len();
     write_box(&mut f, b"ftyp");
     f.extend_from_slice(b"heic"); // major brand
-    w32(&mut f, 0); // minor version
+    w32(&mut f, 0);               // minor version
     f.extend_from_slice(b"heic"); // HEIC still image
     f.extend_from_slice(b"mif1"); // HEIF base
     f.extend_from_slice(b"miaf"); // Multi-Image Application Format (required by Apple Preview)
@@ -69,12 +258,10 @@ pub fn wrap_hevc_image(
     {
         let s = f.len();
         write_fullbox(&mut f, b"hdlr", 0, 0);
-        w32(&mut f, 0); // pre_defined
+        w32(&mut f, 0);               // pre_defined
         f.extend_from_slice(b"pict"); // handler_type
-        w32(&mut f, 0);
-        w32(&mut f, 0);
-        w32(&mut f, 0); // reserved
-        f.push(0); // name (empty)
+        w32(&mut f, 0); w32(&mut f, 0); w32(&mut f, 0); // reserved
+        f.push(0);                    // name (empty)
         patch(&mut f, s);
     }
 
@@ -102,8 +289,8 @@ pub fn wrap_hevc_image(
         w16(&mut f, 0); // data_reference_index
         w16(&mut f, 1); // extent_count
         iloc_offset_patch_pos = f.len();
-        w32(&mut f, 0); // extent_offset — patched later
-        w32(&mut f, hevc_sample.len() as u32); // extent_length
+        w32(&mut f, 0);                           // extent_offset — patched later
+        w32(&mut f, hevc_sample.len() as u32);    // extent_length
         patch(&mut f, s);
     }
 
@@ -115,10 +302,10 @@ pub fn wrap_hevc_image(
         {
             let si = f.len();
             write_fullbox(&mut f, b"infe", 2, 0);
-            w16(&mut f, 1); // item_ID
-            w16(&mut f, 0); // item_protection_index
+            w16(&mut f, 1);               // item_ID
+            w16(&mut f, 0);               // item_protection_index
             f.extend_from_slice(b"hvc1"); // item_type
-            f.push(0); // item_name (empty)
+            f.push(0);                    // item_name (empty)
             patch(&mut f, si);
         }
         patch(&mut f, s);
@@ -154,10 +341,10 @@ pub fn wrap_hevc_image(
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
-                f.push(3); // num_channels = 3
-                f.push(8); // bits_per_channel[0] = 8 (Y)
-                f.push(8); // bits_per_channel[1] = 8 (Cb)
-                f.push(8); // bits_per_channel[2] = 8 (Cr)
+                f.push(3);       // num_channels = 3
+                f.push(8);       // bits_per_channel[0] = 8 (Y)
+                f.push(8);       // bits_per_channel[1] = 8 (Cb)
+                f.push(8);       // bits_per_channel[2] = 8 (Cr)
                 patch(&mut f, sh);
             }
             // prop 4: colr (ICC profile). Apple's ImageIO renders nclx-tagged HEICs
@@ -167,7 +354,7 @@ pub fn wrap_hevc_image(
             {
                 let sh = f.len();
                 write_box(&mut f, b"colr");
-                f.extend_from_slice(b"prof"); // colour_type = ICC profile
+                f.extend_from_slice(b"prof");                       // colour_type = ICC profile
                 f.extend_from_slice(&crate::icc_profile::SRGB_ICC); // the ICC profile bytes
                 patch(&mut f, sh);
             }
@@ -178,13 +365,13 @@ pub fn wrap_hevc_image(
         {
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
-            w32(&mut f, 1); // entry_count
-            w16(&mut f, 1); // item_ID
-            f.push(4); // association_count = 4
-            f.push(0x80 | 1); // essential=1, property_index=1 (hvcC)
-            f.push(2); // essential=0, property_index=2 (ispe)
-            f.push(3); // essential=0, property_index=3 (pixi)
-            f.push(4); // essential=0, property_index=4 (colr)
+            w32(&mut f, 1);          // entry_count
+            w16(&mut f, 1);          // item_ID
+            f.push(4);               // association_count = 4
+            f.push(0x80 | 1);        // essential=1, property_index=1 (hvcC)
+            f.push(2);               // essential=0, property_index=2 (ispe)
+            f.push(3);               // essential=0, property_index=3 (pixi)
+            f.push(4);               // essential=0, property_index=4 (colr)
             patch(&mut f, si);
         }
 
@@ -201,7 +388,7 @@ pub fn wrap_hevc_image(
     patch(&mut f, mdat_start);
 
     // Patch iloc extent_offset with the real absolute file offset
-    f[iloc_offset_patch_pos..iloc_offset_patch_pos + 4]
+    f[iloc_offset_patch_pos..iloc_offset_patch_pos+4]
         .copy_from_slice(&hevc_absolute_offset.to_be_bytes());
 
     Ok(f)
@@ -216,12 +403,12 @@ fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
             32 => vps.push(&nalu.data),
             33 => sps.push(&nalu.data),
             34 => pps.push(&nalu.data),
-            _ => {}
+            _  => {}
         }
     }
 
     let mut r: Vec<u8> = Vec::new();
-    r.push(1); // configurationVersion
+    r.push(1);           // configurationVersion
     // profile_space=0, tier=0, profile_idc=3 (Main Still Picture)
     r.push(0b00_0_00011);
     // profile_compat_flags: flag[1]=Main, flag[2]=Main10, flag[3]=MainSP → 0x70000000
@@ -245,14 +432,12 @@ fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
     };
     r.extend_from_slice(&constraint6);
     r.push(level);
-    r.push(0xF0);
-    r.push(0x00); // min_spatial_segmentation
-    r.push(0xFC); // parallelism type
-    r.push(0xFD); // chroma_format_idc = 1 (4:2:0)
-    r.push(0xF8); // bit_depth_luma_minus8 = 0
-    r.push(0xF8); // bit_depth_chroma_minus8 = 0
-    r.push(0x00);
-    r.push(0x00); // avgFrameRate
+    r.push(0xF0); r.push(0x00); // min_spatial_segmentation
+    r.push(0xFC);        // parallelism type
+    r.push(0xFD);        // chroma_format_idc = 1 (4:2:0)
+    r.push(0xF8);        // bit_depth_luma_minus8 = 0
+    r.push(0xF8);        // bit_depth_chroma_minus8 = 0
+    r.push(0x00); r.push(0x00); // avgFrameRate
     r.push(0b00_001_1_11); // cFR=0, numTL=1, tidNested=1, lengthSizeMinusOne=3 (4 bytes)
 
     let arrays: &[(u8, &Vec<&[u8]>)] = &[(32, &vps), (33, &sps), (34, &pps)];
@@ -261,10 +446,10 @@ fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
         // array_completeness=0 (high bit). libheif uses 0; Apple expects this.
         r.push(nal_type);
         r.push((list.len() >> 8) as u8);
-        r.push(list.len() as u8);
+        r.push( list.len()       as u8);
         for &d in list {
             r.push((d.len() >> 8) as u8);
-            r.push(d.len() as u8);
+            r.push( d.len()       as u8);
             r.extend_from_slice(d);
         }
     }
@@ -277,9 +462,7 @@ mod tests {
     use crate::hevc::NaluStream;
     fn make_test_stream() -> NaluStream {
         use crate::hevc::{build_pps, build_sps, build_vps};
-        NaluStream {
-            nalus: vec![build_vps(16, 16), build_sps(16, 16), build_pps(30)],
-        }
+        NaluStream { nalus: vec![build_vps(16,16, crate::fmt::ChromaFormat::Yuv420), build_sps(16, 16, crate::fmt::ChromaFormat::Yuv420), build_pps(30)] }
     }
     #[test]
     fn ftyp_brand() {
@@ -291,18 +474,9 @@ mod tests {
     fn box_order_ftyp_meta_mdat() {
         let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
         let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
-        assert_eq!(
-            &b[ftyp_size + 4..ftyp_size + 8],
-            b"meta",
-            "meta must follow ftyp"
-        );
-        let meta_size =
-            u32::from_be_bytes(b[ftyp_size..ftyp_size + 4].try_into().unwrap()) as usize;
-        assert_eq!(
-            &b[ftyp_size + meta_size + 4..ftyp_size + meta_size + 8],
-            b"mdat",
-            "mdat must follow meta"
-        );
+        assert_eq!(&b[ftyp_size+4..ftyp_size+8], b"meta", "meta must follow ftyp");
+        let meta_size = u32::from_be_bytes(b[ftyp_size..ftyp_size+4].try_into().unwrap()) as usize;
+        assert_eq!(&b[ftyp_size+meta_size+4..ftyp_size+meta_size+8], b"mdat", "mdat must follow meta");
     }
     #[test]
     fn iloc_offset_points_into_mdat() {
@@ -311,11 +485,8 @@ mod tests {
         let mut pos = 0usize;
         let mut mdat_payload_offset = 0u32;
         while pos + 8 <= b.len() {
-            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
-            if &b[pos + 4..pos + 8] == b"mdat" {
-                mdat_payload_offset = (pos + 8) as u32;
-                break;
-            }
+            let sz = u32::from_be_bytes(b[pos..pos+4].try_into().unwrap()) as usize;
+            if &b[pos+4..pos+8] == b"mdat" { mdat_payload_offset = (pos + 8) as u32; break; }
             pos += sz;
         }
         assert!(mdat_payload_offset > 0, "mdat not found");
@@ -326,34 +497,24 @@ mod tests {
         //               item: item_id(2) + constr_method(2) + data_ref(2) + ext_count(2) = 8
         //               extent_offset is here (4 bytes)
         let offset_pos = iloc_box_pos + 12 + 4 + 8;
-        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos + 4].try_into().unwrap());
-        assert_eq!(
-            extent_offset, mdat_payload_offset,
-            "iloc extent_offset must point to start of mdat payload"
-        );
+        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos+4].try_into().unwrap());
+        assert_eq!(extent_offset, mdat_payload_offset,
+            "iloc extent_offset must point to start of mdat payload");
     }
     #[test]
-    fn ipco_has_pixi_and_colr() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
+    fn alpha_container_structure() {
+        let color = make_test_stream();
+        let alpha = make_test_stream();
+        let b = wrap_hevc_image_with_alpha(&color, &alpha, 16, 16).unwrap();
         let s = b.as_slice();
-        assert!(
-            s.windows(4).any(|w| w == b"pixi"),
-            "pixi box must be present"
-        );
-        // colr (nclx) is REQUIRED by Apple CoreGraphics to build a color space.
-        assert!(
-            s.windows(4).any(|w| w == b"colr"),
-            "colr box must be present"
-        );
-        let colr_pos = s.windows(4).position(|w| w == b"colr").unwrap();
-        assert_eq!(
-            &s[colr_pos + 4..colr_pos + 8],
-            b"prof",
-            "colr must be ICC profile type"
-        );
-        // ipma should have exactly 4 associations (hvcC, ispe, pixi, colr)
+        // Two items, two hvcC, the auxl reference, the auxC property and the URN.
+        assert!(s.windows(4).any(|w| w == b"iref"), "iref box required");
+        assert!(s.windows(4).any(|w| w == b"auxl"), "auxl reference required");
+        assert!(s.windows(4).any(|w| w == b"auxC"), "auxC property required");
+        assert!(s.windows(26).any(|w| w == b"urn:mpeg:hevc:2015:auxid:1"), "alpha URN required");
+        // ipma entry_count must be 2 (color + alpha).
         let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
-        let assoc_count = s[ipma_pos + 14];
-        assert_eq!(assoc_count, 4, "ipma must associate 4 properties");
+        let entry_count = u32::from_be_bytes(s[ipma_pos+8..ipma_pos+12].try_into().unwrap());
+        assert_eq!(entry_count, 2, "ipma must have 2 entries (color + alpha)");
     }
 }

@@ -82,6 +82,9 @@ pub struct PixelFormat {
 
 impl PixelFormat {
     pub fn new(chroma: ChromaFormat) -> Self {
-        PixelFormat { chroma, bit_depth: 8 }
+        PixelFormat {
+            chroma,
+            bit_depth: 8,
+        }
     }
 }
