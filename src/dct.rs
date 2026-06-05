@@ -7,14 +7,14 @@
 /// Luminance quantization matrix (JPEG-derived, quality-scaled).
 /// HEVC allows custom matrices; we embed a sensible default.
 pub const LUMA_QUANT_MATRIX: [[u16; 8]; 8] = [
-    [16, 11, 10, 16, 24, 40, 51, 61],
-    [12, 12, 14, 19, 26, 58, 60, 55],
-    [14, 13, 16, 24, 40, 57, 69, 56],
-    [14, 17, 22, 29, 51, 87, 80, 62],
-    [18, 22, 37, 56, 68, 109, 103, 77],
-    [24, 35, 55, 64, 81, 104, 113, 92],
+    [16, 11, 10, 16,  24,  40,  51,  61],
+    [12, 12, 14, 19,  26,  58,  60,  55],
+    [14, 13, 16, 24,  40,  57,  69,  56],
+    [14, 17, 22, 29,  51,  87,  80,  62],
+    [18, 22, 37, 56,  68, 109, 103,  77],
+    [24, 35, 55, 64,  81, 104, 113,  92],
     [49, 64, 78, 87, 103, 121, 120, 101],
-    [72, 92, 95, 98, 112, 100, 103, 99],
+    [72, 92, 95, 98, 112, 100, 103,  99],
 ];
 
 /// Chrominance quantization matrix.
@@ -49,7 +49,7 @@ pub fn scaled_quant_matrix(base: &[[u16; 8]; 8], quality: u8) -> [[u16; 8]; 8] {
 fn dct1d(data: &mut [f32; 8]) {
     // AAN algorithm (Arai, Agui, Nakajima)
     const A1: f32 = 0.707_106_78; // cos(π/4)
-    const A2: f32 = 0.541_196_1; // cos(3π/8) - cos(π/8) … (approx)
+    const A2: f32 = 0.541_196_1;  // cos(3π/8) - cos(π/8) … (approx)
     const A3: f32 = 0.707_106_78;
     const A4: f32 = 1.306_562_96; // cos(π/8) + cos(3π/8)
     const A5: f32 = 0.382_683_43; // cos(3π/8)
@@ -87,7 +87,7 @@ fn dct1d(data: &mut [f32; 8]) {
 
     data[5] = t7 + t18 - t17;
     data[3] = t7 - t18 + t16;
-    data[1] = t7 + t18 + t17 - t16; // simplified chain
+    data[1] = t7 + t18 + t17 - t16;  // simplified chain
     data[7] = t7 - t18 - t16 + t17;
     // (The exact AAN normalization factors are absorbed into the quant matrix)
 
@@ -227,14 +227,8 @@ mod tests {
         assert!(dc > 100.0, "DC should dominate for flat block, got {dc}");
         for r in 0..8 {
             for c in 0..8 {
-                if r == 0 && c == 0 {
-                    continue;
-                }
-                assert!(
-                    block[r][c].abs() < 1.0,
-                    "AC[{r}][{c}] should be ~0, got {}",
-                    block[r][c]
-                );
+                if r == 0 && c == 0 { continue; }
+                assert!(block[r][c].abs() < 1.0, "AC[{r}][{c}] should be ~0, got {}", block[r][c]);
             }
         }
     }
@@ -338,19 +332,17 @@ pub fn hevc_dequantize(coeffs: &[[i16; 8]; 8], qp: u8, log2_size: u32) -> [[f32;
 /// HEVC 8×8 integer inverse DCT basis: rows mat_dct[4*j][0..8] of the spec's
 /// 32×32 transform matrix (§8.6.4.2).
 const IDCT8: [[i32; 8]; 8] = [
-    [64, 64, 64, 64, 64, 64, 64, 64],
-    [89, 75, 50, 18, -18, -50, -75, -89],
-    [83, 36, -36, -83, -83, -36, 36, 83],
-    [75, -18, -89, -50, 50, 89, 18, -75],
-    [64, -64, -64, 64, 64, -64, -64, 64],
-    [50, -89, 18, 75, -75, -18, 89, -50],
-    [36, -83, 83, -36, -36, 83, -83, 36],
-    [18, -50, 75, -89, 89, -75, 50, -18],
+    [64,  64,  64,  64,  64,  64,  64,  64],
+    [89,  75,  50,  18, -18, -50, -75, -89],
+    [83,  36, -36, -83, -83, -36,  36,  83],
+    [75, -18, -89, -50,  50,  89,  18, -75],
+    [64, -64, -64,  64,  64, -64, -64,  64],
+    [50, -89,  18,  75, -75, -18,  89, -50],
+    [36, -83,  83, -36, -36,  83, -83,  36],
+    [18, -50,  75, -89,  89, -75,  50, -18],
 ];
 
-fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
-    v.max(lo).min(hi)
-}
+fn clip3(lo: i32, hi: i32, v: i32) -> i32 { v.max(lo).min(hi) }
 
 /// Spec-exact HEVC reconstruction for an 8×8 luma TU: integer dequantization
 /// (§8.6.3) followed by the integer inverse transform (§8.6.4), bit-identical to
@@ -419,13 +411,8 @@ mod hevc_quant_tests {
         let dq = hevc_dequantize(&q, 26, 3);
         // Dequantized DC should be within one quant step of original
         let step = hevc_qp_quant_step(26, 3);
-        assert!(
-            (dq[0][0] - block[0][0]).abs() <= step,
-            "dq={:.1} orig={:.1} step={:.1}",
-            dq[0][0],
-            block[0][0],
-            step
-        );
+        assert!((dq[0][0] - block[0][0]).abs() <= step,
+            "dq={:.1} orig={:.1} step={:.1}", dq[0][0], block[0][0], step);
     }
 
     #[test]

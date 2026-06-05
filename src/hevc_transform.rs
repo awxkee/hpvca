@@ -47,14 +47,14 @@ fn t_row(n: usize, i: usize, j: usize) -> i64 {
 
 /// Forward integer transform of an N×N residual block (N = 4 or 8), 8-bit.
 /// Returns transform coefficients (pre-quantisation).
-pub fn fwd_transform(res: &[i32], n: usize) -> Vec<i64> {
+pub fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> Vec<i64> {
     let log2n = if n == 8 { 3 } else { 2 };
-    let bd = 8i64;
+    let bd = bit_depth as i64;
     // Stage 1 (rows): tmp = T * res  (apply transform along columns of res rows)
     // We compute coeff = T * res * T^T with two 1-D passes.
     let shift1 = log2n + bd - 9; // 8x8:2, 4x4:1
     let add1 = if shift1 > 0 { 1i64 << (shift1 - 1) } else { 0 };
-    // pass 1: along rows (horizontal): tmp[i][j] = sum_k T[i][k]*res[k][j]?
+    // pass 1: along rows (horizontal): tmp[i][j] = sum_k T[i][k]*res[k][j]? 
     // Standard HM: first transform the rows of the residual, i.e.
     //   tmp = res * T^T  then  coeff = T * tmp ... order doesn't matter for square sep.
     // We do: tmp[i][j] = (sum_k T[i][k] * res[j][k]) >> shift1   (rows of res)
@@ -94,9 +94,9 @@ pub fn fwd_transform(res: &[i32], n: usize) -> Vec<i64> {
 }
 
 /// Forward quantisation: coeff → level. Intra rounding offset.
-pub fn quantize(coeff: &[i64], n: usize, qp: u8) -> Vec<i16> {
+pub fn quantize(coeff: &[i64], n: usize, qp: u8, bit_depth: u8) -> Vec<i16> {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
-    let bd = 8i64;
+    let bd = bit_depth as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let offset = 171i64 << (q_bits - 9); // intra
@@ -111,9 +111,9 @@ pub fn quantize(coeff: &[i64], n: usize, qp: u8) -> Vec<i16> {
 }
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3).
-pub fn dequantize(level: &[i16], n: usize, qp: u8) -> Vec<i64> {
+pub fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> Vec<i64> {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
-    let bd = 8i64;
+    let bd = bit_depth as i64;
     let bd_shift = bd + log2n - 5; // 8x8:6, 4x4:5
     let add = 1i64 << (bd_shift - 1);
     let scale = DEQUANT_SCALE[(qp % 6) as usize];
@@ -127,8 +127,8 @@ pub fn dequantize(level: &[i16], n: usize, qp: u8) -> Vec<i64> {
 }
 
 /// Inverse integer transform (spec 8.6.4.2), 8-bit. Returns residual.
-pub fn inv_transform(coeff: &[i64], n: usize) -> Vec<i32> {
-    let bd = 8i64;
+pub fn inv_transform(coeff: &[i64], n: usize, bit_depth: u8) -> Vec<i32> {
+    let bd = bit_depth as i64;
     // Stage 1 (columns): out[n] = sum_k T[k][n] * coeff[k]  (= T^T @ col)
     let shift1 = 7i64;
     let add1 = 1i64 << (shift1 - 1);

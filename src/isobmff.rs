@@ -49,11 +49,12 @@ pub fn wrap_hevc_image_with_alpha(
     alpha: &NaluStream,
     width: u32,
     height: u32,
+    bit_depth: crate::fmt::BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let color_sample = color.to_length_prefixed_slices();
     let alpha_sample = alpha.to_length_prefixed_slices();
-    let color_hvcC = build_hvcC(color)?;
-    let alpha_hvcC = build_hvcC(alpha)?;
+    let color_hvcC = build_hvcC(color, bit_depth.bits())?;
+    let alpha_hvcC = build_hvcC(alpha, bit_depth.bits())?;
 
     const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
 
@@ -170,13 +171,13 @@ pub fn wrap_hevc_image_with_alpha(
             // 2: ispe (shared — same extents for color and alpha)
             { let sh=f.len(); write_fullbox(&mut f, b"ispe", 0, 0); w32(&mut f, width); w32(&mut f, height); patch(&mut f, sh); }
             // 3: pixi (color, 3 channels)
-            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(3); f.push(8); f.push(8); f.push(8); patch(&mut f, sh); }
+            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(3); f.push(bit_depth.bits()); f.push(bit_depth.bits()); f.push(bit_depth.bits()); patch(&mut f, sh); }
             // 4: colr (color ICC)
             { let sh=f.len(); write_box(&mut f, b"colr"); f.extend_from_slice(b"prof"); f.extend_from_slice(&crate::icc_profile::SRGB_ICC); patch(&mut f, sh); }
             // 5: hvcC (alpha)
             { let sh=f.len(); write_box(&mut f, b"hvcC"); f.extend_from_slice(&alpha_hvcC); patch(&mut f, sh); }
             // 6: pixi (alpha, 1 channel)
-            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(1); f.push(8); patch(&mut f, sh); }
+            { let sh=f.len(); write_fullbox(&mut f, b"pixi", 0, 0); f.push(1); f.push(bit_depth.bits()); patch(&mut f, sh); }
             // 7: auxC (alpha auxiliary type)
             {
                 let sh=f.len();
@@ -233,9 +234,10 @@ pub fn wrap_hevc_image(
     stream: &NaluStream,
     width: u32,
     height: u32,
+    bit_depth: crate::fmt::BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let hevc_sample = stream.to_length_prefixed_slices();
-    let hvcC_data   = build_hvcC(stream)?;
+    let hvcC_data   = build_hvcC(stream, bit_depth.bits())?;
 
     let mut f: Vec<u8> = Vec::new();
 
@@ -342,9 +344,9 @@ pub fn wrap_hevc_image(
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
                 f.push(3);       // num_channels = 3
-                f.push(8);       // bits_per_channel[0] = 8 (Y)
-                f.push(8);       // bits_per_channel[1] = 8 (Cb)
-                f.push(8);       // bits_per_channel[2] = 8 (Cr)
+                f.push(bit_depth.bits()); // bits_per_channel[0] (Y)
+                f.push(bit_depth.bits()); // bits_per_channel[1] (Cb)
+                f.push(bit_depth.bits()); // bits_per_channel[2] (Cr)
                 patch(&mut f, sh);
             }
             // prop 4: colr (ICC profile). Apple's ImageIO renders nclx-tagged HEICs
@@ -394,7 +396,35 @@ pub fn wrap_hevc_image(
     Ok(f)
 }
 
-fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
+/// Parse chroma_format_idc from an SPS NALU (returns None if it can't be parsed).
+/// Layout after the 2-byte NAL header: sps_video_parameter_set_id(4) +
+/// sps_max_sub_layers_minus1(3) + temporal_id_nesting(1) = 1 byte, then PTL
+/// (profile byte + 4 compat + 6 constraint + 1 level = 12 bytes), then
+/// sps_seq_parameter_set_id (ue) and chroma_format_idc (ue).
+fn sps_chroma_format_idc(sps: Option<&[u8]>) -> Option<u8> {
+    let s = sps?;
+    // Bit position starts after NAL header (2) + 1 byte + PTL (12) = 15 bytes.
+    let start_bit = 15 * 8;
+    let mut pos = start_bit;
+    let get_bit = |p: usize| -> u32 {
+        if p / 8 >= s.len() { return 0; }
+        ((s[p / 8] >> (7 - (p % 8))) & 1) as u32
+    };
+    let mut read_ue = |pos: &mut usize| -> u32 {
+        let mut zeros = 0;
+        while *pos < s.len() * 8 && get_bit(*pos) == 0 { zeros += 1; *pos += 1; }
+        *pos += 1; // the terminating 1
+        if zeros == 0 { return 0; }
+        let mut val = 0u32;
+        for _ in 0..zeros { val = (val << 1) | get_bit(*pos); *pos += 1; }
+        (1 << zeros) - 1 + val
+    };
+    let _sps_id = read_ue(&mut pos);
+    let cfi = read_ue(&mut pos);
+    Some(cfi as u8)
+}
+
+fn build_hvcC(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError> {
     let mut vps: Vec<&[u8]> = Vec::new();
     let mut sps: Vec<&[u8]> = Vec::new();
     let mut pps: Vec<&[u8]> = Vec::new();
@@ -409,34 +439,36 @@ fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
 
     let mut r: Vec<u8> = Vec::new();
     r.push(1);           // configurationVersion
-    // profile_space=0, tier=0, profile_idc=3 (Main Still Picture)
-    r.push(0b00_0_00011);
-    // profile_compat_flags: flag[1]=Main, flag[2]=Main10, flag[3]=MainSP → 0x70000000
-    r.extend_from_slice(&[0x70, 0x00, 0x00, 0x00]);
-    // Mirror the level and constraint flags from the embedded SPS so the hvcC
-    // summary matches the bitstream exactly (the SPS PTL is authoritative; the
-    // level scales with picture size via hevc::level_idc_for).
-    let (constraint6, level) = if let Some(s) = sps.first() {
-        // SPS NALU: 2-byte NAL header, then vps_id/sublayers/tid byte, then PTL:
-        // profile byte (1) + compat (4) + constraint (6) + level (1).
-        // Constraint bytes begin at offset 2+1+1+4 = 8; level at offset 14.
-        let mut c = [0u8; 6];
+
+    // Mirror the profile byte, compatibility flags, constraint flags and level from
+    // the embedded SPS PTL so the hvcC summary matches the bitstream exactly. The SPS
+    // PTL is authoritative (RExt profile, with bit-depth/chroma constraint flags).
+    // SPS NALU layout: 2-byte NAL header, vps_id/sublayers/tid byte, then PTL:
+    //   profile byte (offset 3) + compat[4] (4..8) + constraint[6] (8..14) + level (14).
+    let (profile_byte, compat, constraint6, level) = if let Some(s) = sps.first() {
         if s.len() >= 15 {
+            let mut compat = [0u8; 4];
+            compat.copy_from_slice(&s[4..8]);
+            let mut c = [0u8; 6];
             c.copy_from_slice(&s[8..14]);
-            (c, s[14])
+            (s[3], compat, c, s[14])
         } else {
-            ([0xb0, 0, 0, 0, 0, 0], 93)
+            (0b00_0_00100, [0x00,0,0,0], [0x90,0,0,0,0,0], 93)
         }
     } else {
-        ([0xb0, 0, 0, 0, 0, 0], 93)
+        (0b00_0_00100, [0x00,0,0,0], [0x90,0,0,0,0,0], 93)
     };
-    r.extend_from_slice(&constraint6);
+    r.push(profile_byte);              // general_profile_space/tier/idc (RExt = 4)
+    r.extend_from_slice(&compat);      // general_profile_compatibility_flags
+    r.extend_from_slice(&constraint6); // general_constraint_indicator_flags
     r.push(level);
     r.push(0xF0); r.push(0x00); // min_spatial_segmentation
     r.push(0xFC);        // parallelism type
-    r.push(0xFD);        // chroma_format_idc = 1 (4:2:0)
-    r.push(0xF8);        // bit_depth_luma_minus8 = 0
-    r.push(0xF8);        // bit_depth_chroma_minus8 = 0
+    // chroma_format_idc (low 2 bits; high 6 reserved = 1). Mirror the SPS value.
+    let chroma_idc = sps_chroma_format_idc(sps.first().copied()).unwrap_or(1);
+    r.push(0xFC | (chroma_idc & 0x3));
+    r.push(0xF8 | (bit_depth - 8));  // bit_depth_luma_minus8
+    r.push(0xF8 | (bit_depth - 8));  // bit_depth_chroma_minus8
     r.push(0x00); r.push(0x00); // avgFrameRate
     r.push(0b00_001_1_11); // cFR=0, numTL=1, tidNested=1, lengthSizeMinusOne=3 (4 bytes)
 
@@ -462,17 +494,17 @@ mod tests {
     use crate::hevc::NaluStream;
     fn make_test_stream() -> NaluStream {
         use crate::hevc::{build_pps, build_sps, build_vps};
-        NaluStream { nalus: vec![build_vps(16,16, crate::fmt::ChromaFormat::Yuv420), build_sps(16, 16, crate::fmt::ChromaFormat::Yuv420), build_pps(30)] }
+        NaluStream { nalus: vec![build_vps(16,16, crate::fmt::ChromaFormat::Yuv420, crate::fmt::BitDepth::Eight), build_sps(16, 16, crate::fmt::ChromaFormat::Yuv420, crate::fmt::BitDepth::Eight), build_pps(30)] }
     }
     #[test]
     fn ftyp_brand() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
+        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
         assert_eq!(&b[4..8], b"ftyp");
         assert_eq!(&b[8..12], b"heic");
     }
     #[test]
     fn box_order_ftyp_meta_mdat() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
+        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
         let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
         assert_eq!(&b[ftyp_size+4..ftyp_size+8], b"meta", "meta must follow ftyp");
         let meta_size = u32::from_be_bytes(b[ftyp_size..ftyp_size+4].try_into().unwrap()) as usize;
@@ -480,7 +512,7 @@ mod tests {
     }
     #[test]
     fn iloc_offset_points_into_mdat() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
+        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
         // Find mdat payload start
         let mut pos = 0usize;
         let mut mdat_payload_offset = 0u32;
@@ -505,7 +537,7 @@ mod tests {
     fn alpha_container_structure() {
         let color = make_test_stream();
         let alpha = make_test_stream();
-        let b = wrap_hevc_image_with_alpha(&color, &alpha, 16, 16).unwrap();
+        let b = wrap_hevc_image_with_alpha(&color, &alpha, 16, 16, crate::fmt::BitDepth::Eight).unwrap();
         let s = b.as_slice();
         // Two items, two hvcC, the auxl reference, the auxC property and the URN.
         assert!(s.windows(4).any(|w| w == b"iref"), "iref box required");

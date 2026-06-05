@@ -56,37 +56,26 @@ const RENORM_TABLE: [u32; 32] = [
 #[derive(Clone, Copy, Debug)]
 pub struct CtxModel {
     pub p_state_idx: u8,
-    pub val_mps: u8,
+    pub val_mps:     u8,
 }
 
 impl CtxModel {
     /// Initialise from HEVC spec §9.3.2.2.
     pub fn init(init_value: u8, qp: u8) -> Self {
         // HEVC §9.3.2.2 context initialisation.
-        let slope_idx = (init_value >> 4) as i32;
+        let slope_idx  = (init_value >> 4) as i32;
         let offset_idx = (init_value & 0x0F) as i32;
         let m = slope_idx * 5 - 45;
         let n = (offset_idx << 3) - 16;
         let qpc = (qp as i32).clamp(0, 51);
         let pre = (((m * qpc) >> 4) + n).clamp(1, 126);
         if pre >= 64 {
-            CtxModel {
-                p_state_idx: (pre - 64) as u8,
-                val_mps: 1,
-            }
+            CtxModel { p_state_idx: (pre - 64) as u8, val_mps: 1 }
         } else {
-            CtxModel {
-                p_state_idx: (63 - pre) as u8,
-                val_mps: 0,
-            }
+            CtxModel { p_state_idx: (63 - pre) as u8, val_mps: 0 }
         }
     }
-    pub fn fixed(p: u8, m: u8) -> Self {
-        CtxModel {
-            p_state_idx: p,
-            val_mps: m,
-        }
-    }
+    pub fn fixed(p: u8, m: u8) -> Self { CtxModel { p_state_idx: p, val_mps: m } }
 }
 
 /// HEVC CABAC encoder.
@@ -97,13 +86,13 @@ impl CtxModel {
 /// compatible with the HEVC arithmetic decoder (verified by an independent
 /// decoder over tens of thousands of random symbol sequences).
 pub struct CabacEncoder {
-    low: u32,              // 10-bit working low register
-    m_range: u32,          // current range [256, 510]
-    bits_outstanding: u32, // count of pending carry-dependent bits
-    first_bit: bool,       // suppress the very first put_bit (H.264/HEVC convention)
-    bit_buffer: u8,        // partial output byte
-    bit_count: u8,         // bits filled in bit_buffer (0..8)
-    pub output: Vec<u8>,
+    low:               u32,   // 10-bit working low register
+    m_range:           u32,   // current range [256, 510]
+    bits_outstanding:  u32,   // count of pending carry-dependent bits
+    first_bit:         bool,  // suppress the very first put_bit (H.264/HEVC convention)
+    bit_buffer:        u8,     // partial output byte
+    bit_count:         u8,     // bits filled in bit_buffer (0..8)
+    pub output:        Vec<u8>,
 }
 
 impl CabacEncoder {
@@ -162,6 +151,7 @@ impl CabacEncoder {
             self.low <<= 1;
         }
     }
+
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -246,6 +236,7 @@ impl CabacEncoder {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,9 +259,7 @@ mod tests {
     #[test]
     fn bypass_zero() {
         let mut enc = CabacEncoder::new();
-        for _ in 0..8 {
-            enc.encode_bypass(0);
-        }
+        for _ in 0..8 { enc.encode_bypass(0); }
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -280,9 +269,7 @@ mod tests {
     fn mps_sequence_then_terminate() {
         let mut enc = CabacEncoder::new();
         let mut ctx = CtxModel::fixed(20, 0);
-        for _ in 0..16 {
-            enc.encode_bin(0, &mut ctx);
-        }
+        for _ in 0..16 { enc.encode_bin(0, &mut ctx); }
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());

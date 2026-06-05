@@ -23,8 +23,8 @@ pub struct ContextSet {
     pub split_transform_flag: [CtxModel; 3],
 
     // CBF: cbf_luma[0..1], cbf_chroma[0..4]
-    pub cbf_luma: [CtxModel; 2],
-    pub cbf_chroma: [CtxModel; 5], // cb_trafoDepth0, cb_tD1, cr_tD0, cr_tD1, cr_tD2
+    pub cbf_luma:   [CtxModel; 2],
+    pub cbf_chroma: [CtxModel; 5],   // cb_trafoDepth0, cb_tD1, cr_tD0, cr_tD1, cr_tD2
 
     // last_sig_coeff_x/y prefix (18 contexts each)
     pub last_sig_coeff_x_prefix: [CtxModel; 18],
@@ -44,15 +44,13 @@ pub struct ContextSet {
 
     // SAO: sao_merge_left/up flag (1 ctx, shared) and sao_type_idx (1 ctx).
     // initType0: sao_merge=153, sao_type_idx=200.
-    pub sao_merge_flag: CtxModel,
-    pub sao_type_idx: CtxModel,
+    pub sao_merge_flag:  CtxModel,
+    pub sao_type_idx:    CtxModel,
 }
 
 impl ContextSet {
     pub fn init_islice(qp: u8) -> Self {
-        fn c(iv: u8, qp: u8) -> CtxModel {
-            CtxModel::init(iv, qp)
-        }
+        fn c(iv: u8, qp: u8) -> CtxModel { CtxModel::init(iv, qp) }
         fn arr<const N: usize>(ivs: [u8; N], qp: u8) -> [CtxModel; N] {
             ivs.map(|iv| CtxModel::init(iv, qp))
         }
@@ -73,51 +71,42 @@ impl ContextSet {
             cbf_chroma: arr([94, 138, 182, 154, 154], qp),
 
             // last_significant_coeff_x_prefix (18) — initType0
-            last_sig_coeff_x_prefix: arr(
-                [
-                    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108,
-                    123, 63,
-                ],
-                qp,
-            ),
+            last_sig_coeff_x_prefix: arr([
+                110, 110, 124, 125, 140, 153, 125, 127, 140, 109,
+                111, 143, 127, 111,  79, 108, 123,  63,
+            ], qp),
 
             // last_significant_coeff_y_prefix (18) — initType0 (same table)
-            last_sig_coeff_y_prefix: arr(
-                [
-                    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108,
-                    123, 63,
-                ],
-                qp,
-            ),
+            last_sig_coeff_y_prefix: arr([
+                110, 110, 124, 125, 140, 153, 125, 127, 140, 109,
+                111, 143, 127, 111,  79, 108, 123,  63,
+            ], qp),
 
             // significant_coeff_flag — initType0 row (42 values + 2 pad)
-            sig_coeff_flag: arr(
-                [
-                    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107,
-                    125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152,
-                    136, 152, 136, 153, 136, 139, 111, 136, 139, 111, 141, 111,
-                ],
-                qp,
-            ),
+            sig_coeff_flag: arr([
+                111, 111, 125, 110, 110,  94, 124, 108, 124, 107,
+                125, 141, 179, 153, 125, 107, 125, 141, 179, 153,
+                125, 107, 125, 141, 179, 153, 125, 140, 139, 182,
+                182, 152, 136, 152, 136, 153, 136, 139, 111, 136,
+                139, 111, 141, 111,
+            ], qp),
 
             // coded_sub_block_flag initType0 (×4): {91,171,134,141}
             coded_sub_block_flag: arr([91, 171, 134, 141], qp),
 
             // coeff_abs_level_greater1_flag (24) — initType0
-            coeff_abs_level_greater1: arr(
-                [
-                    140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152,
-                    140, 179, 166, 182, 140, 227, 122, 197,
-                ],
-                qp,
-            ),
+            coeff_abs_level_greater1: arr([
+                140,  92, 137, 138, 140, 152, 138, 139, 153,  74,
+                149,  92, 139, 107, 122, 152, 140, 179, 166, 182,
+                140, 227, 122, 197,
+            ], qp),
 
             // coeff_abs_level_greater2_flag (6) — initType0: {138,153,136,167,152,152}
             coeff_abs_level_greater2: arr([138, 153, 136, 167, 152, 152], qp),
 
             // SAO initType0: sao_merge_flag=153, sao_type_idx=200 (libde265).
             sao_merge_flag: c(153, qp),
-            sao_type_idx: c(200, qp),
+            sao_type_idx:   c(200, qp),
         }
     }
 }
@@ -126,17 +115,17 @@ impl ContextSet {
 /// I-slice (initType=0) init values from libde265:
 ///   part_mode = 184, prev_intra_luma_pred_flag = 184, intra_chroma_pred_mode = 63
 pub struct IntraModeContexts {
-    pub part_mode: CtxModel,
+    pub part_mode:                 CtxModel,
     pub prev_intra_luma_pred_flag: CtxModel,
-    pub intra_chroma_pred_mode: CtxModel,
+    pub intra_chroma_pred_mode:    CtxModel,
 }
 
 impl IntraModeContexts {
     pub fn init_islice(qp: u8) -> Self {
         Self {
-            part_mode: CtxModel::init(184, qp),
+            part_mode:                 CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
-            intra_chroma_pred_mode: CtxModel::init(63, qp),
+            intra_chroma_pred_mode:    CtxModel::init(63,  qp),
         }
     }
 }

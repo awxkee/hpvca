@@ -7,11 +7,8 @@
 //!   - IDR  NAL type 19  (intra-only, CABAC, DC/Planar per CU, reconstruct loop)
 
 use crate::{
-    cabac::{
-        CabacEncoder, ContextSet, IntraModeContexts, encode_cbf_chroma, encode_cbf_luma,
-        encode_residual,
-    },
-    dct::{self, hevc_dequantize, hevc_quantize},
+    cabac::{CabacEncoder, ContextSet, IntraModeContexts, encode_residual, encode_cbf_luma, encode_cbf_chroma},
+    dct::{self, hevc_quantize, hevc_dequantize},
     error::EncodeError,
     intra,
     yuv::Yuv,
@@ -121,11 +118,7 @@ pub struct BitWriter {
 
 impl BitWriter {
     pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            bit_pos: 0,
-            cur_byte: 0,
-        }
+        Self { buf: Vec::new(), bit_pos: 0, cur_byte: 0 }
     }
 
     pub fn write_bits(&mut self, v: u32, n: u32) {
@@ -141,9 +134,7 @@ impl BitWriter {
         }
     }
 
-    pub fn write_bit(&mut self, v: bool) {
-        self.write_bits(v as u32, 1);
-    }
+    pub fn write_bit(&mut self, v: bool) { self.write_bits(v as u32, 1); }
 
     /// Unsigned Exp-Golomb.
     pub fn write_ue(&mut self, mut v: u32) {
@@ -155,19 +146,13 @@ impl BitWriter {
 
     /// Signed Exp-Golomb.
     pub fn write_se(&mut self, v: i32) {
-        let u = if v > 0 {
-            2 * v as u32 - 1
-        } else {
-            (-2 * v) as u32
-        };
+        let u = if v > 0 { 2 * v as u32 - 1 } else { (-2 * v) as u32 };
         self.write_ue(u);
     }
 
     pub fn rbsp_trailing_bits(&mut self) {
         self.write_bit(true);
-        while self.bit_pos != 0 {
-            self.write_bit(false);
-        }
+        while self.bit_pos != 0 { self.write_bit(false); }
     }
 
     pub fn finish(mut self) -> Vec<u8> {
@@ -181,10 +166,10 @@ impl BitWriter {
 // ─── NALU header ─────────────────────────────────────────────────────────────
 
 fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
-    bw.write_bit(false); // forbidden_zero_bit
-    bw.write_bits(nal_type as u32, 6); // nal_unit_type
-    bw.write_bits(0, 6); // nuh_layer_id = 0
-    bw.write_bits(1, 3); // nuh_temporal_id_plus1 = 1
+    bw.write_bit(false);                         // forbidden_zero_bit
+    bw.write_bits(nal_type as u32, 6);           // nal_unit_type
+    bw.write_bits(0, 6);                          // nuh_layer_id = 0
+    bw.write_bits(1, 3);                          // nuh_temporal_id_plus1 = 1
 }
 
 // ─── profile_tier_level ──────────────────────────────────────────────────────
@@ -209,14 +194,8 @@ pub fn level_idc_for(w: u32, h: u32) -> u8 {
     let ps = (w as u64) * (h as u64);
     // (MaxLumaPs, level_idc)
     const TABLE: &[(u64, u8)] = &[
-        (36864, 30),
-        (122880, 60),
-        (245760, 63),
-        (552960, 90),
-        (983040, 93),
-        (2228224, 120),
-        (8912896, 150),
-        (35651584, 180),
+        (36864, 30), (122880, 60), (245760, 63), (552960, 90),
+        (983040, 93), (2228224, 120), (8912896, 150), (35651584, 180),
     ];
     for &(maxps, lvl) in TABLE {
         if ps <= maxps {
@@ -226,67 +205,68 @@ pub fn level_idc_for(w: u32, h: u32) -> u8 {
     186 // Level 6.2 — effectively unlimited for still images
 }
 
-fn write_profile_tier_level(bw: &mut BitWriter, level_idc: u8, chroma: crate::fmt::ChromaFormat) {
+fn write_profile_tier_level(bw: &mut BitWriter, level_idc: u8, chroma: crate::fmt::ChromaFormat, bit_depth: crate::fmt::BitDepth) {
     // Profile/Tier/Level, matched to x265's RExt output. The RExt constraint flags
     // must be consistent with the actual chroma format: a 4:2:2 stream must NOT set
     // max_420chroma_constraint_flag.
-    bw.write_bits(0, 2); // general_profile_space = 0
-    bw.write_bit(false); // general_tier_flag = 0 (Main tier)
-    bw.write_bits(4, 5); // general_profile_idc = 4 (Format Range Extensions)
+    bw.write_bits(0, 2);           // general_profile_space = 0
+    bw.write_bit(false);           // general_tier_flag = 0 (Main tier)
+    bw.write_bits(4, 5);           // general_profile_idc = 4 (Format Range Extensions)
 
     bw.write_bits(0x0800_0000, 32); // compatibility: bit 4 (RExt)
 
-    bw.write_bit(true); // general_progressive_source_flag   = 1
-    bw.write_bit(false); // general_interlaced_source_flag    = 0
-    bw.write_bit(false); // general_non_packed_constraint_flag= 0
-    bw.write_bit(true); // general_frame_only_constraint_flag= 1
+    bw.write_bit(true);    // general_progressive_source_flag   = 1
+    bw.write_bit(false);   // general_interlaced_source_flag    = 0
+    bw.write_bit(false);   // general_non_packed_constraint_flag= 0
+    bw.write_bit(true);    // general_frame_only_constraint_flag= 1
     // RExt constraint flags:
-    bw.write_bit(true); // max_12bit_constraint_flag    = 1
-    bw.write_bit(true); // max_10bit_constraint_flag    = 1
-    bw.write_bit(true); // max_8bit_constraint_flag     = 1
+    bw.write_bit(true);    // max_12bit_constraint_flag    = 1
+    bw.write_bit(true);    // max_10bit_constraint_flag    = 1
+    // max_8bit_constraint_flag: only set when the stream is 8-bit.
+    bw.write_bit(bit_depth == crate::fmt::BitDepth::Eight); // max_8bit_constraint_flag
     // For monochrome, the stream satisfies all the chroma constraints (max_422,
     // max_420 are true) and additionally max_monochrome = 1.
     let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
     let is_420 = matches!(chroma, crate::fmt::ChromaFormat::Yuv420);
     let is_mono = matches!(chroma, crate::fmt::ChromaFormat::Monochrome);
     bw.write_bit(!is_444 || is_mono); // max_422chroma_constraint_flag
-    bw.write_bit(is_420 || is_mono); // max_420chroma_constraint_flag
-    bw.write_bit(is_mono); // max_monochrome_constraint_flag
-    bw.write_bit(true); // intra_constraint_flag        = 1
-    bw.write_bit(false); // one_picture_only_constraint_flag = 0
-    bw.write_bit(true); // lower_bit_rate_constraint_flag   = 1
-    bw.write_bits(0, 32); // reserved
-    bw.write_bits(0, 3); // reserved (35 reserved bits total after 13 constraint bits)
+    bw.write_bit(is_420 || is_mono);  // max_420chroma_constraint_flag
+    bw.write_bit(is_mono);            // max_monochrome_constraint_flag
+    bw.write_bit(true);    // intra_constraint_flag        = 1
+    bw.write_bit(false);   // one_picture_only_constraint_flag = 0
+    bw.write_bit(true);    // lower_bit_rate_constraint_flag   = 1
+    bw.write_bits(0, 32);  // reserved
+    bw.write_bits(0, 3);   // reserved (35 reserved bits total after 13 constraint bits)
 
     bw.write_bits(level_idc as u32, 8);
 }
 
 // ─── VPS ─────────────────────────────────────────────────────────────────────
 
-pub fn build_vps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> Nalu {
-    let coded_w = (width + 63) & !63;
+pub fn build_vps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat, bit_depth: crate::fmt::BitDepth) -> Nalu {
+    let coded_w = (width  + 63) & !63;
     let coded_h = (height + 63) & !63;
     let level = level_idc_for(coded_w, coded_h);
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 32);
 
-    bw.write_bits(0, 4); // vps_video_parameter_set_id = 0
-    bw.write_bit(true); // vps_base_layer_internal_flag
-    bw.write_bit(true); // vps_base_layer_available_flag
-    bw.write_bits(0, 6); // vps_max_layers_minus1 = 0  (1 layer)
-    bw.write_bits(0, 3); // vps_max_sub_layers_minus1 = 0  (1 temporal layer)
-    bw.write_bit(true); // vps_temporal_id_nesting_flag
+    bw.write_bits(0, 4);   // vps_video_parameter_set_id = 0
+    bw.write_bit(true);    // vps_base_layer_internal_flag
+    bw.write_bit(true);    // vps_base_layer_available_flag
+    bw.write_bits(0, 6);   // vps_max_layers_minus1 = 0  (1 layer)
+    bw.write_bits(0, 3);   // vps_max_sub_layers_minus1 = 0  (1 temporal layer)
+    bw.write_bit(true);    // vps_temporal_id_nesting_flag
     bw.write_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
 
-    write_profile_tier_level(&mut bw, level, chroma);
+    write_profile_tier_level(&mut bw, level, chroma, bit_depth);
 
     // vps_sub_layer_ordering_info_present_flag = false → only [0] entry
     bw.write_bit(false);
-    bw.write_ue(2); // vps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches SPS)
-    bw.write_ue(0); // vps_max_num_reorder_pics[0] = 0
-    bw.write_ue(0); // vps_max_latency_increase_plus1[0] = 0
+    bw.write_ue(2);   // vps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches SPS)
+    bw.write_ue(0);   // vps_max_num_reorder_pics[0] = 0
+    bw.write_ue(0);   // vps_max_latency_increase_plus1[0] = 0
 
-    bw.write_bits(0, 6); // vps_max_layer_id = 0
+    bw.write_bits(0, 6);  // vps_max_layer_id = 0
     // vps_num_layer_sets_minus1 = 0  (base layer set only)
     bw.write_ue(0);
     // layer_id_included_flag[i][j] loop: spec says i=0..nls_m1, j=0..max_layer_id
@@ -295,32 +275,29 @@ pub fn build_vps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> N
     // Writing the spec-correct flag[0][0] would be mis-parsed as the next field.
     // We match what every real encoder does: write NO flags for the base layer set.
 
-    bw.write_bit(false); // vps_timing_info_present_flag
-    bw.write_bit(false); // vps_extension_flag
+    bw.write_bit(false);  // vps_timing_info_present_flag
+    bw.write_bit(false);  // vps_extension_flag
 
     bw.rbsp_trailing_bits();
-    Nalu {
-        nal_type: 32,
-        data: bw.finish(),
-    }
+    Nalu { nal_type: 32, data: bw.finish() }
 }
 
 // ─── SPS ─────────────────────────────────────────────────────────────────────
 
-pub fn build_sps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> Nalu {
+pub fn build_sps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat, bit_depth: crate::fmt::BitDepth) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
 
-    bw.write_bits(0, 4); // sps_video_parameter_set_id = 0
-    bw.write_bits(0, 3); // sps_max_sub_layers_minus1 = 0
-    bw.write_bit(true); // sps_temporal_id_nesting_flag
+    bw.write_bits(0, 4);   // sps_video_parameter_set_id = 0
+    bw.write_bits(0, 3);   // sps_max_sub_layers_minus1 = 0
+    bw.write_bit(true);    // sps_temporal_id_nesting_flag
 
     let sps_level = level_idc_for((width + 63) & !63, (height + 63) & !63);
-    write_profile_tier_level(&mut bw, sps_level, chroma);
+    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth);
 
-    bw.write_ue(0); // sps_seq_parameter_set_id = 0
+    bw.write_ue(0);   // sps_seq_parameter_set_id = 0
 
-    bw.write_ue(chroma.idc()); // chroma_format_idc (1=4:2:0, 2=4:2:2, 3=4:4:4)
+    bw.write_ue(chroma.idc());   // chroma_format_idc (1=4:2:0, 2=4:2:2, 3=4:4:4)
     // separate_colour_plane_flag is present only when chroma_format_idc == 3. We use
     // packed 4:4:4 (the three components share one coding tree), so the flag is 0.
     if chroma.idc() == 3 {
@@ -331,7 +308,7 @@ pub fn build_sps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> N
     // with no partial boundary CTBs. Empirically Apple's hardware decoder accepts a
     // LARGER range of sizes with full-CTB declaration than with multiple-of-8 +
     // partial CTBs, so we round to 64 and let the conformance window crop.
-    let coded_w = (width + 63) & !63;
+    let coded_w = (width  + 63) & !63;
     let coded_h = (height + 63) & !63;
     bw.write_ue(coded_w);
     bw.write_ue(coded_h);
@@ -341,29 +318,29 @@ pub fn build_sps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> N
     // SubHeightC (=2 for 4:2:0, =1 for 4:2:2) vertically.
     let sub_w = chroma.sub_w() as u32;
     let sub_h = chroma.sub_h() as u32;
-    let crop_right = (coded_w - width) / sub_w;
+    let crop_right  = (coded_w - width)  / sub_w;
     let crop_bottom = (coded_h - height) / sub_h;
     let need_window = crop_right > 0 || crop_bottom > 0;
     bw.write_bit(need_window);
     if need_window {
-        bw.write_ue(0); // conf_win_left_offset
-        bw.write_ue(crop_right); // conf_win_right_offset
-        bw.write_ue(0); // conf_win_top_offset
+        bw.write_ue(0);           // conf_win_left_offset
+        bw.write_ue(crop_right);  // conf_win_right_offset
+        bw.write_ue(0);           // conf_win_top_offset
         bw.write_ue(crop_bottom); // conf_win_bottom_offset
     }
 
-    bw.write_ue(0); // bit_depth_luma_minus8   = 0 (8-bit)
-    bw.write_ue(0); // bit_depth_chroma_minus8 = 0 (8-bit)
+    bw.write_ue(bit_depth.minus8() as u32);   // bit_depth_luma_minus8
+    bw.write_ue(bit_depth.minus8() as u32);   // bit_depth_chroma_minus8
 
-    bw.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4 = 4 → max POC = 256
+    bw.write_ue(4);   // log2_max_pic_order_cnt_lsb_minus4 = 4 → max POC = 256
 
     // sps_sub_layer_ordering_info_present_flag = false
     bw.write_bit(false);
-    bw.write_ue(2); // sps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches x265;
-    // hardware decoders allocate the DPB from this and may reject a
-    // value smaller than they expect for the pipeline).
-    bw.write_ue(0); // sps_max_num_reorder_pics[0]
-    bw.write_ue(0); // sps_max_latency_increase_plus1[0]
+    bw.write_ue(2);   // sps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches x265;
+                      // hardware decoders allocate the DPB from this and may reject a
+                      // value smaller than they expect for the pipeline).
+    bw.write_ue(0);   // sps_max_num_reorder_pics[0]
+    bw.write_ue(0);   // sps_max_latency_increase_plus1[0]
 
     // Coding-tree unit (CTU) size hierarchy.
     // Apple VideoToolbox's hardware HEVC decoder requires CTB size 64 (the size
@@ -383,61 +360,58 @@ pub fn build_sps(width: u32, height: u32, chroma: crate::fmt::ChromaFormat) -> N
     // max_transform_hierarchy_depth_inter = 0 (matches x265).
     bw.write_ue(0);
 
-    bw.write_bit(false); // scaling_list_enabled_flag
-    bw.write_bit(false); // amp_enabled_flag
-    bw.write_bit(true); // sample_adaptive_offset_enabled_flag = 1 (matches x265 &
-    // Kvazaar; Apple's decoder expects per-CTB SAO syntax in
-    // the slice. We signal SAO "off" for every CTB, so the
-    // reconstruction is identical, but the syntax is present.)
-    bw.write_bit(false); // pcm_enabled_flag
+    bw.write_bit(false);  // scaling_list_enabled_flag
+    bw.write_bit(false);  // amp_enabled_flag
+    bw.write_bit(true);   // sample_adaptive_offset_enabled_flag = 1 (matches x265 &
+                          // Kvazaar; Apple's decoder expects per-CTB SAO syntax in
+                          // the slice. We signal SAO "off" for every CTB, so the
+                          // reconstruction is identical, but the syntax is present.)
+    bw.write_bit(false);  // pcm_enabled_flag
 
-    bw.write_ue(0); // num_short_term_ref_pic_sets = 0
-    bw.write_bit(false); // long_term_ref_pics_present_flag
-    bw.write_bit(true); // sps_temporal_mvp_enabled_flag = 1 (matches x265; no effect
-    // on I-slice parsing but kept identical to x265's SPS)
-    bw.write_bit(true); // strong_intra_smoothing_enabled_flag = 1 (matches x265;
-    // only affects 32×32 intra which we don't use, so output
-    // is unchanged)
+    bw.write_ue(0);       // num_short_term_ref_pic_sets = 0
+    bw.write_bit(false);  // long_term_ref_pics_present_flag
+    bw.write_bit(true);   // sps_temporal_mvp_enabled_flag = 1 (matches x265; no effect
+                          // on I-slice parsing but kept identical to x265's SPS)
+    bw.write_bit(true);   // strong_intra_smoothing_enabled_flag = 1 (matches x265;
+                          // only affects 32×32 intra which we don't use, so output
+                          // is unchanged)
 
     // VUI parameters: colour info so decoders display correctly
-    bw.write_bit(true); // vui_parameters_present_flag
+    bw.write_bit(true);   // vui_parameters_present_flag
     write_vui(&mut bw);
 
-    bw.write_bit(false); // sps_extension_present_flag
+    bw.write_bit(false);  // sps_extension_present_flag
 
     bw.rbsp_trailing_bits();
-    Nalu {
-        nal_type: 33,
-        data: bw.finish(),
-    }
+    Nalu { nal_type: 33, data: bw.finish() }
 }
 
 /// Write minimal VUI (Annex E §E.2.1) with BT.601 colour info.
 fn write_vui(bw: &mut BitWriter) {
-    bw.write_bit(false); // aspect_ratio_info_present_flag
-    bw.write_bit(false); // overscan_info_present_flag
+    bw.write_bit(false);  // aspect_ratio_info_present_flag
+    bw.write_bit(false);  // overscan_info_present_flag
 
     // video_signal_type_present_flag = true
     bw.write_bit(true);
-    bw.write_bits(5, 3); // video_format = 5 (unspecified)
-    bw.write_bit(true); // video_full_range_flag = 1 (full range 0-255)
-    // libheif uses full range. Our YUV conversion
-    // produces studio-swing Y [16-235], but VideoToolbox
-    // on macOS ignores limited-range signals and clips to
-    // black. Signalling full range matches libheif and
-    // makes the image display correctly on Apple devices.
-    bw.write_bit(true); // colour_description_present_flag
-    bw.write_bits(1, 8); // colour_primaries         = 1 (BT.709) — matches libheif
+    bw.write_bits(5, 3);  // video_format = 5 (unspecified)
+    bw.write_bit(true);   // video_full_range_flag = 1 (full range 0-255)
+                          // libheif uses full range. Our YUV conversion
+                          // produces studio-swing Y [16-235], but VideoToolbox
+                          // on macOS ignores limited-range signals and clips to
+                          // black. Signalling full range matches libheif and
+                          // makes the image display correctly on Apple devices.
+    bw.write_bit(true);   // colour_description_present_flag
+    bw.write_bits(1, 8);  // colour_primaries         = 1 (BT.709) — matches libheif
     bw.write_bits(13, 8); // transfer_characteristics = 13 (sRGB / IEC 61966-2-1)
-    bw.write_bits(1, 8); // matrix_coefficients      = 1 (BT.709) — matches colr
+    bw.write_bits(1, 8);  // matrix_coefficients      = 1 (BT.709) — matches colr
 
-    bw.write_bit(false); // chroma_loc_info_present_flag
-    bw.write_bit(false); // neutral_chroma_indication_flag
-    bw.write_bit(false); // field_seq_flag
-    bw.write_bit(false); // frame_field_info_present_flag
-    bw.write_bit(false); // default_display_window_flag
-    bw.write_bit(false); // vui_timing_info_present_flag
-    bw.write_bit(false); // bitstream_restriction_flag
+    bw.write_bit(false);  // chroma_loc_info_present_flag
+    bw.write_bit(false);  // neutral_chroma_indication_flag
+    bw.write_bit(false);  // field_seq_flag
+    bw.write_bit(false);  // frame_field_info_present_flag
+    bw.write_bit(false);  // default_display_window_flag
+    bw.write_bit(false);  // vui_timing_info_present_flag
+    bw.write_bit(false);  // bitstream_restriction_flag
 }
 
 // ─── PPS ─────────────────────────────────────────────────────────────────────
@@ -446,76 +420,66 @@ pub fn build_pps(qp: u8) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
 
-    bw.write_ue(0); // pps_pic_parameter_set_id = 0
-    bw.write_ue(0); // pps_seq_parameter_set_id = 0
-    bw.write_bit(false); // dependent_slice_segments_enabled_flag
-    bw.write_bit(false); // output_flag_present_flag
-    bw.write_bits(0, 3); // num_extra_slice_header_bits
-    bw.write_bit(false); // sign_data_hiding_enabled_flag
-    bw.write_bit(false); // cabac_init_present_flag
-    bw.write_ue(0); // num_ref_idx_l0_default_active_minus1
-    bw.write_ue(0); // num_ref_idx_l1_default_active_minus1
+    bw.write_ue(0);        // pps_pic_parameter_set_id = 0
+    bw.write_ue(0);        // pps_seq_parameter_set_id = 0
+    bw.write_bit(false);   // dependent_slice_segments_enabled_flag
+    bw.write_bit(false);   // output_flag_present_flag
+    bw.write_bits(0, 3);   // num_extra_slice_header_bits
+    bw.write_bit(false);   // sign_data_hiding_enabled_flag
+    bw.write_bit(false);   // cabac_init_present_flag
+    bw.write_ue(0);        // num_ref_idx_l0_default_active_minus1
+    bw.write_ue(0);        // num_ref_idx_l1_default_active_minus1
     bw.write_se(qp as i32 - 26); // init_qp_minus26: carry the full slice QP here
-    bw.write_bit(false); // constrained_intra_pred_flag
-    bw.write_bit(false); // transform_skip_enabled_flag
+    bw.write_bit(false);   // constrained_intra_pred_flag
+    bw.write_bit(false);   // transform_skip_enabled_flag
 
     // cu_qp_delta_enabled_flag = false  (fixed QP throughout)
     bw.write_bit(false);
     // No diff_cu_qp_delta_depth since cu_qp_delta_enabled_flag = false
 
     // pps_cb_qp_offset and pps_cr_qp_offset: ALWAYS present (HEVC spec §7.3.2.3)
-    bw.write_se(0); // pps_cb_qp_offset = 0
-    bw.write_se(0); // pps_cr_qp_offset = 0
+    bw.write_se(0);        // pps_cb_qp_offset = 0
+    bw.write_se(0);        // pps_cr_qp_offset = 0
 
-    bw.write_bit(false); // pps_slice_chroma_qp_offsets_present_flag
-    bw.write_bit(false); // weighted_pred_flag
-    bw.write_bit(false); // weighted_bipred_flag
-    bw.write_bit(false); // transquant_bypass_enabled_flag
-    bw.write_bit(false); // tiles_enabled_flag
-    bw.write_bit(false); // entropy_coding_sync_enabled_flag
+    bw.write_bit(false);   // pps_slice_chroma_qp_offsets_present_flag
+    bw.write_bit(false);   // weighted_pred_flag
+    bw.write_bit(false);   // weighted_bipred_flag
+    bw.write_bit(false);   // transquant_bypass_enabled_flag
+    bw.write_bit(false);   // tiles_enabled_flag
+    bw.write_bit(false);   // entropy_coding_sync_enabled_flag
     // No tile fields (tiles_enabled=0).
     // seq_loop_filter_across_slices_enabled_flag: ALWAYS present per HEVC spec and
     // ffmpeg decode_pps() unconditionally reads it after tiles/ecs flags.
-    bw.write_bit(true); // pps_loop_filter_across_slices_enabled_flag = 1 (matches
-    // x265). With a single slice it has no visible effect, but
-    // x265 sets it and we keep the PPS identical.
+    bw.write_bit(true);    // pps_loop_filter_across_slices_enabled_flag = 1 (matches
+                           // x265). With a single slice it has no visible effect, but
+                           // x265 sets it and we keep the PPS identical.
 
     // Deblocking filter ENABLED with default beta/tc offsets (0). The encoder
     // applies the same in-loop deblocking to its reconstruction, so the output
     // matches conformant decoders (libde265/ffmpeg) and block-edge artifacts are
     // smoothed. We still emit the control-present block so the offsets are
     // explicit rather than relying on defaults.
-    bw.write_bit(false); // deblocking_filter_control_present_flag (use defaults: enabled, offsets 0)
-    bw.write_bit(false); // pps_scaling_list_data_present_flag
-    bw.write_bit(false); // lists_modification_present_flag
-    bw.write_ue(0); // log2_parallel_merge_level_minus2
-    bw.write_bit(false); // slice_segment_header_extension_present_flag
-    bw.write_bit(false); // pps_extension_present_flag
+    bw.write_bit(false);   // deblocking_filter_control_present_flag (use defaults: enabled, offsets 0)
+    bw.write_bit(false);   // pps_scaling_list_data_present_flag
+    bw.write_bit(false);   // lists_modification_present_flag
+    bw.write_ue(0);        // log2_parallel_merge_level_minus2
+    bw.write_bit(false);   // slice_segment_header_extension_present_flag
+    bw.write_bit(false);   // pps_extension_present_flag
 
     bw.rbsp_trailing_bits();
-    Nalu {
-        nal_type: 34,
-        data: bw.finish(),
-    }
+    Nalu { nal_type: 34, data: bw.finish() }
 }
 
 // ─── IDR slice ───────────────────────────────────────────────────────────────
 
 /// Encode a still image as a single HEVC IDR picture.
-pub fn encode_intra(
-    yuv: &Yuv,
-    width: u32,
-    height: u32,
-    quality: u8,
-) -> Result<NaluStream, EncodeError> {
-    let vps = build_vps(width, height, yuv.chroma);
-    let sps = build_sps(width, height, yuv.chroma);
+pub fn encode_intra(yuv: &Yuv, width: u32, height: u32, quality: u8) -> Result<NaluStream, EncodeError> {
+    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
+    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
     let pps = build_pps(qp_val);
     let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality)?;
-    Ok(NaluStream {
-        nalus: vec![vps, sps, pps, idr],
-    })
+    Ok(NaluStream { nalus: vec![vps, sps, pps, idr] })
 }
 
 /// Encode and also return the encoder's internal reconstruction (coded dimensions).
@@ -527,20 +491,13 @@ pub fn encode_intra_with_recon(
     width: u32,
     height: u32,
     quality: u8,
-) -> Result<(NaluStream, Vec<u8>, Vec<u8>, Vec<u8>), EncodeError> {
-    let vps = build_vps(width, height, yuv.chroma);
-    let sps = build_sps(width, height, yuv.chroma);
+) -> Result<(NaluStream, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
+    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
+    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
     let pps = build_pps(qp_val);
     let (idr, ry, rcb, rcr) = build_idr_slice(yuv, width, height, quality)?;
-    Ok((
-        NaluStream {
-            nalus: vec![vps, sps, pps, idr],
-        },
-        ry,
-        rcb,
-        rcr,
-    ))
+    Ok((NaluStream { nalus: vec![vps, sps, pps, idr] }, ry, rcb, rcr))
 }
 
 fn build_idr_slice(
@@ -548,7 +505,7 @@ fn build_idr_slice(
     width: u32,
     height: u32,
     quality: u8,
-) -> Result<(Nalu, Vec<u8>, Vec<u8>, Vec<u8>), EncodeError> {
+) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
     // Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
     let _ = quality; // used above
@@ -557,29 +514,29 @@ fn build_idr_slice(
     // by sub_w horizontally and sub_h vertically (4:2:0 → /2,/2; 4:2:2 → /2,/1).
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
-    let w = ((width + 63) & !63) as usize;
-    let h = ((height + 63) & !63) as usize;
+    let w  = ((width  + 63) & !63) as usize;
+    let h  = ((height + 63) & !63) as usize;
     let cw = w / sub_w;
     let ch = h / sub_h;
-    let src_yw = yuv.width as usize;
-    let src_yh = yuv.height as usize;
-    let src_cw = (yuv.width as usize + sub_w - 1) / sub_w;
-    let src_ch = (yuv.height as usize + sub_h - 1) / sub_h;
+    let src_yw  = yuv.width  as usize;
+    let src_yh  = yuv.height as usize;
+    let src_cw  = (yuv.width  as usize + sub_w - 1) / sub_w;
+    let src_ch  = (yuv.height as usize + sub_h - 1) / sub_h;
 
     // ── Slice header ────────────────────────────────────────────────────────
     let mut hdr = BitWriter::new();
     nalu_header(&mut hdr, 20); // IDR_N_LP (no leading pictures — correct for a
-    // single still image; x265 and Apple use this).
+                               // single still image; x265 and Apple use this).
 
-    hdr.write_bit(true); // first_slice_segment_in_pic_flag
+    hdr.write_bit(true);    // first_slice_segment_in_pic_flag
     // IRAP pictures (types 16-23, incl. IDR_W_RADL=19) must write no_output_of_prior_pics_flag
-    hdr.write_bit(false); // no_output_of_prior_pics_flag = 0
-    hdr.write_ue(0); // slice_pic_parameter_set_id = 0
-    hdr.write_ue(2); // slice_type = I (ue(v): 2)
+    hdr.write_bit(false);   // no_output_of_prior_pics_flag = 0
+    hdr.write_ue(0);        // slice_pic_parameter_set_id = 0
+    hdr.write_ue(2);        // slice_type = I (ue(v): 2)
     // slice_sao_luma_flag / slice_sao_chroma_flag — present because the SPS enables
     // SAO. slice_sao_chroma_flag is only present when ChromaArrayType != 0 (HEVC
     // §7.3.6.1), so it is omitted for monochrome.
-    hdr.write_bit(true); // slice_sao_luma_flag   = 1
+    hdr.write_bit(true);    // slice_sao_luma_flag   = 1
     if !yuv.chroma.is_monochrome() {
         hdr.write_bit(true); // slice_sao_chroma_flag = 1
     }
@@ -599,14 +556,12 @@ fn build_idr_slice(
 
     // Padded reconstruction buffers (prediction uses coded dimensions). Monochrome
     // has no chroma planes.
-    let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
+    let mut rec_y  = pad_plane(&yuv.y,  src_yw, src_yh, w,  h);
     let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
         (Vec::new(), Vec::new())
     } else {
-        (
-            pad_plane(&yuv.cb, src_cw, src_ch, cw, ch),
-            pad_plane(&yuv.cr, src_cw, src_ch, cw, ch),
-        )
+        (pad_plane(&yuv.cb, src_cw, src_ch, cw, ch),
+         pad_plane(&yuv.cr, src_cw, src_ch, cw, ch))
     };
 
     // CTB grid: full 64×64 CTBs over the 64-multiple coded picture (no partial
@@ -614,10 +569,10 @@ fn build_idr_slice(
     // window crops the padding). Each CTB: 64→32→16→8 quadtree, 64 leaf 8×8 CUs.
     let ctb_size_y = 64usize;
     let ctb_size_c = 32usize;
-    let cu_size_y = 8usize;
-    let cu_size_c = 4usize;
-    let ctus_x = w / ctb_size_y;
-    let ctus_y = h / ctb_size_y;
+    let cu_size_y  = 8usize;
+    let cu_size_c  = 4usize;
+    let ctus_x = w  / ctb_size_y;
+    let ctus_y = h  / ctb_size_y;
     let total_ctus = ctus_x * ctus_y;
     let mut ctu_idx = 0usize;
 
@@ -653,7 +608,7 @@ fn build_idr_slice(
             let ca0 = if ctu_row > 0 { 1 } else { 0 };
             cab.encode_bin(1, &mut ctx.split_cu_flag[cl0 + ca0]);
 
-            for (q1y, q1x) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+            for (q1y, q1x) in [(0usize,0usize),(0,1),(1,0),(1,1)] {
                 let l1_lu_r = lu_row0 + q1y * 32;
                 let l1_lu_c = lu_col0 + q1x * 32;
                 let l1_ch_r = ch_row0 + q1y * 16;
@@ -663,25 +618,17 @@ fn build_idr_slice(
                 let ca1 = if q1y > 0 || ctu_row > 0 { 1 } else { 0 };
                 cab.encode_bin(1, &mut ctx.split_cu_flag[cl1 + ca1]);
 
-                for (q2y, q2x) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                for (q2y, q2x) in [(0usize,0usize),(0,1),(1,0),(1,1)] {
                     let l2_lu_r = l1_lu_r + q2y * 16;
                     let l2_lu_c = l1_lu_c + q2x * 16;
                     let l2_ch_r = l1_ch_r + q2y * 8;
                     let l2_ch_c = l1_ch_c + q2x * 8;
 
-                    let cl2 = if q2x > 0 || q1x > 0 || ctu_col > 0 {
-                        1
-                    } else {
-                        0
-                    };
-                    let ca2 = if q2y > 0 || q1y > 0 || ctu_row > 0 {
-                        1
-                    } else {
-                        0
-                    };
+                    let cl2 = if q2x > 0 || q1x > 0 || ctu_col > 0 { 1 } else { 0 };
+                    let ca2 = if q2y > 0 || q1y > 0 || ctu_row > 0 { 1 } else { 0 };
                     cab.encode_bin(1, &mut ctx.split_cu_flag[cl2 + ca2]);
 
-                    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                    for (dy, dx) in [(0usize,0usize),(0,1),(1,0),(1,1)] {
                         let lu_row = l2_lu_r + dy * cu_size_y;
                         let lu_col = l2_lu_c + dx * cu_size_y;
                         // Chroma coordinates derive from luma via the subsampling
@@ -692,27 +639,14 @@ fn build_idr_slice(
                         let _ = (l2_ch_r, l2_ch_c, cu_size_c); // superseded by derivation
 
                         encode_cu(
-                            &mut cab,
-                            &mut ctx,
-                            &mut ictx,
-                            &yuv.y,
-                            &mut rec_y,
-                            &yuv.cb,
-                            &yuv.cr,
-                            &mut rec_cb,
-                            &mut rec_cr,
-                            src_yw,
-                            src_yh,
-                            w,
-                            src_cw,
-                            src_ch,
-                            cw,
-                            lu_row,
-                            lu_col,
-                            ch_row,
-                            ch_col,
-                            qp,
-                            yuv.chroma,
+                            &mut cab, &mut ctx, &mut ictx,
+                            &yuv.y, &mut rec_y,
+                            &yuv.cb, &yuv.cr,
+                            &mut rec_cb, &mut rec_cr,
+                            src_yw, src_yh, w,
+                            src_cw, src_ch, cw,
+                            lu_row, lu_col, ch_row, ch_col,
+                            qp, yuv.chroma, yuv.bit_depth,
                         );
                     }
                 }
@@ -733,25 +667,17 @@ fn build_idr_slice(
     // edges are smoothed).
     // In-loop deblocking. Monochrome filters luma only.
     if yuv.chroma.is_monochrome() {
-        crate::deblock::deblock_luma_only(&mut rec_y, w, h, qp_val);
+        crate::deblock::deblock_luma_only(&mut rec_y, w, h, qp_val, yuv.bit_depth);
     } else {
-        crate::deblock::deblock(&mut rec_y, w, h, &mut rec_cb, &mut rec_cr, cw, ch, qp_val);
+        crate::deblock::deblock(&mut rec_y, w, h, &mut rec_cb, &mut rec_cr, cw, ch, qp_val, yuv.bit_depth);
     }
 
-    Ok((
-        Nalu {
-            nal_type: 20,
-            data: nalu_data,
-        },
-        rec_y,
-        rec_cb,
-        rec_cr,
-    ))
+    Ok((Nalu { nal_type: 20, data: nalu_data }, rec_y, rec_cb, rec_cr))
 }
 
 /// Pad a plane to (dst_w × dst_h) by edge-replication.
-fn pad_plane(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
-    let mut out = vec![128u8; dst_w * dst_h];
+fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u16> {
+    let mut out = vec![128u16; dst_w * dst_h];
     for r in 0..dst_h {
         let sr = r.min(src_h - 1);
         for c in 0..dst_w {
@@ -796,17 +722,8 @@ fn mpm_list(cand_a: u8, cand_b: u8) -> [u8; 3] {
 
 /// Decode-order availability for the block containing neighbour pixel (nr,nc),
 /// relative to the current block at (cur_r,cur_c). CTUs raster, sub-blocks Z-scan.
-fn is_block_decoded(
-    nr: usize,
-    nc: usize,
-    cur_r: usize,
-    cur_c: usize,
-    ctb: usize,
-    width: usize,
-) -> bool {
-    if nc >= width {
-        return false;
-    }
+fn is_block_decoded(nr: usize, nc: usize, cur_r: usize, cur_c: usize, ctb: usize, width: usize) -> bool {
+    if nc >= width { return false; }
     let blk = 8usize;
     let ctus_x = width / ctb;
     let grid = ctb / blk; // sub-blocks per side
@@ -821,10 +738,7 @@ fn is_block_decoded(
         while g > 1 {
             z |= (sc & 1) << (2 * bit);
             z |= (sr & 1) << (2 * bit + 1);
-            sr >>= 1;
-            sc >>= 1;
-            bit += 1;
-            g >>= 1;
+            sr >>= 1; sc >>= 1; bit += 1; g >>= 1;
         }
         let cells = (grid * grid) as i64;
         ci as i64 * cells + z as i64
@@ -839,14 +753,10 @@ fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat) -> u8 {
     let qpi = (qp as i32).clamp(0, 57);
     match chroma {
         crate::fmt::ChromaFormat::Yuv420 => {
-            static QP_C: [u8; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
-            if qpi < 30 {
-                qpi as u8
-            } else if qpi > 43 {
-                (qpi - 6) as u8
-            } else {
-                QP_C[(qpi - 30) as usize]
-            }
+            static QP_C: [u8; 14] = [29,30,31,32,33,33,34,34,35,35,36,36,37,37];
+            if qpi < 30 { qpi as u8 }
+            else if qpi > 43 { (qpi - 6) as u8 }
+            else { QP_C[(qpi - 30) as usize] }
         }
         // Monochrome has no chroma; value is unused. Return luma QP for definiteness.
         crate::fmt::ChromaFormat::Monochrome => qpi.min(51) as u8,
@@ -858,32 +768,32 @@ fn encode_cu(
     enc: &mut CabacEncoder,
     ctx: &mut ContextSet,
     ictx: &mut IntraModeContexts,
-    src_y: &[u8],
-    rec_y: &mut Vec<u8>,
-    src_cb: &[u8],
-    src_cr: &[u8],
-    rec_cb: &mut Vec<u8>,
-    rec_cr: &mut Vec<u8>,
-    src_yw: usize,
-    src_yh: usize,
-    yw_stride: usize,
-    src_cw: usize,
-    src_ch: usize,
-    cw_stride: usize,
-    lu_row: usize,
-    lu_col: usize,
-    ch_row: usize,
-    ch_col: usize,
+    src_y: &[u16], rec_y: &mut Vec<u16>,
+    src_cb: &[u16], src_cr: &[u16],
+    rec_cb: &mut Vec<u16>, rec_cr: &mut Vec<u16>,
+    src_yw: usize, src_yh: usize, yw_stride: usize,
+    src_cw: usize, src_ch: usize, cw_stride: usize,
+    lu_row: usize, lu_col: usize,
+    ch_row: usize, ch_col: usize,
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
+    bit_depth: crate::fmt::BitDepth,
 ) {
     const LU: usize = 8; // luma block size
     const CH: usize = 4; // chroma transform block size (4×4 in all formats)
-    // Number of 4×4 chroma transform blocks stacked vertically per 8×8 luma CU:
-    // 4:2:0 → 1 (chroma is 4×4); 4:2:2 → 2 (chroma is 4×8 = two stacked 4×4 TBs).
+    let neutral: u16 = bit_depth.neutral();      // 128 (8-bit) / 512 (10-bit)
+    let max_val: u16 = bit_depth.max_val();      // 255 / 1023
+    // HEVC §8.6.1: the decoder dequantizes at Qp' = Qp + QpBdOffset, where
+    // QpBdOffset = 6*(bitDepth-8). The signaled slice/PPS QP stays the user QP; the
+    // encoder must quantize AND dequantize at this same Qp' so its bitstream matches
+    // the decoder's interpretation. Chroma derives its table mapping from the
+    // un-offset luma QP, then adds the offset.
+    let qp_bd_offset = bit_depth.qp_bd_offset();
+    let qp_slice = qp;                  // user/slice QP (no bd offset)
+    let qp = qp_slice + qp_bd_offset;   // luma Qp' used for transform quant/dequant
     let n_chroma_tb = chroma.chroma_tbs_per_cu();
-    let coded_yh = rec_y.len() / yw_stride;
-    let coded_ch_h = rec_cb.len() / cw_stride;
+    let coded_yh = rec_y.len()  / yw_stride;
+    let coded_ch_h = if cw_stride > 0 { rec_cb.len() / cw_stride.max(1) } else { 0 };
 
     // ── Luma intra prediction ───────────────────────────────────────────────
     // Always use PLANAR. With PLANAR everywhere, every block's neighbours are
@@ -891,19 +801,10 @@ fn encode_cu(
     // yields candidate list [PLANAR, DC, VERTICAL] with PLANAR at index 0. That
     // makes mpm_idx = 0 correct for every block, independent of position — no
     // neighbour-mode tracking needed and no risk of an MPM-index/scan mismatch.
-    let (yc0, ya, yl) = intra::get_reference_samples(
-        rec_y,
-        yw_stride,
-        lu_row,
-        lu_col,
-        coded_yh,
-        LU,
-        64,
-        yw_stride / 64,
-    );
+    let (yc0, ya, yl) = intra::get_reference_samples(rec_y, yw_stride, lu_row, lu_col, coded_yh, LU, 64, yw_stride / 64, neutral);
     // Luma 8×8 PLANAR uses the smoothed ([1 2 1]/4) reference (HEVC §8.4.4.2.3).
     let (yaf, ylf) = intra::filter_references(yc0, &ya, &yl, LU);
-    let y_pred = intra::predict_planar(&yaf, &ylf, LU);
+    let y_pred   = intra::predict_planar(&yaf, &ylf, LU);
 
     // ── part_mode ──────────────────────────────────────────────────────────
     // Our 8×8 CU equals the SPS minimum luma CB size (log2_min=3), so the spec
@@ -920,11 +821,9 @@ fn encode_cu(
     // candB: DC if above unavailable OR above lies in a different CTB row, else
     //        its mode (PLANAR here).
     let ctb = 64usize;
-    let avail_left =
-        lu_col > 0 && is_block_decoded(lu_row, lu_col - 1, lu_row, lu_col, ctb, yw_stride);
+    let avail_left  = lu_col > 0 && is_block_decoded(lu_row, lu_col - 1, lu_row, lu_col, ctb, yw_stride);
     let above_in_same_ctb = lu_row > 0 && ((lu_row - 1) >= (lu_row / ctb) * ctb);
-    let avail_above = lu_row > 0
-        && above_in_same_ctb
+    let avail_above = lu_row > 0 && above_in_same_ctb
         && is_block_decoded(lu_row - 1, lu_col, lu_row, lu_col, ctb, yw_stride);
     // All decoded neighbours are PLANAR (0); unavailable/cross-CTB → DC (1).
     const PLANAR: u8 = 0;
@@ -939,17 +838,9 @@ fn encode_cu(
         enc.encode_bin(1, &mut ictx.prev_intra_luma_pred_flag);
         // mpm_idx TR(cMax=2) bypass: 0→"0", 1→"10", 2→"11".
         match idx {
-            0 => {
-                enc.encode_bypass(0);
-            }
-            1 => {
-                enc.encode_bypass(1);
-                enc.encode_bypass(0);
-            }
-            _ => {
-                enc.encode_bypass(1);
-                enc.encode_bypass(1);
-            }
+            0 => { enc.encode_bypass(0); }
+            1 => { enc.encode_bypass(1); enc.encode_bypass(0); }
+            _ => { enc.encode_bypass(1); enc.encode_bypass(1); }
         }
     } else {
         // PLANAR not an MPM (cannot happen here since one cand is always DC and
@@ -959,14 +850,8 @@ fn encode_cu(
         let mut sorted = mpm;
         sorted.sort_unstable();
         let mut rem = PLANAR as i32;
-        for &m in sorted.iter() {
-            if (m as i32) <= rem {
-                rem += 1;
-            }
-        }
-        for i in (0..5).rev() {
-            enc.encode_bypass(((rem >> i) & 1) as u8);
-        }
+        for &m in sorted.iter() { if (m as i32) <= rem { rem += 1; } }
+        for i in (0..5).rev() { enc.encode_bypass(((rem >> i) & 1) as u8); }
     }
 
     // ── Chroma intra pred mode (DM_CHROMA → single '0' bin) ──────────────
@@ -981,24 +866,18 @@ fn encode_cu(
     // 4:2:2 stacks two 4×4 TBs vertically. HEVC predicts each chroma TB separately
     // (§8.4.4.2.1); a lower stacked TB uses the just-reconstructed upper TB as its
     // above reference. We predict → transform → reconstruct each TB in order.
-    let chroma_qp = chroma_qp_for(qp, chroma);
+    let chroma_qp = chroma_qp_for(qp_slice, chroma) + qp_bd_offset;
     let sub_w = chroma.sub_w();
     let sub_h = chroma.sub_h();
     let luma_ctus_x = yw_stride / 64;
-    let ctb = chroma.chroma_tb_size(); // 4 or 8
-    let log2_ctb = ctb.trailing_zeros(); // 2 or 3
+    let ctb = chroma.chroma_tb_size();          // 4 or 8
+    let log2_ctb = ctb.trailing_zeros();        // 2 or 3
     // Diagonal scan for this chroma TB size (4×4 or 8×8).
-    let chroma_scan: &[(usize, usize)] = if ctb == 4 {
-        &dct::DIAG_SCAN_4X4
-    } else {
-        &dct::ZIGZAG
-    };
+    let chroma_scan: &[(usize, usize)] = if ctb == 4 { &dct::DIAG_SCAN_4X4 } else { &dct::ZIGZAG };
 
     struct ChromaTb {
-        cb_zz: Vec<i16>,
-        cb_nz: bool,
-        cr_zz: Vec<i16>,
-        cr_nz: bool,
+        cb_zz: Vec<i16>, cb_nz: bool,
+        cr_zz: Vec<i16>, cr_nz: bool,
     }
 
     let mut tbs: Vec<ChromaTb> = Vec::with_capacity(n_chroma_tb);
@@ -1010,124 +889,54 @@ fn encode_cu(
         // [1 2 1]/4 filter exactly like luma (HEVC §8.4.4.2.3); 4×4 chroma is not.
         let filt = ctb > 4; // true only for 4:4:4 8×8 chroma
         let (bc0, ba, bl) = intra::get_reference_samples_chroma(
-            rec_cb,
-            cw_stride,
-            sub_ch_row,
-            ch_col,
-            coded_ch_h,
-            ctb,
-            sub_w,
-            sub_h,
-            yw_stride,
-            coded_yh,
-            luma_ctus_x,
-            lu_row,
-            lu_col,
-        );
-        let (baf, blf) = if filt {
-            intra::filter_references(bc0, &ba, &bl, ctb)
-        } else {
-            (ba, bl)
-        };
+            rec_cb, cw_stride, sub_ch_row, ch_col, coded_ch_h, ctb,
+            sub_w, sub_h, yw_stride, coded_yh, luma_ctus_x, lu_row, lu_col, neutral);
+        let (baf, blf) = if filt { intra::filter_references(bc0, &ba, &bl, ctb) } else { (ba, bl) };
         let cb_pred = intra::predict_planar(&baf, &blf, ctb);
         let (rc0, ra, rl) = intra::get_reference_samples_chroma(
-            rec_cr,
-            cw_stride,
-            sub_ch_row,
-            ch_col,
-            coded_ch_h,
-            ctb,
-            sub_w,
-            sub_h,
-            yw_stride,
-            coded_yh,
-            luma_ctus_x,
-            lu_row,
-            lu_col,
-        );
-        let (raf, rlf) = if filt {
-            intra::filter_references(rc0, &ra, &rl, ctb)
-        } else {
-            (ra, rl)
-        };
+            rec_cr, cw_stride, sub_ch_row, ch_col, coded_ch_h, ctb,
+            sub_w, sub_h, yw_stride, coded_yh, luma_ctus_x, lu_row, lu_col, neutral);
+        let (raf, rlf) = if filt { intra::filter_references(rc0, &ra, &rl, ctb) } else { (ra, rl) };
         let cr_pred = intra::predict_planar(&raf, &rlf, ctb);
 
         let b_orig = extract_block_dyn(src_cb, src_cw, src_ch, sub_ch_row, ch_col, ctb);
         let r_orig = extract_block_dyn(src_cr, src_cw, src_ch, sub_ch_row, ch_col, ctb);
-        let b_res: Vec<i32> = b_orig
-            .iter()
-            .zip(&cb_pred)
-            .map(|(&o, &p)| o as i32 - p as i32)
-            .collect();
-        let r_res: Vec<i32> = r_orig
-            .iter()
-            .zip(&cr_pred)
-            .map(|(&o, &p)| o as i32 - p as i32)
-            .collect();
-        let cb_level = crate::hevc_transform::quantize(
-            &crate::hevc_transform::fwd_transform(&b_res, ctb),
-            ctb,
-            chroma_qp,
-        );
-        let cr_level = crate::hevc_transform::quantize(
-            &crate::hevc_transform::fwd_transform(&r_res, ctb),
-            ctb,
-            chroma_qp,
-        );
-        let cb_zz: Vec<i16> = chroma_scan
-            .iter()
-            .map(|&(r, c)| cb_level[r * ctb + c])
-            .collect();
-        let cr_zz: Vec<i16> = chroma_scan
-            .iter()
-            .map(|&(r, c)| cr_level[r * ctb + c])
-            .collect();
+        let b_res: Vec<i32> = b_orig.iter().zip(&cb_pred).map(|(&o, &p)| o as i32 - p as i32).collect();
+        let r_res: Vec<i32> = r_orig.iter().zip(&cr_pred).map(|(&o, &p)| o as i32 - p as i32).collect();
+        let cb_level = crate::hevc_transform::quantize(&crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits()), ctb, chroma_qp, bit_depth.bits());
+        let cr_level = crate::hevc_transform::quantize(&crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits()), ctb, chroma_qp, bit_depth.bits());
+        let cb_zz: Vec<i16> = chroma_scan.iter().map(|&(r, c)| cb_level[r * ctb + c]).collect();
+        let cr_zz: Vec<i16> = chroma_scan.iter().map(|&(r, c)| cr_level[r * ctb + c]).collect();
         let cb_nz = cb_zz.iter().any(|&x| x != 0);
         let cr_nz = cr_zz.iter().any(|&x| x != 0);
 
         // Reconstruct this TB so the next stacked TB (4:2:2) sees it as a reference.
-        let b_dq = crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp);
-        let b_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&b_dq, ctb)
-            .iter()
-            .map(|&v| v as f32)
-            .collect();
-        let b_rec = intra::reconstruct(&cb_pred, &b_rec_f, ctb);
-        let r_dq = crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp);
-        let r_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&r_dq, ctb)
-            .iter()
-            .map(|&v| v as f32)
-            .collect();
-        let r_rec = intra::reconstruct(&cr_pred, &r_rec_f, ctb);
-        for r in 0..ctb {
-            for c in 0..ctb {
-                let (row, col) = (sub_ch_row + r, ch_col + c);
-                if row < coded_ch_h && col < cw_stride {
-                    rec_cb[row * cw_stride + col] = b_rec[r * ctb + c];
-                    rec_cr[row * cw_stride + col] = r_rec[r * ctb + c];
-                }
+        let b_dq = crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp, bit_depth.bits());
+        let b_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits()).iter().map(|&v| v as f32).collect();
+        let b_rec = intra::reconstruct(&cb_pred, &b_rec_f, ctb, max_val);
+        let r_dq = crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp, bit_depth.bits());
+        let r_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits()).iter().map(|&v| v as f32).collect();
+        let r_rec = intra::reconstruct(&cr_pred, &r_rec_f, ctb, max_val);
+        for r in 0..ctb { for c in 0..ctb {
+            let (row, col) = (sub_ch_row + r, ch_col + c);
+            if row < coded_ch_h && col < cw_stride {
+                rec_cb[row * cw_stride + col] = b_rec[r * ctb + c];
+                rec_cr[row * cw_stride + col] = r_rec[r * ctb + c];
             }
-        }
+        }}
 
-        tbs.push(ChromaTb {
-            cb_zz,
-            cb_nz,
-            cr_zz,
-            cr_nz,
-        });
+        tbs.push(ChromaTb { cb_zz, cb_nz, cr_zz, cr_nz });
     }
 
     // ── HEVC integer transform + quantize: luma 8×8 ───────────────────────
-    let y_orig = extract_block_n::<LU>(src_y, src_yw, src_yh, lu_row, lu_col);
-    let y_res = intra::compute_residual(&y_orig, &y_pred, LU);
+    let y_orig = extract_block_n::<LU>(src_y,  src_yw, src_yh,  lu_row, lu_col);
+    let y_res  = intra::compute_residual(&y_orig, &y_pred, LU);
     let y_res_i: Vec<i32> = y_res.iter().map(|&v| v as i32).collect();
-    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, LU);
-    let y_level = crate::hevc_transform::quantize(&y_tcoeff, LU, qp); // row-major levels
+    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, LU, bit_depth.bits());
+    let y_level  = crate::hevc_transform::quantize(&y_tcoeff, LU, qp, bit_depth.bits()); // row-major levels
     // Reorder row-major levels into HEVC diagonal scan order for residual_coding.
-    let y_zigzag: Vec<i16> = dct::ZIGZAG
-        .iter()
-        .map(|&(r, c)| y_level[r * LU + c])
-        .collect();
-    let y_nz = y_zigzag.iter().any(|&x| x != 0);
+    let y_zigzag: Vec<i16> = dct::ZIGZAG.iter().map(|&(r, c)| y_level[r * LU + c]).collect();
+    let y_nz     = y_zigzag.iter().any(|&x| x != 0);
 
     // ── CABAC: transform_tree() syntax ─────────────────────────────────────
     // split_transform_flag is inferred 0 (max_transform_hierarchy_depth_intra = 0),
@@ -1136,93 +945,54 @@ fn encode_cu(
     // cbf order (HEVC §7.3.8.8): for ChromaArrayType==2 (4:2:2) the two stacked
     // chroma TBs each have their own cbf, signalled cb[0],cb[1] then cr[0],cr[1],
     // before cbf_luma. For 4:2:0 there is one of each.
-    for t in &tbs {
-        encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
-    }
-    for t in &tbs {
-        encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
-    }
+    for t in &tbs { encode_cbf_chroma(enc, ctx, t.cb_nz, 0); }
+    for t in &tbs { encode_cbf_chroma(enc, ctx, t.cr_nz, 0); }
     // cbf_luma at trafoDepth=0 (intra, single TU → always coded)
     encode_cbf_luma(enc, ctx, y_nz, 0);
 
     // ── CABAC: residuals (HEVC §7.3.8.11) ─────────────────────────────────
     // Order: luma, then all Cb chroma TBs, then all Cr chroma TBs (component-major).
     // Chroma TB size is log2_ctb (2 for 4:2:0/4:2:2, 3 for 4:4:4).
-    if y_nz {
-        encode_residual(enc, ctx, &y_zigzag, 3, true);
-    }
-    for t in &tbs {
-        if t.cb_nz {
-            encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false);
-        }
-    }
-    for t in &tbs {
-        if t.cr_nz {
-            encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false);
-        }
-    }
+    if y_nz { encode_residual(enc, ctx, &y_zigzag, 3, true); }
+    for t in &tbs { if t.cb_nz { encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false); } }
+    for t in &tbs { if t.cr_nz { encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false); } }
 
     // ── Reconstruct luma (integer dequant + inverse transform) ─────────────
-    let y_dq = crate::hevc_transform::dequantize(&y_level, LU, qp);
-    let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, LU);
+    let y_dq  = crate::hevc_transform::dequantize(&y_level, LU, qp, bit_depth.bits());
+    let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, LU, bit_depth.bits());
     let y_res_rec_f: Vec<f32> = y_res_rec.iter().map(|&v| v as f32).collect();
-    let y_rec = intra::reconstruct(&y_pred, &y_res_rec_f, LU);
-    for r in 0..LU {
-        for c in 0..LU {
-            let (row, col) = (lu_row + r, lu_col + c);
-            if row < coded_yh && col < yw_stride {
-                rec_y[row * yw_stride + col] = y_rec[r * LU + c];
-            }
-        }
-    }
+    let y_rec = intra::reconstruct(&y_pred, &y_res_rec_f, LU, max_val);
+    for r in 0..LU { for c in 0..LU {
+        let (row,col)=(lu_row+r, lu_col+c);
+        if row < coded_yh && col < yw_stride { rec_y[row*yw_stride+col] = y_rec[r*LU+c]; }
+    }}
     // Chroma was already reconstructed into rec_cb/rec_cr inside the per-sub-TB loop
     // above (so each stacked sub-TB could serve as the next one's intra reference).
 }
 
 /// Extract an N×N block from a plane (compile-time N via const generic).
-fn extract_block_n<const N: usize>(
-    plane: &[u8],
-    src_w: usize,
-    src_h: usize,
-    row: usize,
-    col: usize,
-) -> Vec<u8> {
-    let mut out = vec![128u8; N * N];
-    for r in 0..N {
-        for c in 0..N {
-            out[r * N + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
-        }
-    }
+fn extract_block_n<const N: usize>(plane: &[u16], src_w: usize, src_h: usize, row: usize, col: usize) -> Vec<u16> {
+    let mut out = vec![128u16; N * N];
+    for r in 0..N { for c in 0..N {
+        out[r*N+c] = plane[(row+r).min(src_h-1) * src_w + (col+c).min(src_w-1)];
+    }}
     out
 }
 
 /// Extract an n×n block from a plane (runtime size). Used for chroma where the TB
 /// side is 4 (4:2:0/4:2:2) or 8 (4:4:4).
-fn extract_block_dyn(
-    plane: &[u8],
-    src_w: usize,
-    src_h: usize,
-    row: usize,
-    col: usize,
-    n: usize,
-) -> Vec<u8> {
-    let mut out = vec![128u8; n * n];
-    for r in 0..n {
-        for c in 0..n {
-            out[r * n + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
-        }
-    }
+fn extract_block_dyn(plane: &[u16], src_w: usize, src_h: usize, row: usize, col: usize, n: usize) -> Vec<u16> {
+    let mut out = vec![128u16; n * n];
+    for r in 0..n { for c in 0..n {
+        out[r*n+c] = plane[(row+r).min(src_h-1) * src_w + (col+c).min(src_w-1)];
+    }}
     out
 }
 
 /// 8×8 DCT-II + quantize → i16 coefficient matrix.
 fn dct_quantize_8x8(residual: &[f32], qmat: &[[u16; 8]; 8]) -> [[i16; 8]; 8] {
     let mut blk = [[0.0f32; 8]; 8];
-    for r in 0..8 {
-        for c in 0..8 {
-            blk[r][c] = residual[r * 8 + c];
-        }
-    }
+    for r in 0..8 { for c in 0..8 { blk[r][c] = residual[r*8+c]; } }
     dct::dct2d(&mut blk);
     dct::quantize(&blk, qmat)
 }
@@ -1231,54 +1001,30 @@ fn dct_quantize_8x8(residual: &[f32], qmat: &[[u16; 8]; 8]) -> [[i16; 8]; 8] {
 fn dct_quantize_4x4(residual: &[f32], qmat: &[[u16; 8]; 8]) -> [[i16; 4]; 4] {
     // Embed 4×4 into 8×8, DCT, take top-left 4×4
     let mut blk = [[0.0f32; 8]; 8];
-    for r in 0..4 {
-        for c in 0..4 {
-            blk[r][c] = residual[r * 4 + c];
-        }
-    }
+    for r in 0..4 { for c in 0..4 { blk[r][c] = residual[r*4+c]; } }
     dct::dct2d(&mut blk);
     let mut out = [[0i16; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            out[r][c] = (blk[r][c] / qmat[r][c] as f32).round() as i16;
-        }
-    }
+    for r in 0..4 { for c in 0..4 {
+        out[r][c] = (blk[r][c] / qmat[r][c] as f32).round() as i16;
+    }}
     out
 }
 
 /// Dequantize a 4×4 coefficient block.
 fn dequantize_4x4(coeffs: &[[i16; 4]; 4], qmat: &[[u16; 8]; 8]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            out[r][c] = coeffs[r][c] as f32 * qmat[r][c] as f32;
-        }
-    }
+    for r in 0..4 { for c in 0..4 { out[r][c] = coeffs[r][c] as f32 * qmat[r][c] as f32; } }
     out
 }
 
 /// Zigzag scan of a 4×4 coefficient block (16 elements).
 fn zigzag_scan_4x4(b: &[[i16; 4]; 4]) -> Vec<i16> {
     // HEVC up-right diagonal scan (row, col) — must match dct::DIAG_SCAN_4X4.
-    const ZZ: [(usize, usize); 16] = [
-        (0, 0),
-        (1, 0),
-        (0, 1),
-        (2, 0),
-        (1, 1),
-        (0, 2),
-        (3, 0),
-        (2, 1),
-        (1, 2),
-        (0, 3),
-        (3, 1),
-        (2, 2),
-        (1, 3),
-        (3, 2),
-        (2, 3),
-        (3, 3),
+    const ZZ: [(usize,usize);16] = [
+        (0,0),(1,0),(0,1),(2,0),(1,1),(0,2),(3,0),(2,1),
+        (1,2),(0,3),(3,1),(2,2),(1,3),(3,2),(2,3),(3,3),
     ];
-    ZZ.iter().map(|&(r, c)| b[r][c]).collect()
+    ZZ.iter().map(|&(r,c)| b[r][c]).collect()
 }
 
 /// 4×4 orthonormal forward DCT-II — exact transform pair with `idct2d_4x4`.
@@ -1296,11 +1042,7 @@ fn fdct2d_4x4(blk: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
         let n = 4usize;
         let mut out = [0.0f32; 4];
         for k in 0..n {
-            let wk = if k == 0 {
-                (1.0 / n as f32).sqrt()
-            } else {
-                (2.0 / n as f32).sqrt()
-            };
+            let wk = if k == 0 { (1.0 / n as f32).sqrt() } else { (2.0 / n as f32).sqrt() };
             let mut s = 0.0f32;
             for m in 0..n {
                 s += x[m] * (PI * k as f32 * (2 * m + 1) as f32 / (2 * n) as f32).cos();
@@ -1331,43 +1073,24 @@ fn idct2d_4x4(dq: &[[f32; 4]; 4]) -> Vec<f32> {
     use std::f32::consts::PI;
     let n = 4;
     let mut out = vec![0.0f32; n * n];
-    for row in 0..n {
-        for col in 0..n {
-            let mut s = 0.0f32;
-            for kr in 0..n {
-                for kc in 0..n {
-                    let wr = if kr == 0 {
-                        1.0 / (n as f32).sqrt()
-                    } else {
-                        (2.0 / n as f32).sqrt()
-                    };
-                    let wc = if kc == 0 {
-                        1.0 / (n as f32).sqrt()
-                    } else {
-                        (2.0 / n as f32).sqrt()
-                    };
-                    s += wr
-                        * wc
-                        * dq[kr][kc]
-                        * (PI * kr as f32 * (2 * row + 1) as f32 / (2 * n) as f32).cos()
-                        * (PI * kc as f32 * (2 * col + 1) as f32 / (2 * n) as f32).cos();
-                }
-            }
-            out[row * n + col] = s;
-        }
-    }
+    for row in 0..n { for col in 0..n {
+        let mut s = 0.0f32;
+        for kr in 0..n { for kc in 0..n {
+            let wr = if kr==0 {1.0/(n as f32).sqrt()} else {(2.0/n as f32).sqrt()};
+            let wc = if kc==0 {1.0/(n as f32).sqrt()} else {(2.0/n as f32).sqrt()};
+            s += wr*wc*dq[kr][kc]
+                 *(PI*kr as f32*(2*row+1) as f32/(2*n) as f32).cos()
+                 *(PI*kc as f32*(2*col+1) as f32/(2*n) as f32).cos();
+        }}
+        out[row*n+col] = s;
+    }}
     out
 }
 
 /// Extract a BS×BS block from a plane, clamping at boundaries.
 fn extract_block(
-    plane: &[u8],
-    src_w: usize,
-    src_h: usize,
-    _stride: usize,
-    brow: usize,
-    bcol: usize,
-    bs: usize,
+    plane: &[u8], src_w: usize, src_h: usize,
+    _stride: usize, brow: usize, bcol: usize, bs: usize,
 ) -> Vec<u8> {
     let mut out = vec![128u8; bs * bs];
     for r in 0..bs {
@@ -1388,22 +1111,12 @@ fn idct2d(dq: &[[f32; 8]; 8], n: usize) -> Vec<f32> {
         for col in 0..n {
             let mut sum = 0.0f32;
             for kr in 0..n {
-                let wr = if kr == 0 {
-                    1.0 / (n as f32).sqrt()
-                } else {
-                    (2.0 / n as f32).sqrt()
-                };
+                let wr = if kr == 0 { 1.0 / (n as f32).sqrt() } else { (2.0 / n as f32).sqrt() };
                 for kc in 0..n {
-                    let wc = if kc == 0 {
-                        1.0 / (n as f32).sqrt()
-                    } else {
-                        (2.0 / n as f32).sqrt()
-                    };
-                    sum += wr
-                        * wc
-                        * dq[kr][kc]
-                        * (PI * kr as f32 * (2 * row + 1) as f32 / (2 * n) as f32).cos()
-                        * (PI * kc as f32 * (2 * col + 1) as f32 / (2 * n) as f32).cos();
+                    let wc = if kc == 0 { 1.0 / (n as f32).sqrt() } else { (2.0 / n as f32).sqrt() };
+                    sum += wr * wc * dq[kr][kc]
+                         * (PI * kr as f32 * (2 * row + 1) as f32 / (2 * n) as f32).cos()
+                         * (PI * kc as f32 * (2 * col + 1) as f32 / (2 * n) as f32).cos();
                 }
             }
             out[row * n + col] = sum;
@@ -1437,17 +1150,14 @@ mod tests {
     #[test]
     fn nalu_stream_to_annex_b() {
         let stream = NaluStream {
-            nalus: vec![Nalu {
-                nal_type: 32,
-                data: vec![0x40, 0x01],
-            }],
+            nalus: vec![Nalu { nal_type: 32, data: vec![0x40, 0x01] }],
         };
         assert_eq!(&stream.to_annex_b()[0..4], &[0, 0, 0, 1]);
     }
 
     #[test]
     fn vps_starts_with_nalu_header() {
-        let vps = build_vps(256, 256, crate::fmt::ChromaFormat::Yuv420);
+        let vps = build_vps(256, 256, crate::fmt::ChromaFormat::Yuv420, crate::fmt::BitDepth::Eight);
         // NAL header byte 0: forbidden(1) | type(6) | layer_id[5:0] high bits
         // For VPS type=32=0b100000: byte0 = 0b0_100000_0 = 0x40
         assert_eq!(vps.data[0], 0x40, "VPS first byte should be 0x40");
@@ -1458,7 +1168,7 @@ mod tests {
         // 65×49 → padded to 72×56, window right=3/2=3 (but integer: (72-65)/2=3 wait no)
         // coded_w=72, crop_right=(72-65)/2=3... actually 65 is odd so (72-65)=7 which isn't /2
         // Let's try 64×48 → no padding needed
-        let sps = build_sps(64, 48, crate::fmt::ChromaFormat::Yuv420);
+        let sps = build_sps(64, 48, crate::fmt::ChromaFormat::Yuv420, crate::fmt::BitDepth::Eight);
         assert!(sps.data.len() > 10);
     }
 

@@ -11,24 +11,14 @@ use super::{contexts::ContextSet, engine::CabacEncoder};
 /// ffmpeg: GET_CABAC(elem_offset[CBF_LUMA] + !trafo_depth)
 /// cbf_luma[0] = trafo_depth != 0, cbf_luma[1] = trafo_depth == 0 (i.e. root TU).
 /// We always call at trafo_depth=0 (root), so use cbf_luma[1].
-pub fn encode_cbf_luma(
-    enc: &mut CabacEncoder,
-    ctx: &mut ContextSet,
-    flag: bool,
-    trafo_depth: usize,
-) {
+pub fn encode_cbf_luma(enc: &mut CabacEncoder, ctx: &mut ContextSet, flag: bool, trafo_depth: usize) {
     let idx = if trafo_depth == 0 { 1 } else { 0 };
     enc.encode_bin(flag as u8, &mut ctx.cbf_luma[idx]);
 }
 
 /// Encode cbf_cb or cbf_cr at given trafo_depth (0..4).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_CB_CR] + trafo_depth)
-pub fn encode_cbf_chroma(
-    enc: &mut CabacEncoder,
-    ctx: &mut ContextSet,
-    flag: bool,
-    trafo_depth: usize,
-) {
+pub fn encode_cbf_chroma(enc: &mut CabacEncoder, ctx: &mut ContextSet, flag: bool, trafo_depth: usize) {
     let idx = trafo_depth.min(4);
     enc.encode_bin(flag as u8, &mut ctx.cbf_chroma[idx]);
 }
@@ -61,9 +51,9 @@ pub fn encode_residual(
     let (last_row, last_col) = ZIGZAG_LOOKUP(last_scan_pos, log2_ts);
     encode_last_sig(enc, ctx, last_col as u32, last_row as u32, log2_ts, is_luma);
 
-    let tu_side = 1usize << log2_ts; // 8 or 4
-    let sb_side = (tu_side / 4).max(1); // sub-blocks per side (2 or 1)
-    let num_sb = sb_side * sb_side; // 4 or 1
+    let tu_side = 1usize << log2_ts;            // 8 or 4
+    let sb_side = (tu_side / 4).max(1);         // sub-blocks per side (2 or 1)
+    let num_sb  = sb_side * sb_side;            // 4 or 1
     let last_sb = last_scan_pos / 16;
 
     // Sub-block diagonal scan over the sb_side×sb_side grid (matches coeff layout).
@@ -86,10 +76,7 @@ pub fn encode_residual(
     };
 
     // Level-coding carry state across sub-blocks (libde265 c1 / first_subblock).
-    let mut level_state = LevelState {
-        c1: 1,
-        first_subblock: true,
-    };
+    let mut level_state = LevelState { c1: 1, first_subblock: true };
 
     // Walk sub-blocks from the last-significant sub-block down to DC (matches
     // HEVC §7.3.8.11: for(i = lastSubBlock; i >= 0; i--)). Sub-blocks above the
@@ -131,11 +118,7 @@ pub fn encode_residual(
         }
 
         let prev_csbf = csbf_neighbors[sb_grid];
-        let scan_top = if sb == last_sb {
-            last_scan_pos % 16
-        } else {
-            15
-        };
+        let scan_top = if sb == last_sb { last_scan_pos % 16 } else { 15 };
 
         let mut sig_positions: Vec<usize> = Vec::new();
         let mut any_sig_in_sb = false;
@@ -181,15 +164,7 @@ pub fn encode_residual(
             continue;
         }
         // sig_positions are in high→low scan order already.
-        encode_coeff_levels(
-            enc,
-            ctx,
-            coeffs,
-            &sig_positions,
-            sb,
-            is_luma,
-            &mut level_state,
-        );
+        encode_coeff_levels(enc, ctx, coeffs, &sig_positions, sb, is_luma, &mut level_state);
     }
 }
 
@@ -234,8 +209,8 @@ fn encode_last_sig(
     // and the minimum coordinate in each group). The prefix is a truncated-unary
     // code of the group index; the suffix is the offset within the group.
     const G_GROUP_IDX: [u32; 32] = [
-        0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9,
-        9, 9,
+        0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
     ];
     const G_MIN_IN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 
@@ -270,20 +245,8 @@ fn encode_last_sig(
     };
 
     // HEVC §7.3.8.11 order: x-prefix, y-prefix, then x-suffix, y-suffix.
-    encode_prefix(
-        enc,
-        &mut ctx.last_sig_coeff_x_prefix,
-        last_x,
-        ctx_offset,
-        ctx_shift,
-    );
-    encode_prefix(
-        enc,
-        &mut ctx.last_sig_coeff_y_prefix,
-        last_y,
-        ctx_offset,
-        ctx_shift,
-    );
+    encode_prefix(enc, &mut ctx.last_sig_coeff_x_prefix, last_x, ctx_offset, ctx_shift);
+    encode_prefix(enc, &mut ctx.last_sig_coeff_y_prefix, last_y, ctx_offset, ctx_shift);
     encode_suffix(enc, last_x);
     encode_suffix(enc, last_y);
 }
@@ -301,7 +264,12 @@ fn sig_coeff_ctx(
     scan_idx: u8,
     is_luma: bool,
 ) -> usize {
-    const CTX_IDX_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 99];
+    const CTX_IDX_MAP_4X4: [u8; 16] = [
+        0, 1, 4, 5,
+        2, 3, 4, 5,
+        6, 6, 8, 8,
+        7, 7, 8, 99,
+    ];
     let sb_width = 1usize << (log2_ts - 2); // sub-blocks per side (1 for 4×4, 2 for 8×8)
 
     let mut sig_ctx: i32;
@@ -317,33 +285,9 @@ fn sig_coeff_ctx(
         let xs = xc >> 2;
         let ys = yc >> 2;
         sig_ctx = match prev_csbf {
-            0 => {
-                if xp + yp >= 3 {
-                    0
-                } else if xp + yp > 0 {
-                    1
-                } else {
-                    2
-                }
-            }
-            1 => {
-                if yp == 0 {
-                    2
-                } else if yp == 1 {
-                    1
-                } else {
-                    0
-                }
-            }
-            2 => {
-                if xp == 0 {
-                    2
-                } else if xp == 1 {
-                    1
-                } else {
-                    0
-                }
-            }
+            0 => if xp + yp >= 3 { 0 } else if xp + yp > 0 { 1 } else { 2 },
+            1 => if yp == 0 { 2 } else if yp == 1 { 1 } else { 0 },
+            2 => if xp == 0 { 2 } else if xp == 1 { 1 } else { 0 },
             _ => 2,
         };
         if is_luma {
@@ -365,16 +309,12 @@ fn sig_coeff_ctx(
         }
     }
 
-    if is_luma {
-        sig_ctx as usize
-    } else {
-        27 + sig_ctx as usize
-    }
+    if is_luma { sig_ctx as usize } else { 27 + sig_ctx as usize }
 }
 
 /// Per-TU state carried across sub-blocks for level coding.
 struct LevelState {
-    c1: i32, // greater1 carry (the libde265 `c1`)
+    c1: i32,            // greater1 carry (the libde265 `c1`)
     first_subblock: bool,
 }
 
@@ -456,11 +396,7 @@ fn encode_coeff_levels(
             continue;
         }
         // base_level = 1 + greater1 + greater2 (the flags actually coded).
-        let g1 = if c < last_g1 {
-            greater1_flags[c] as i32
-        } else {
-            0
-        };
+        let g1 = if c < last_g1 { greater1_flags[c] as i32 } else { 0 };
         let g2 = if Some(c) == first_g1_one {
             (coeffs[sig_pos[c]].unsigned_abs() as i32 > 2) as i32
         } else {
@@ -486,9 +422,7 @@ fn encode_coeff_remaining(enc: &mut CabacEncoder, value: u32, rice_k: u32) {
     //   prefix  > 3:  value = (((1 << (prefix-3)) + 2) << k) + suffix(prefix-3+k bits)
     if value < (4u32 << rice_k) {
         let prefix = value >> rice_k;
-        for _ in 0..prefix {
-            enc.encode_bypass(1);
-        }
+        for _ in 0..prefix { enc.encode_bypass(1); }
         enc.encode_bypass(0);
         for i in (0..rice_k).rev() {
             enc.encode_bypass(((value >> i) & 1) as u8);
@@ -498,14 +432,10 @@ fn encode_coeff_remaining(enc: &mut CabacEncoder, value: u32, rice_k: u32) {
         let mut p = 4u32;
         loop {
             let base_next = ((1u32 << (p + 1 - 3)) + 2) << rice_k;
-            if value < base_next {
-                break;
-            }
+            if value < base_next { break; }
             p += 1;
         }
-        for _ in 0..p {
-            enc.encode_bypass(1);
-        }
+        for _ in 0..p { enc.encode_bypass(1); }
         enc.encode_bypass(0);
         let suffix_bits = p - 3 + rice_k;
         let codeword = value - (((1u32 << (p - 3)) + 2) << rice_k);
@@ -522,9 +452,7 @@ mod tests {
 
     fn make_coeffs(vals: &[(usize, i16)], len: usize) -> Vec<i16> {
         let mut c = vec![0i16; len];
-        for &(i, v) in vals {
-            c[i] = v;
-        }
+        for &(i, v) in vals { c[i] = v; }
         c
     }
 
