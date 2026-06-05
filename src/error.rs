@@ -5,6 +5,9 @@ pub enum EncodeError {
     #[error("Invalid image dimensions: {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
 
+    #[error("Invalid input: plane sizes or parameters are inconsistent")]
+    InvalidInput,
+
     #[error("DCT block error: {0}")]
     DctError(String),
 

@@ -233,7 +233,7 @@ fn encode_last_sig(
     // HEVC last-significant-coeff binarization tables (group index per coordinate,
     // and the minimum coordinate in each group). The prefix is a truncated-unary
     // code of the group index; the suffix is the offset within the group.
-    const G_GROUP_IDX: [u32; 32] = [
+    static G_GROUP_IDX: [u32; 32] = [
         0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9,
         9, 9,
     ];
@@ -301,7 +301,7 @@ fn sig_coeff_ctx(
     scan_idx: u8,
     is_luma: bool,
 ) -> usize {
-    const CTX_IDX_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 99];
+    static CTX_IDX_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 99];
     let sb_width = 1usize << (log2_ts - 2); // sub-blocks per side (1 for 4×4, 2 for 8×8)
 
     let mut sig_ctx: i32;

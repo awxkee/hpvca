@@ -47,7 +47,7 @@ pub const TRANS_IDX_LPS: [u8; 64] = [
 /// Index is lps>>3 (0..31). Values from x265/openHEVC renorm table.
 #[rustfmt::skip]
 #[allow(dead_code)]
-const RENORM_TABLE: [u32; 32] = [
+static RENORM_TABLE: [u32; 32] = [
     6,5,4,4,3,3,3,3,2,2,2,2,2,2,2,2,
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
 ];
@@ -81,6 +81,9 @@ impl CtxModel {
             }
         }
     }
+
+    /// Test-only constructor with an explicit probability state and MPS value.
+    #[cfg(test)]
     pub fn fixed(p: u8, m: u8) -> Self {
         CtxModel {
             p_state_idx: p,

@@ -1,35 +1,8 @@
-//! HEVC intra prediction for 8×8 luma and 4×4 chroma blocks.
+//! HEVC intra prediction for 8×8 luma and 4×4/8×8 chroma blocks.
 //!
-//! HEVC spec §8.4.4. We implement:
-//!   - DC mode   (mode 1): mean of above + left reference samples
-//!   - Planar mode (mode 0): bilinear blend from above-right + below-left
-//!
-//! For a still-image encoder with no inter prediction, DC mode gives good
-//! results for uniform areas and Planar handles gradients well.
-//! We select between the two based on variance of the reference samples.
-
-/// Intra prediction mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IntraMode {
-    /// Mode 0: bilinear ramp (Planar)
-    Planar = 0,
-    /// Mode 1: mean of boundary samples (DC)
-    Dc = 1,
-}
-
-/// Predict an N×N block using DC mode.
-///
-/// Reference samples:
-///   `above[0..n]` = row immediately above (left-to-right)
-///   `left[0..n]`  = column immediately to the left (top-to-bottom)
-///
-/// Returns an N×N prediction block as a flat Vec (row-major).
-pub fn predict_dc(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
-    let sum: u32 =
-        above.iter().map(|&x| x as u32).sum::<u32>() + left.iter().map(|&x| x as u32).sum::<u32>();
-    let dc = ((sum + n as u32) / (2 * n as u32)) as u16; // rounded mean
-    vec![dc; n * n]
-}
+//! HEVC spec §8.4.4. The encoder uses PLANAR mode everywhere (mode 0), which keeps
+//! the most-probable-mode derivation trivial and gives good results for both flat
+//! and gradient regions in still images.
 
 /// Predict an N×N block using Planar mode (HEVC §8.4.4.2.4).
 ///
@@ -46,33 +19,6 @@ pub fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
             let h = (n - 1 - col) as i32 * left[row] as i32 + (col + 1) as i32 * top_right;
             let v = (n - 1 - row) as i32 * above[col] as i32 + (row + 1) as i32 * bottom_left;
             pred[row * n + col] = ((h + v + n as i32) >> (log2 + 1)) as u16;
-        }
-    }
-    pred
-}
-
-/// Rectangular PLANAR prediction for a `w`×`h` block (HEVC §8.4.4.2.4 generalised
-/// to non-square blocks, as used for 4:2:2 chroma where the block is 4 wide × 8
-/// tall). `above` has length ≥ w+1 (above[0..w] plus top-right at above[w]); `left`
-/// has length ≥ h+1 (left[0..h] plus bottom-left at left[h]). Returns row-major w*h.
-pub fn predict_planar_rect(above: &[u16], left: &[u16], w: usize, h: usize) -> Vec<u16> {
-    let mut pred = vec![0u16; w * h];
-    let top_right = above[w] as i32;
-    let bottom_left = left[h] as i32;
-    // HEVC planar: predSamples[x][y] =
-    //   ( (W-1-x)*p[-1][y] + (x+1)*p[W][-1] + (H-1-y)*p[x][-1] + (y+1)*p[-1][H]
-    //     + W (when... ) ) — the standard uses normalisation by (W*H) with shift.
-    // For W,H powers of two we use: (h_term*H + v_term*W ...) Simpler: use the
-    // separable form with rounding by (w*h):
-    let wh = (w * h) as i32;
-    let shift = (w * h).trailing_zeros(); // log2(w*h)
-    for y in 0..h {
-        for x in 0..w {
-            let horiz = (w as i32 - 1 - x as i32) * left[y] as i32 + (x as i32 + 1) * top_right;
-            let vert = (h as i32 - 1 - y as i32) * above[x] as i32 + (y as i32 + 1) * bottom_left;
-            // predV scaled by W, predH scaled by H → combine and normalise by 2*W*H.
-            let val = (horiz * h as i32 + vert * w as i32 + wh) >> (shift + 1);
-            pred[y * w + x] = val as u16;
         }
     }
     pred
@@ -116,30 +62,6 @@ pub fn filter_references(
     }
     let _ = n;
     (fa, fl)
-}
-
-/// Choose DC vs Planar based on variance of the reference samples.
-///
-/// High variance → Planar (samples vary a lot → gradient likely).
-/// Low variance  → DC (uniform area).
-pub fn choose_mode(above: &[u16], left: &[u16]) -> IntraMode {
-    let all: Vec<u16> = above.iter().chain(left.iter()).copied().collect();
-    let n = all.len();
-    let mean = all.iter().map(|&x| x as u32).sum::<u32>() / n as u32;
-    let var = all
-        .iter()
-        .map(|&x| {
-            let d = x as i64 - mean as i64;
-            (d * d) as u64
-        })
-        .sum::<u64>()
-        / n as u64;
-
-    if var > 64 * 64 {
-        IntraMode::Planar
-    } else {
-        IntraMode::Dc
-    }
 }
 
 /// Decode-order ("z-scan") index of the 8×8 (luma) / 4×4 (chroma) block that
@@ -457,23 +379,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dc_flat_block() {
-        let above = vec![100u16; 9]; // n=8, +1 corner
-        let left = vec![100u16; 9];
-        let pred = predict_dc(&above[..8], &left[..8], 8);
-        assert_eq!(pred, vec![100u16; 64]);
-    }
-
-    #[test]
-    fn dc_mixed() {
-        let above = vec![200u16; 8];
-        let left = vec![100u16; 8];
-        let pred = predict_dc(&above, &left, 8);
-        // mean = (200*8 + 100*8) / 16 = 150
-        assert_eq!(pred[0], 150);
-    }
-
-    #[test]
     fn planar_corners() {
         let mut above = vec![0u16; 9];
         let mut left = vec![0u16; 9];
@@ -492,19 +397,5 @@ mod tests {
         let pred = vec![128u16; 64];
         let res = compute_residual(&pixels, &pred, 8);
         assert!(res.iter().all(|&r| r == 0.0));
-    }
-
-    #[test]
-    fn choose_mode_uniform() {
-        let above = vec![128u16; 8];
-        let left = vec![128u16; 8];
-        assert_eq!(choose_mode(&above, &left), IntraMode::Dc);
-    }
-
-    #[test]
-    fn choose_mode_gradient() {
-        let above: Vec<u16> = (0..8u16).map(|i| i * 30).collect();
-        let left: Vec<u16> = (0..8u16).map(|i| 255 - i * 30).collect();
-        assert_eq!(choose_mode(&above, &left), IntraMode::Planar);
     }
 }

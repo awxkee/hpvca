@@ -10,7 +10,7 @@
 //! same domain the decoder inverts, so encoder reconstruction == decoder output.
 
 /// 4×4 HEVC transform matrix.
-const T4: [[i32; 4]; 4] = [
+static T4: [[i32; 4]; 4] = [
     [64, 64, 64, 64],
     [83, 36, -36, -83],
     [64, -64, -64, 64],
@@ -18,7 +18,7 @@ const T4: [[i32; 4]; 4] = [
 ];
 
 /// 8×8 HEVC transform matrix.
-const T8: [[i32; 8]; 8] = [
+static T8: [[i32; 8]; 8] = [
     [64, 64, 64, 64, 64, 64, 64, 64],
     [89, 75, 50, 18, -18, -50, -75, -89],
     [83, 36, -36, -83, -83, -36, 36, 83],
@@ -29,17 +29,8 @@ const T8: [[i32; 8]; 8] = [
     [18, -50, 75, -89, 89, -75, 50, -18],
 ];
 
-const QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
-const DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
-
-#[inline]
-fn row(matrix_row: &[i32], v: &[i64], n: usize) -> i64 {
-    let mut s = 0i64;
-    for i in 0..n {
-        s += matrix_row[i] as i64 * v[i];
-    }
-    s
-}
+static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
+static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 fn t_row(n: usize, i: usize, j: usize) -> i64 {
     (if n == 8 { T8[i][j] } else { T4[i][j] }) as i64

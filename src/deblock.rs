@@ -12,12 +12,12 @@
 //! deblocking filter enabled in the PPS (default offsets), the encoder's
 //! reconstruction therefore matches the decoder's output bit-for-bit.
 
-const BETA_TABLE: [i32; 52] = [
+static BETA_TABLE: [i32; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
     20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64,
 ];
 
-const TC_TABLE: [i32; 54] = [
+static TC_TABLE: [i32; 54] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3,
     3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24,
 ];

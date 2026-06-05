@@ -12,7 +12,6 @@
 //!   mdat  ← offset stored in iloc is patched after mdat position is known
 
 use crate::{error::EncodeError, hevc::NaluStream};
-use std::io::Write;
 
 fn w32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_be_bytes());
@@ -40,6 +39,22 @@ fn patch(buf: &mut Vec<u8>, start: usize) {
     buf[start..start + 4].copy_from_slice(&size.to_be_bytes());
 }
 
+/// Write a `colr` box from the requested colour metadata: either an `nclx` payload
+/// (enumerated CICP) or a `prof` payload (embedded ICC profile).
+fn write_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
+    use crate::color::ColorMetadata;
+    let sh = f.len();
+    write_box(f, b"colr");
+    match color {
+        ColorMetadata::Cicp(enc) => f.extend_from_slice(&enc.nclx_payload()),
+        ColorMetadata::Icc(icc) => {
+            f.extend_from_slice(b"prof");
+            f.extend_from_slice(icc);
+        }
+    }
+    patch(f, sh);
+}
+
 /// Wrap a color HEVC image plus a monochrome HEVC alpha image into a HEIC file.
 ///
 /// The alpha channel is a standalone monochrome (4:0:0) HEVC image item, linked to
@@ -54,6 +69,7 @@ pub fn wrap_hevc_image_with_alpha(
     width: u32,
     height: u32,
     bit_depth: crate::fmt::BitDepth,
+    color_meta: &crate::color::ColorMetadata,
 ) -> Result<Vec<u8>, EncodeError> {
     let color_sample = color.to_length_prefixed_slices();
     let alpha_sample = alpha.to_length_prefixed_slices();
@@ -197,14 +213,8 @@ pub fn wrap_hevc_image_with_alpha(
                 f.push(bit_depth.bits());
                 patch(&mut f, sh);
             }
-            // 4: colr (color ICC)
-            {
-                let sh = f.len();
-                write_box(&mut f, b"colr");
-                f.extend_from_slice(b"prof");
-                f.extend_from_slice(&crate::icc_profile::SRGB_ICC);
-                patch(&mut f, sh);
-            }
+            // 4: colr (color metadata — nclx CICP or ICC profile)
+            write_colr(&mut f, color_meta);
             // 5: hvcC (alpha)
             {
                 let sh = f.len();
@@ -277,6 +287,7 @@ pub fn wrap_hevc_image(
     width: u32,
     height: u32,
     bit_depth: crate::fmt::BitDepth,
+    color_meta: &crate::color::ColorMetadata,
 ) -> Result<Vec<u8>, EncodeError> {
     let hevc_sample = stream.to_length_prefixed_slices();
     let hvcC_data = build_hvcC(stream, bit_depth.bits())?;
@@ -393,17 +404,12 @@ pub fn wrap_hevc_image(
                 f.push(bit_depth.bits()); // bits_per_channel[2] (Cr)
                 patch(&mut f, sh);
             }
-            // prop 4: colr (ICC profile). Apple's ImageIO renders nclx-tagged HEICs
-            // as BLACK on current macOS even though it parses the nclx as sRGB; an
-            // embedded ICC profile (exactly what libheif does) renders correctly.
-            // The profile is sRGB IEC61966-2.1 (from littleCMS).
-            {
-                let sh = f.len();
-                write_box(&mut f, b"colr");
-                f.extend_from_slice(b"prof"); // colour_type = ICC profile
-                f.extend_from_slice(&crate::icc_profile::SRGB_ICC); // the ICC profile bytes
-                patch(&mut f, sh);
-            }
+            // prop 4: colr — colour metadata. Either enumerated CICP ('nclx') or an
+            // embedded ICC profile ('prof'). The default is an sRGB ICC profile,
+            // because Apple's ImageIO has rendered some nclx-only HEICs as black even
+            // when it parses the nclx as sRGB; an ICC profile (as libheif embeds)
+            // renders correctly. CICP is available for compact/HDR signalling.
+            write_colr(&mut f, color_meta);
             patch(&mut f, si);
         }
 
@@ -570,13 +576,27 @@ mod tests {
     }
     #[test]
     fn ftyp_brand() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(&b[4..8], b"ftyp");
         assert_eq!(&b[8..12], b"heic");
     }
     #[test]
     fn box_order_ftyp_meta_mdat() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+        )
+        .unwrap();
         let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
         assert_eq!(
             &b[ftyp_size + 4..ftyp_size + 8],
@@ -593,7 +613,14 @@ mod tests {
     }
     #[test]
     fn iloc_offset_points_into_mdat() {
-        let b = wrap_hevc_image(&make_test_stream(), 16, 16, crate::fmt::BitDepth::Eight).unwrap();
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+        )
+        .unwrap();
         // Find mdat payload start
         let mut pos = 0usize;
         let mut mdat_payload_offset = 0u32;
@@ -623,8 +650,15 @@ mod tests {
     fn alpha_container_structure() {
         let color = make_test_stream();
         let alpha = make_test_stream();
-        let b = wrap_hevc_image_with_alpha(&color, &alpha, 16, 16, crate::fmt::BitDepth::Eight)
-            .unwrap();
+        let b = wrap_hevc_image_with_alpha(
+            &color,
+            &alpha,
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+        )
+        .unwrap();
         let s = b.as_slice();
         // Two items, two hvcC, the auxl reference, the auxC property and the URN.
         assert!(s.windows(4).any(|w| w == b"iref"), "iref box required");

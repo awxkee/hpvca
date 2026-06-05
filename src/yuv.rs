@@ -24,6 +24,49 @@ pub struct Yuv {
 }
 
 impl Yuv {
+    /// Build a `Yuv` from caller-supplied planar samples, for the YUV-direct encode
+    /// path ([`crate::encode_yuv`]). Validates that the plane lengths match the
+    /// dimensions and chroma format. For monochrome, `cb`/`cr` must be empty.
+    ///
+    /// Samples must be at `bit_depth`'s native range. `width`/`height` are the visible
+    /// dimensions; the luma plane must be exactly `width*height` and each chroma plane
+    /// `ceil(width/sub_w) * ceil(height/sub_h)`.
+    pub fn from_planes(
+        y: Vec<u16>,
+        cb: Vec<u16>,
+        cr: Vec<u16>,
+        width: u32,
+        height: u32,
+        chroma: ChromaFormat,
+        bit_depth: BitDepth,
+    ) -> Result<Self, crate::error::EncodeError> {
+        let w = width as usize;
+        let h = height as usize;
+        if y.len() != w * h {
+            return Err(crate::error::EncodeError::InvalidInput);
+        }
+        if chroma.is_monochrome() {
+            if !cb.is_empty() || !cr.is_empty() {
+                return Err(crate::error::EncodeError::InvalidInput);
+            }
+        } else {
+            let cw = (w + chroma.sub_w() - 1) / chroma.sub_w();
+            let ch = (h + chroma.sub_h() - 1) / chroma.sub_h();
+            if cb.len() != cw * ch || cr.len() != cw * ch {
+                return Err(crate::error::EncodeError::InvalidInput);
+            }
+        }
+        Ok(Yuv {
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            chroma,
+            bit_depth,
+        })
+    }
+
     pub fn luma_stride(&self) -> usize {
         self.width as usize
     }

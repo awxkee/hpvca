@@ -8,9 +8,6 @@
 
 use super::engine::CtxModel;
 
-/// CNU = "context not used" sentinel value (127 in ffmpeg).
-const CNU: u8 = 154; // use a neutral probability when context not applicable
-
 /// All context models for I-slice residual coding, keyed by ffmpeg's
 /// init_values[0] (I-slice column).
 pub struct ContextSet {
