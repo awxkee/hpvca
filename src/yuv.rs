@@ -29,14 +29,7 @@
 use crate::fmt::{BitDepth, ChromaFormat};
 use crate::{EncodeError, checked_buffer_size, validate_dims};
 
-/// Planar YCbCr image. Samples are u16 (valid range depends on bit depth).
-///
-/// `width`/`height` are the *coded/conformance* dimensions the planes are stored at
-/// — rounded up to the chroma subsampling grid so chroma planes are well-defined.
-/// `display_w`/`display_h` are the *true visible* dimensions (which may be odd); the
-/// HEIF `ispe` box reports these so the decoder shows exactly the original size even
-/// when the coded picture is one pixel larger. They equal `width`/`height` unless the
-/// source had odd dimensions under a subsampled chroma format.
+/// Planar YCbCr image
 pub struct Yuv {
     pub y: Vec<u16>,
     pub cb: Vec<u16>,
@@ -65,21 +58,21 @@ impl Yuv {
         height: u32,
         chroma: ChromaFormat,
         bit_depth: BitDepth,
-    ) -> Result<Self, crate::error::EncodeError> {
+    ) -> Result<Self, EncodeError> {
         let w = width as usize;
         let h = height as usize;
         if y.len() != w * h {
-            return Err(crate::error::EncodeError::InvalidInput);
+            return Err(EncodeError::InvalidInput);
         }
         if chroma.is_monochrome() {
             if !cb.is_empty() || !cr.is_empty() {
-                return Err(crate::error::EncodeError::InvalidInput);
+                return Err(EncodeError::InvalidInput);
             }
         } else {
             let cw = w.div_ceil(chroma.sub_w());
             let ch = h.div_ceil(chroma.sub_h());
             if cb.len() != cw * ch || cr.len() != cw * ch {
-                return Err(crate::error::EncodeError::InvalidInput);
+                return Err(EncodeError::InvalidInput);
             }
         }
         Ok(Yuv {
@@ -179,18 +172,14 @@ pub(crate) fn rgb_to_yuv(
     let maxv = bit_depth.max_val() as f32;
     let neutral = bit_depth.neutral() as f32;
 
-    // Hoisted reciprocals — avoid repeated division in the hot loop.
     const REC_CB: f32 = 1.0 / 1.8556;
     const REC_CR: f32 = 1.0 / 1.5748;
 
-    // ── Monochrome path ───────────────────────────────────────────────────
     if chroma.is_monochrome() {
         let channels = rgb.len() / (w * h);
         let y_plane: Vec<u16> = if channels == 1 {
-            // 1-channel input: direct copy, no matrix.
             rgb.to_vec()
         } else {
-            // Multi-channel input: derive luma via BT.709.
             rgb.chunks_exact(channels)
                 .map(|px| {
                     let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
@@ -234,7 +223,6 @@ pub(crate) fn rgb_to_yuv(
     let (cb_plane, cr_plane): (Vec<u16>, Vec<u16>) = (0..ch)
         .flat_map(|crow| (0..cw).map(move |ccol| (crow, ccol)))
         .map(|(crow, ccol)| {
-            // Accumulate over the luma block covered by this chroma sample.
             let (sum_cb, sum_cr, count) = (0..sh)
                 .flat_map(|dy| (0..sw).map(move |dx| (dy, dx)))
                 .filter(|&(dy, dx)| {
