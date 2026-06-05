@@ -352,15 +352,10 @@ pub(crate) fn rgb_to_yuv(
 
                 let (y_row0, y_row1) = y_pair.split_at_mut(w);
 
-                // Row 0: luma + first chroma estimate (horizontal avg of pairs).
                 process_row(src0, y_row0, Some(cb_row), Some(cr_row), neutral_q13, maxv);
 
-                // Row 1: luma only — accumulate its chroma into a temp row,
-                // then average with row0's chroma already in cb_row/cr_row.
                 process_row(src1, y_row1, None, None, neutral_q13, maxv);
 
-                // Average row0 chroma with row1 chroma vertically.
-                // We compute row1 chroma inline here and fold directly.
                 let pairs1 = src1.chunks_exact(6);
                 let remainder1 = pairs1.remainder();
 
