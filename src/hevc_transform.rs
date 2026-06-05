@@ -96,7 +96,7 @@ fn fwd_transform_n<const N: usize>(res: &[i32], t: &[[i32; N]; N], bit_depth: u8
     coeff
 }
 
-/// Forward quantisation: coeff → level. Intra rounding offset.
+/// Forward quantization: coeff → level
 pub(crate) fn quantize(coeff: &[i64], n: usize, qp: u8, bit_depth: u8) -> Vec<i16> {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
     let bd = bit_depth as i64;
