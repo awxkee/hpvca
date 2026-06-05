@@ -5,5 +5,16 @@ members = ["app"]
 name = "hpvca"
 version = "0.1.0"
 edition = "2024"
+description = "HEVC/HEIC tiny image encoder"
+readme = "README.md"
+keywords = ["heic", "heif", "hevc", "encoder", "image"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/hpvca"
+categories = ["multimedia::images", "compression", "encoding"]
+homepage = "https://github.com/awxkee/hpvca"
+repository = "https://github.com/awxkee/hpvca"
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
+rust-version = "1.93.0"
 
 [dependencies]
