@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig, PixelLayout};
+use hpvca::{BitDepth, ChromaFormat, EncodeConfig};
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
@@ -37,14 +37,11 @@ fn main() {
     let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
-    let data = hpvca::encode_with_alpha(
+    let data = hpvca::encode_rgba10(
         &arr,
         img.width(),
         img.height(),
-        PixelLayout::Rgba,
-        &EncodeConfig::default()
-            .with_bit_depth(BitDepth::Ten)
-            .with_chroma(ChromaFormat::Yuv444),
+        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv444),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
