@@ -66,7 +66,7 @@ pub struct EncodeConfig {
     /// Chroma subsampling format. Ignored by the `gray*` entry points, which
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
-    /// Colour metadata written to the `colr` box / VUI.
+    /// Color metadata written to the `colr` box / VUI.
     pub color: ColorMetadata,
     /// Optional image metadata (orientation, HDR light level, EXIF).
     pub metadata: Metadata,
