@@ -30,6 +30,7 @@
 use hpvca::{BitDepth, ChromaFormat, EncodeConfig, PixelLayout};
 use std::fs;
 use std::time::Instant;
+use image::imageops::FilterType;
 
 fn main() {
     let img = image::open("./assets/abstract_alpha.png")
