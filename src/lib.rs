@@ -296,8 +296,6 @@ pub fn encode_rgba12_with_alpha(
     encode_rgba_with_alpha_wide(rgba, width, height, BitDepth::Twelve, cfg)
 }
 
-// ── 8-bit Gray / GrayAlpha ────────────────────────────────────────────────────
-
 /// Encode a packed 8-bit greyscale image to HEIC (monochrome, no chroma).
 ///
 /// `gray` must hold exactly `width * height` bytes.
