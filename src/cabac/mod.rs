@@ -1,7 +1,7 @@
-pub mod engine;
 pub mod contexts;
+pub mod engine;
 pub mod residual;
 
-pub use engine::CabacEncoder;
 pub use contexts::{ContextSet, IntraModeContexts};
-pub use residual::{encode_residual, encode_cbf_luma, encode_cbf_chroma};
+pub use engine::CabacEncoder;
+pub use residual::{encode_cbf_chroma, encode_cbf_luma, encode_residual};

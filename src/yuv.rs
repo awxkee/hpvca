@@ -24,7 +24,9 @@ pub struct Yuv {
 }
 
 impl Yuv {
-    pub fn luma_stride(&self) -> usize { self.width as usize }
+    pub fn luma_stride(&self) -> usize {
+        self.width as usize
+    }
     pub fn chroma_stride(&self) -> usize {
         (self.width as usize + self.chroma.sub_w() - 1) / self.chroma.sub_w()
     }
@@ -43,7 +45,13 @@ impl Yuv {
 /// Uses full-range BT.709: Y = 0.2126R + 0.7152G + 0.0722B, and chroma centred at
 /// `neutral = 2^(bit_depth-1)` with the standard 1.8556 / 1.5748 divisors (which
 /// operate on native-range sample differences, so they are bit-depth independent).
-pub fn rgb_to_yuv(rgb: &[u16], width: u32, height: u32, chroma: ChromaFormat, bit_depth: BitDepth) -> Yuv {
+pub fn rgb_to_yuv(
+    rgb: &[u16],
+    width: u32,
+    height: u32,
+    chroma: ChromaFormat,
+    bit_depth: BitDepth,
+) -> Yuv {
     let w = width as usize;
     let h = height as usize;
     let maxv = bit_depth.max_val() as f32;
@@ -60,7 +68,15 @@ pub fn rgb_to_yuv(rgb: &[u16], width: u32, height: u32, chroma: ChromaFormat, bi
     }
 
     if chroma.is_monochrome() {
-        return Yuv { y: y_plane, cb: Vec::new(), cr: Vec::new(), width, height, chroma, bit_depth };
+        return Yuv {
+            y: y_plane,
+            cb: Vec::new(),
+            cr: Vec::new(),
+            width,
+            height,
+            chroma,
+            bit_depth,
+        };
     }
 
     let sw = chroma.sub_w();
@@ -100,7 +116,15 @@ pub fn rgb_to_yuv(rgb: &[u16], width: u32, height: u32, chroma: ChromaFormat, bi
         }
     }
 
-    Yuv { y: y_plane, cb: cb_plane, cr: cr_plane, width, height, chroma, bit_depth }
+    Yuv {
+        y: y_plane,
+        cb: cb_plane,
+        cr: cr_plane,
+        width,
+        height,
+        chroma,
+        bit_depth,
+    }
 }
 
 /// Backwards-compatible 8-bit 4:2:0 helper (accepts packed 8-bit RGB).
@@ -115,7 +139,13 @@ mod tests {
 
     #[test]
     fn white_pixel_8bit() {
-        let yuv = rgb_to_yuv(&[255u16, 255, 255], 1, 1, ChromaFormat::Yuv420, BitDepth::Eight);
+        let yuv = rgb_to_yuv(
+            &[255u16, 255, 255],
+            1,
+            1,
+            ChromaFormat::Yuv420,
+            BitDepth::Eight,
+        );
         assert!(yuv.y[0] > 250);
         assert!((yuv.cb[0] as i32 - 128).abs() < 5);
     }
@@ -123,9 +153,23 @@ mod tests {
     #[test]
     fn white_pixel_10bit() {
         // Native 10-bit white is 1023 per channel.
-        let yuv = rgb_to_yuv(&[1023u16, 1023, 1023], 1, 1, ChromaFormat::Yuv420, BitDepth::Ten);
-        assert!(yuv.y[0] > 1000, "10-bit white Y should approach 1023, got {}", yuv.y[0]);
-        assert!((yuv.cb[0] as i32 - 512).abs() < 20, "10-bit neutral chroma ~512, got {}", yuv.cb[0]);
+        let yuv = rgb_to_yuv(
+            &[1023u16, 1023, 1023],
+            1,
+            1,
+            ChromaFormat::Yuv420,
+            BitDepth::Ten,
+        );
+        assert!(
+            yuv.y[0] > 1000,
+            "10-bit white Y should approach 1023, got {}",
+            yuv.y[0]
+        );
+        assert!(
+            (yuv.cb[0] as i32 - 512).abs() < 20,
+            "10-bit neutral chroma ~512, got {}",
+            yuv.cb[0]
+        );
     }
 
     #[test]
@@ -136,20 +180,38 @@ mod tests {
 
     #[test]
     fn dimensions_monochrome() {
-        let yuv = rgb_to_yuv(&vec![128u16; 4*4*3], 4, 4, ChromaFormat::Monochrome, BitDepth::Eight);
+        let yuv = rgb_to_yuv(
+            &vec![128u16; 4 * 4 * 3],
+            4,
+            4,
+            ChromaFormat::Monochrome,
+            BitDepth::Eight,
+        );
         assert_eq!(yuv.y.len(), 16);
         assert_eq!(yuv.cb.len(), 0);
     }
 
     #[test]
     fn dimensions_444() {
-        let yuv = rgb_to_yuv(&vec![128u16; 4*4*3], 4, 4, ChromaFormat::Yuv444, BitDepth::Eight);
+        let yuv = rgb_to_yuv(
+            &vec![128u16; 4 * 4 * 3],
+            4,
+            4,
+            ChromaFormat::Yuv444,
+            BitDepth::Eight,
+        );
         assert_eq!(yuv.cb.len(), 16);
     }
 
     #[test]
     fn dimensions_422() {
-        let yuv = rgb_to_yuv(&vec![128u16; 4*4*3], 4, 4, ChromaFormat::Yuv422, BitDepth::Eight);
+        let yuv = rgb_to_yuv(
+            &vec![128u16; 4 * 4 * 3],
+            4,
+            4,
+            ChromaFormat::Yuv422,
+            BitDepth::Eight,
+        );
         assert_eq!(yuv.cb.len(), 8);
     }
 }

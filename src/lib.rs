@@ -18,7 +18,7 @@ pub use fmt::{BitDepth, ChromaFormat};
 /// latest source and aren't running a stale checkpoint.
 pub const BUILD_ID: &str = "apple-compat-2026-06-04: 64x64 CTB, IDR_N_LP(20), \
 slice-only mdat, iloc-before-iinf, array_completeness=0, BT.709 full-range, \
-colr nclx present, even-dim rounding, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10-bit";
+colr nclx present, even-dim rounding, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10+12-bit";
 
 /// Encode an RGBA image to HEIC with an alpha channel (8-bit, packed `u8`).
 ///
