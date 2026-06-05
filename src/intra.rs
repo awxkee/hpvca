@@ -25,8 +25,8 @@ pub enum IntraMode {
 ///
 /// Returns an N×N prediction block as a flat Vec (row-major).
 pub fn predict_dc(above: &[u8], left: &[u8], n: usize) -> Vec<u8> {
-    let sum: u32 = above.iter().map(|&x| x as u32).sum::<u32>()
-        + left.iter().map(|&x| x as u32).sum::<u32>();
+    let sum: u32 =
+        above.iter().map(|&x| x as u32).sum::<u32>() + left.iter().map(|&x| x as u32).sum::<u32>();
     let dc = ((sum + n as u32) / (2 * n as u32)) as u8; // rounded mean
     vec![dc; n * n]
 }
@@ -43,10 +43,8 @@ pub fn predict_planar(above: &[u8], left: &[u8], n: usize) -> Vec<u8> {
 
     for row in 0..n {
         for col in 0..n {
-            let h = (n - 1 - col) as i32 * left[row] as i32
-                  + (col + 1) as i32 * top_right;
-            let v = (n - 1 - row) as i32 * above[col] as i32
-                  + (row + 1) as i32 * bottom_left;
+            let h = (n - 1 - col) as i32 * left[row] as i32 + (col + 1) as i32 * top_right;
+            let v = (n - 1 - row) as i32 * above[col] as i32 + (row + 1) as i32 * bottom_left;
             pred[row * n + col] = ((h + v + n as i32) >> (log2 + 1)) as u8;
         }
     }
@@ -97,12 +95,20 @@ pub fn choose_mode(above: &[u8], left: &[u8]) -> IntraMode {
     let all: Vec<u8> = above.iter().chain(left.iter()).copied().collect();
     let n = all.len();
     let mean = all.iter().map(|&x| x as u32).sum::<u32>() / n as u32;
-    let var = all.iter().map(|&x| {
-        let d = x as i64 - mean as i64;
-        (d * d) as u64
-    }).sum::<u64>() / n as u64;
+    let var = all
+        .iter()
+        .map(|&x| {
+            let d = x as i64 - mean as i64;
+            (d * d) as u64
+        })
+        .sum::<u64>()
+        / n as u64;
 
-    if var > 64 * 64 { IntraMode::Planar } else { IntraMode::Dc }
+    if var > 64 * 64 {
+        IntraMode::Planar
+    } else {
+        IntraMode::Dc
+    }
 }
 
 /// Decode-order ("z-scan") index of the 8×8 (luma) / 4×4 (chroma) block that
@@ -114,21 +120,43 @@ fn decode_order(r: usize, c: usize, blk: usize, ctu: usize, ctus_x: usize) -> i6
     let ctu_r = r / ctu;
     let ctu_c = c / ctu;
     let ctu_idx = ctu_r * ctus_x + ctu_c;
-    // sub-block position within the CTU
+    // Sub-block grid position within the CTU (in units of `blk`).
     let sub_r = (r % ctu) / blk;
     let sub_c = (c % ctu) / blk;
-    // Z-scan order of [(0,0)->0,(0,1)->1,(1,0)->2,(1,1)->3]
-    let z = sub_r * 2 + sub_c;
-    (ctu_idx as i64) * 4 + z as i64
+    // Hierarchical Z-scan (Morton order): interleave the bits of sub_r and sub_c.
+    // For a 2×2 grid (16-CTU / 8-blk) this reduces to sub_r*2+sub_c.
+    // For a 4×4 grid (32-CTU / 8-blk) it produces the correct nested Z-order:
+    //   the CTB splits into four quadrants (Z-scan), each into four CUs (Z-scan).
+    let grid = ctu / blk; // sub-blocks per side (2 or 4)
+    let mut z: u64 = 0;
+    let mut bit = 0;
+    let mut sr = sub_r as u64;
+    let mut sc = sub_c as u64;
+    let mut g = grid;
+    while g > 1 {
+        z |= (sc & 1) << (2 * bit);
+        z |= (sr & 1) << (2 * bit + 1);
+        sr >>= 1;
+        sc >>= 1;
+        bit += 1;
+        g >>= 1;
+    }
+    let cells = (grid * grid) as i64;
+    (ctu_idx as i64) * cells + z as i64
 }
 
 /// Returns true if neighbour pixel (nr,nc) was already reconstructed when coding
 /// the block whose top-left is (block_row, block_col).
 fn is_available(
-    nr: i64, nc: i64,
-    block_row: usize, block_col: usize,
-    blk: usize, ctu: usize, ctus_x: usize,
-    width: usize, height: usize,
+    nr: i64,
+    nc: i64,
+    block_row: usize,
+    block_col: usize,
+    blk: usize,
+    ctu: usize,
+    ctus_x: usize,
+    width: usize,
+    height: usize,
 ) -> bool {
     if nr < 0 || nc < 0 || nr as usize >= height || nc as usize >= width {
         return false;
@@ -161,7 +189,7 @@ pub fn get_reference_samples(
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
     let mut above = vec![0u8; ext + 1]; // above[0..2n]
-    let mut left = vec![0u8; ext + 1];  // left[0..2n]
+    let mut left = vec![0u8; ext + 1]; // left[0..2n]
     let mut avail_above = vec![false; ext + 1];
     let mut avail_left = vec![false; ext + 1];
     let mut corner = 0u8;
@@ -269,7 +297,7 @@ mod tests {
     #[test]
     fn dc_flat_block() {
         let above = vec![100u8; 9]; // n=8, +1 corner
-        let left  = vec![100u8; 9];
+        let left = vec![100u8; 9];
         let pred = predict_dc(&above[..8], &left[..8], 8);
         assert_eq!(pred, vec![100u8; 64]);
     }
@@ -277,7 +305,7 @@ mod tests {
     #[test]
     fn dc_mixed() {
         let above = vec![200u8; 8];
-        let left  = vec![100u8; 8];
+        let left = vec![100u8; 8];
         let pred = predict_dc(&above, &left, 8);
         // mean = (200*8 + 100*8) / 16 = 150
         assert_eq!(pred[0], 150);
@@ -286,20 +314,20 @@ mod tests {
     #[test]
     fn planar_corners() {
         let mut above = vec![0u8; 9];
-        let mut left  = vec![0u8; 9];
+        let mut left = vec![0u8; 9];
         above[8] = 255; // top-right
-        left[8]  = 255; // bottom-left
+        left[8] = 255; // bottom-left
         let pred = predict_planar(&above, &left, 8);
         // Bottom-left pixel should be close to bottom-left sample
         // Top-right pixel should be close to top-right sample
-        assert!(pred[7] > 100);      // top-right area of block
-        assert!(pred[8 * 7] > 100);  // bottom-left area
+        assert!(pred[7] > 100); // top-right area of block
+        assert!(pred[8 * 7] > 100); // bottom-left area
     }
 
     #[test]
     fn residual_zero_when_perfect() {
         let pixels = vec![128u8; 64];
-        let pred   = vec![128u8; 64];
+        let pred = vec![128u8; 64];
         let res = compute_residual(&pixels, &pred, 8);
         assert!(res.iter().all(|&r| r == 0.0));
     }
@@ -307,14 +335,14 @@ mod tests {
     #[test]
     fn choose_mode_uniform() {
         let above = vec![128u8; 8];
-        let left  = vec![128u8; 8];
+        let left = vec![128u8; 8];
         assert_eq!(choose_mode(&above, &left), IntraMode::Dc);
     }
 
     #[test]
     fn choose_mode_gradient() {
         let above: Vec<u8> = (0..8u8).map(|i| i * 30).collect();
-        let left:  Vec<u8> = (0..8u8).map(|i| 255 - i * 30).collect();
+        let left: Vec<u8> = (0..8u8).map(|i| 255 - i * 30).collect();
         assert_eq!(choose_mode(&above, &left), IntraMode::Planar);
     }
 }

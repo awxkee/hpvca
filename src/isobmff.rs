@@ -11,19 +11,23 @@
 //!            ipma
 //!   mdat  ← offset stored in iloc is patched after mdat position is known
 
-use std::io::Write;
 use crate::{error::EncodeError, hevc::NaluStream};
+use std::io::Write;
 
-fn w32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_be_bytes()); }
-fn w16(buf: &mut Vec<u8>, v: u16) { buf.extend_from_slice(&v.to_be_bytes()); }
+fn w32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+fn w16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
 
 fn write_fullbox(buf: &mut Vec<u8>, cc: &[u8; 4], ver: u8, flags: u32) {
     w32(buf, 0); // size placeholder
     buf.extend_from_slice(cc);
     buf.push(ver);
     buf.push((flags >> 16) as u8);
-    buf.push((flags >>  8) as u8);
-    buf.push( flags        as u8);
+    buf.push((flags >> 8) as u8);
+    buf.push(flags as u8);
 }
 
 fn write_box(buf: &mut Vec<u8>, cc: &[u8; 4]) {
@@ -33,7 +37,7 @@ fn write_box(buf: &mut Vec<u8>, cc: &[u8; 4]) {
 
 fn patch(buf: &mut Vec<u8>, start: usize) {
     let size = (buf.len() - start) as u32;
-    buf[start..start+4].copy_from_slice(&size.to_be_bytes());
+    buf[start..start + 4].copy_from_slice(&size.to_be_bytes());
 }
 
 pub fn wrap_hevc_image(
@@ -41,8 +45,8 @@ pub fn wrap_hevc_image(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, EncodeError> {
-    let hevc_sample = stream.to_length_prefixed();
-    let hvcC_data   = build_hvcC(stream)?;
+    let hevc_sample = stream.to_length_prefixed_slices();
+    let hvcC_data = build_hvcC(stream)?;
 
     let mut f: Vec<u8> = Vec::new();
 
@@ -50,7 +54,7 @@ pub fn wrap_hevc_image(
     let s = f.len();
     write_box(&mut f, b"ftyp");
     f.extend_from_slice(b"heic"); // major brand
-    w32(&mut f, 0);               // minor version
+    w32(&mut f, 0); // minor version
     f.extend_from_slice(b"heic"); // HEIC still image
     f.extend_from_slice(b"mif1"); // HEIF base
     f.extend_from_slice(b"miaf"); // Multi-Image Application Format (required by Apple Preview)
@@ -65,10 +69,12 @@ pub fn wrap_hevc_image(
     {
         let s = f.len();
         write_fullbox(&mut f, b"hdlr", 0, 0);
-        w32(&mut f, 0);               // pre_defined
+        w32(&mut f, 0); // pre_defined
         f.extend_from_slice(b"pict"); // handler_type
-        w32(&mut f, 0); w32(&mut f, 0); w32(&mut f, 0); // reserved
-        f.push(0);                    // name (empty)
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        w32(&mut f, 0); // reserved
+        f.push(0); // name (empty)
         patch(&mut f, s);
     }
 
@@ -80,24 +86,8 @@ pub fn wrap_hevc_image(
         patch(&mut f, s);
     }
 
-    // iinf
-    {
-        let s = f.len();
-        write_fullbox(&mut f, b"iinf", 0, 0);
-        w16(&mut f, 1); // entry_count
-        {
-            let si = f.len();
-            write_fullbox(&mut f, b"infe", 2, 0);
-            w16(&mut f, 1);               // item_ID
-            w16(&mut f, 0);               // item_protection_index
-            f.extend_from_slice(b"hvc1"); // item_type
-            f.push(0);                    // item_name (empty)
-            patch(&mut f, si);
-        }
-        patch(&mut f, s);
-    }
-
     // iloc — version=1 so construction_method field is present.
+    // libheif places iloc BEFORE iinf; Apple parsers can be order-sensitive.
     // We write a placeholder for extent_offset and record its position.
     let iloc_offset_patch_pos;
     {
@@ -112,8 +102,25 @@ pub fn wrap_hevc_image(
         w16(&mut f, 0); // data_reference_index
         w16(&mut f, 1); // extent_count
         iloc_offset_patch_pos = f.len();
-        w32(&mut f, 0);                           // extent_offset — patched later
-        w32(&mut f, hevc_sample.len() as u32);    // extent_length
+        w32(&mut f, 0); // extent_offset — patched later
+        w32(&mut f, hevc_sample.len() as u32); // extent_length
+        patch(&mut f, s);
+    }
+
+    // iinf
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        w16(&mut f, 1); // entry_count
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, 1); // item_ID
+            w16(&mut f, 0); // item_protection_index
+            f.extend_from_slice(b"hvc1"); // item_type
+            f.push(0); // item_name (empty)
+            patch(&mut f, si);
+        }
         patch(&mut f, s);
     }
 
@@ -147,27 +154,37 @@ pub fn wrap_hevc_image(
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
-                f.push(3);       // num_channels = 3
-                f.push(8);       // bits_per_channel[0] = 8 (Y)
-                f.push(8);       // bits_per_channel[1] = 8 (Cb)
-                f.push(8);       // bits_per_channel[2] = 8 (Cr)
+                f.push(3); // num_channels = 3
+                f.push(8); // bits_per_channel[0] = 8 (Y)
+                f.push(8); // bits_per_channel[1] = 8 (Cb)
+                f.push(8); // bits_per_channel[2] = 8 (Cr)
                 patch(&mut f, sh);
             }
-            // NOTE: no 'colr' box — libheif does not include one, and
-            // Apple Preview works without it. Adding nclx colr was causing issues.
+            // prop 4: colr (ICC profile). Apple's ImageIO renders nclx-tagged HEICs
+            // as BLACK on current macOS even though it parses the nclx as sRGB; an
+            // embedded ICC profile (exactly what libheif does) renders correctly.
+            // The profile is sRGB IEC61966-2.1 (from littleCMS).
+            {
+                let sh = f.len();
+                write_box(&mut f, b"colr");
+                f.extend_from_slice(b"prof"); // colour_type = ICC profile
+                f.extend_from_slice(&crate::icc_profile::SRGB_ICC); // the ICC profile bytes
+                patch(&mut f, sh);
+            }
             patch(&mut f, si);
         }
 
-        // ipma — 3 properties, matching libheif exactly
+        // ipma — 4 properties (hvcC, ispe, pixi, colr)
         {
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
-            w32(&mut f, 1);          // entry_count
-            w16(&mut f, 1);          // item_ID
-            f.push(3);               // association_count = 3
-            f.push(0x80 | 1);        // essential=1, property_index=1 (hvcC)
-            f.push(2);               // essential=0, property_index=2 (ispe)
-            f.push(3);               // essential=0, property_index=3 (pixi)
+            w32(&mut f, 1); // entry_count
+            w16(&mut f, 1); // item_ID
+            f.push(4); // association_count = 4
+            f.push(0x80 | 1); // essential=1, property_index=1 (hvcC)
+            f.push(2); // essential=0, property_index=2 (ispe)
+            f.push(3); // essential=0, property_index=3 (pixi)
+            f.push(4); // essential=0, property_index=4 (colr)
             patch(&mut f, si);
         }
 
@@ -184,7 +201,7 @@ pub fn wrap_hevc_image(
     patch(&mut f, mdat_start);
 
     // Patch iloc extent_offset with the real absolute file offset
-    f[iloc_offset_patch_pos..iloc_offset_patch_pos+4]
+    f[iloc_offset_patch_pos..iloc_offset_patch_pos + 4]
         .copy_from_slice(&hevc_absolute_offset.to_be_bytes());
 
     Ok(f)
@@ -199,38 +216,55 @@ fn build_hvcC(stream: &NaluStream) -> Result<Vec<u8>, EncodeError> {
             32 => vps.push(&nalu.data),
             33 => sps.push(&nalu.data),
             34 => pps.push(&nalu.data),
-            _  => {}
+            _ => {}
         }
     }
 
     let mut r: Vec<u8> = Vec::new();
-    r.push(1);           // configurationVersion
+    r.push(1); // configurationVersion
     // profile_space=0, tier=0, profile_idc=3 (Main Still Picture)
     r.push(0b00_0_00011);
     // profile_compat_flags: flag[1]=Main, flag[2]=Main10, flag[3]=MainSP → 0x70000000
     r.extend_from_slice(&[0x70, 0x00, 0x00, 0x00]);
-    // constraint_indicator_flags: all zero — matches libheif's output.
-    // (The SPS PTL carries the actual constraint flags; the hvcC record
-    //  summary field is informational and Apple VideoToolbox reads the SPS directly.)
-    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    r.push(120);         // level_idc = 120 (Level 4.0) — matches libheif.
-    r.push(0xF0); r.push(0x00); // min_spatial_segmentation
-    r.push(0xFC);        // parallelism type
-    r.push(0xFD);        // chroma_format_idc = 1 (4:2:0)
-    r.push(0xF8);        // bit_depth_luma_minus8 = 0
-    r.push(0xF8);        // bit_depth_chroma_minus8 = 0
-    r.push(0x00); r.push(0x00); // avgFrameRate
+    // Mirror the level and constraint flags from the embedded SPS so the hvcC
+    // summary matches the bitstream exactly (the SPS PTL is authoritative; the
+    // level scales with picture size via hevc::level_idc_for).
+    let (constraint6, level) = if let Some(s) = sps.first() {
+        // SPS NALU: 2-byte NAL header, then vps_id/sublayers/tid byte, then PTL:
+        // profile byte (1) + compat (4) + constraint (6) + level (1).
+        // Constraint bytes begin at offset 2+1+1+4 = 8; level at offset 14.
+        let mut c = [0u8; 6];
+        if s.len() >= 15 {
+            c.copy_from_slice(&s[8..14]);
+            (c, s[14])
+        } else {
+            ([0xb0, 0, 0, 0, 0, 0], 93)
+        }
+    } else {
+        ([0xb0, 0, 0, 0, 0, 0], 93)
+    };
+    r.extend_from_slice(&constraint6);
+    r.push(level);
+    r.push(0xF0);
+    r.push(0x00); // min_spatial_segmentation
+    r.push(0xFC); // parallelism type
+    r.push(0xFD); // chroma_format_idc = 1 (4:2:0)
+    r.push(0xF8); // bit_depth_luma_minus8 = 0
+    r.push(0xF8); // bit_depth_chroma_minus8 = 0
+    r.push(0x00);
+    r.push(0x00); // avgFrameRate
     r.push(0b00_001_1_11); // cFR=0, numTL=1, tidNested=1, lengthSizeMinusOne=3 (4 bytes)
 
     let arrays: &[(u8, &Vec<&[u8]>)] = &[(32, &vps), (33, &sps), (34, &pps)];
     r.push(arrays.len() as u8);
     for &(nal_type, list) in arrays {
-        r.push(0x80 | nal_type);
+        // array_completeness=0 (high bit). libheif uses 0; Apple expects this.
+        r.push(nal_type);
         r.push((list.len() >> 8) as u8);
-        r.push( list.len()       as u8);
+        r.push(list.len() as u8);
         for &d in list {
             r.push((d.len() >> 8) as u8);
-            r.push( d.len()       as u8);
+            r.push(d.len() as u8);
             r.extend_from_slice(d);
         }
     }
@@ -243,7 +277,9 @@ mod tests {
     use crate::hevc::NaluStream;
     fn make_test_stream() -> NaluStream {
         use crate::hevc::{build_pps, build_sps, build_vps};
-        NaluStream { nalus: vec![build_vps(), build_sps(16, 16), build_pps(30)] }
+        NaluStream {
+            nalus: vec![build_vps(16, 16), build_sps(16, 16), build_pps(30)],
+        }
     }
     #[test]
     fn ftyp_brand() {
@@ -255,9 +291,18 @@ mod tests {
     fn box_order_ftyp_meta_mdat() {
         let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
         let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
-        assert_eq!(&b[ftyp_size+4..ftyp_size+8], b"meta", "meta must follow ftyp");
-        let meta_size = u32::from_be_bytes(b[ftyp_size..ftyp_size+4].try_into().unwrap()) as usize;
-        assert_eq!(&b[ftyp_size+meta_size+4..ftyp_size+meta_size+8], b"mdat", "mdat must follow meta");
+        assert_eq!(
+            &b[ftyp_size + 4..ftyp_size + 8],
+            b"meta",
+            "meta must follow ftyp"
+        );
+        let meta_size =
+            u32::from_be_bytes(b[ftyp_size..ftyp_size + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &b[ftyp_size + meta_size + 4..ftyp_size + meta_size + 8],
+            b"mdat",
+            "mdat must follow meta"
+        );
     }
     #[test]
     fn iloc_offset_points_into_mdat() {
@@ -266,8 +311,11 @@ mod tests {
         let mut pos = 0usize;
         let mut mdat_payload_offset = 0u32;
         while pos + 8 <= b.len() {
-            let sz = u32::from_be_bytes(b[pos..pos+4].try_into().unwrap()) as usize;
-            if &b[pos+4..pos+8] == b"mdat" { mdat_payload_offset = (pos + 8) as u32; break; }
+            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            if &b[pos + 4..pos + 8] == b"mdat" {
+                mdat_payload_offset = (pos + 8) as u32;
+                break;
+            }
             pos += sz;
         }
         assert!(mdat_payload_offset > 0, "mdat not found");
@@ -278,22 +326,34 @@ mod tests {
         //               item: item_id(2) + constr_method(2) + data_ref(2) + ext_count(2) = 8
         //               extent_offset is here (4 bytes)
         let offset_pos = iloc_box_pos + 12 + 4 + 8;
-        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos+4].try_into().unwrap());
-        assert_eq!(extent_offset, mdat_payload_offset,
-            "iloc extent_offset must point to start of mdat payload");
+        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos + 4].try_into().unwrap());
+        assert_eq!(
+            extent_offset, mdat_payload_offset,
+            "iloc extent_offset must point to start of mdat payload"
+        );
     }
     #[test]
-    fn ipco_has_pixi_no_colr() {
+    fn ipco_has_pixi_and_colr() {
         let b = wrap_hevc_image(&make_test_stream(), 16, 16).unwrap();
         let s = b.as_slice();
-        assert!(s.windows(4).any(|w| w == b"pixi"), "pixi box must be present");
-        // colr removed — libheif does not include it and Apple Preview works without it
-        assert!(!s.windows(4).any(|w| w == b"colr"), "colr box should not be present");
-        // ipma should have exactly 3 associations (hvcC, ispe, pixi)
-        // windows().position() returns the offset of the fourcc 'ipma', not the box start.
-        // Layout from fourcc: ver(1)+flags(3)+entry_count(4)+item_id(2)+assoc_count(1)
+        assert!(
+            s.windows(4).any(|w| w == b"pixi"),
+            "pixi box must be present"
+        );
+        // colr (nclx) is REQUIRED by Apple CoreGraphics to build a color space.
+        assert!(
+            s.windows(4).any(|w| w == b"colr"),
+            "colr box must be present"
+        );
+        let colr_pos = s.windows(4).position(|w| w == b"colr").unwrap();
+        assert_eq!(
+            &s[colr_pos + 4..colr_pos + 8],
+            b"prof",
+            "colr must be ICC profile type"
+        );
+        // ipma should have exactly 4 associations (hvcC, ispe, pixi, colr)
         let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
         let assoc_count = s[ipma_pos + 14];
-        assert_eq!(assoc_count, 3, "ipma must associate 3 properties (hvcC, ispe, pixi)");
+        assert_eq!(assoc_count, 4, "ipma must associate 4 properties");
     }
 }

@@ -54,7 +54,7 @@ pub fn fwd_transform(res: &[i32], n: usize) -> Vec<i64> {
     // We compute coeff = T * res * T^T with two 1-D passes.
     let shift1 = log2n + bd - 9; // 8x8:2, 4x4:1
     let add1 = if shift1 > 0 { 1i64 << (shift1 - 1) } else { 0 };
-    // pass 1: along rows (horizontal): tmp[i][j] = sum_k T[i][k]*res[k][j]? 
+    // pass 1: along rows (horizontal): tmp[i][j] = sum_k T[i][k]*res[k][j]?
     // Standard HM: first transform the rows of the residual, i.e.
     //   tmp = res * T^T  then  coeff = T * tmp ... order doesn't matter for square sep.
     // We do: tmp[i][j] = (sum_k T[i][k] * res[j][k]) >> shift1   (rows of res)

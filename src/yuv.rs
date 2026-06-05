@@ -4,9 +4,9 @@
 
 /// Planar YCbCr 4:2:0 representation.
 pub struct Yuv420 {
-    pub y: Vec<u8>,   // width * height
-    pub cb: Vec<u8>,  // (width/2) * (height/2)
-    pub cr: Vec<u8>,  // (width/2) * (height/2)
+    pub y: Vec<u8>,  // width * height
+    pub cb: Vec<u8>, // (width/2) * (height/2)
+    pub cr: Vec<u8>, // (width/2) * (height/2)
     pub width: u32,
     pub height: u32,
 }
@@ -25,13 +25,14 @@ impl Yuv420 {
 
 /// Convert packed 8-bit RGB (R,G,B per pixel) to planar YCbCr 4:2:0.
 ///
-/// BT.601 **full-range** ("JPEG/JFIF") coefficients — Y in [0, 255]:
-///   Y  =  0.299 R + 0.587 G + 0.114 B
-///   Cb = 128 - 0.168736 R - 0.331264 G + 0.500 B
-///   Cr = 128 + 0.500 R    - 0.418688 G - 0.081312 B
+/// BT.709 **full-range** coefficients — Y in [0, 255], matching matrix_coefficients=1
+/// and full_range_flag=1 signalled in the SPS VUI and the HEIF colr box:
+///   Y  =  0.2126 R + 0.7152 G + 0.0722 B
+///   Cb = 128 + (B - Y) / 1.8556
+///   Cr = 128 + (R - Y) / 1.5748
 ///
-/// Must match the VUI video_full_range_flag=1 signal in the SPS.
-/// Apple VideoToolbox and libheif both use full-range for HEIC still images.
+/// The colour pipeline (primaries, transfer, matrix) is fully consistent BT.709 so
+/// Apple CoreGraphics/CGImage builds the correct colour space and renders properly.
 pub fn rgb_to_yuv420(rgb: &[u8], width: u32, height: u32) -> Yuv420 {
     let w = width as usize;
     let h = height as usize;
@@ -42,23 +43,18 @@ pub fn rgb_to_yuv420(rgb: &[u8], width: u32, height: u32) -> Yuv420 {
     let mut cb_plane = vec![0u8; cw * ch];
     let mut cr_plane = vec![0u8; cw * ch];
 
-    // Convert every luma sample — full-range BT.601
+    // Full-range BT.709 luma.
     for row in 0..h {
         for col in 0..w {
             let base = (row * w + col) * 3;
-            let (r, g, b) = (
-                rgb[base] as f32,
-                rgb[base + 1] as f32,
-                rgb[base + 2] as f32,
-            );
-            let yv = (0.299 * r + 0.587 * g + 0.114 * b)
+            let (r, g, b) = (rgb[base] as f32, rgb[base + 1] as f32, rgb[base + 2] as f32);
+            let yv = (0.2126 * r + 0.7152 * g + 0.0722 * b)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             y_plane[row * w + col] = yv;
         }
     }
 
-    // Downsample chroma 2:1 in both dimensions (average 2x2 block)
     for crow in 0..ch {
         for ccol in 0..cw {
             let mut sum_cb = 0.0f32;
@@ -70,13 +66,11 @@ pub fn rgb_to_yuv420(rgb: &[u8], width: u32, height: u32) -> Yuv420 {
                     let col = ccol * 2 + dx;
                     if row < h && col < w {
                         let base = (row * w + col) * 3;
-                        let (r, g, b) = (
-                            rgb[base] as f32,
-                            rgb[base + 1] as f32,
-                            rgb[base + 2] as f32,
-                        );
-                        sum_cb += 128.0 - 0.168736 * r - 0.331264 * g + 0.500    * b;
-                        sum_cr += 128.0 + 0.500    * r - 0.418688 * g - 0.081312 * b;
+                        let (r, g, b) =
+                            (rgb[base] as f32, rgb[base + 1] as f32, rgb[base + 2] as f32);
+                        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        sum_cb += 128.0 + (b - y) / 1.8556;
+                        sum_cr += 128.0 + (r - y) / 1.5748;
                         count += 1;
                     }
                 }
