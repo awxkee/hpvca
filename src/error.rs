@@ -27,8 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use std::fmt;
 use crate::MAX_DIM;
+use std::fmt;
 
 #[derive(Debug)]
 pub enum EncodeError {
@@ -38,10 +38,7 @@ pub enum EncodeError {
     BitstreamError(String),
     IsobmffError(String),
     Io(std::io::Error),
-    DimensionTooLarge {
-        width: usize,
-        height: usize,
-    },
+    DimensionTooLarge { width: usize, height: usize },
 }
 
 impl fmt::Display for EncodeError {

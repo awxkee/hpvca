@@ -235,6 +235,9 @@ pub fn encode(
     if layout == PixelLayout::Gray && !cfg.chroma.is_monochrome() {
         return Err(EncodeError::InvalidInput);
     }
+    if layout == PixelLayout::GrayAlpha && !cfg.chroma.is_monochrome() {
+        return Err(EncodeError::InvalidInput);
+    }
 
     // Strip alpha when the caller passes RGBA but only wants colour output.
     let rgb_owned: Vec<u16>;
@@ -282,7 +285,7 @@ pub fn encode_with_alpha(
     layout: PixelLayout,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-   /* validate_dims(width, height)?;
+    validate_dims(width, height)?;
     cfg.validate()?;
     validate_pixel_buffer(pixels, width, height, layout)?;
 
@@ -295,110 +298,92 @@ pub fn encode_with_alpha(
     let (nw, nh) = (enc_w as usize, enc_h as usize);
     let ch = layout.channels();
 
-    // For GrayAlpha the color output is monochrome (1-ch); for Rgba it is
-    // RGB (3-ch). We store color as 3 channels in both cases so rgb_to_yuv
-    // sees a consistent layout; for GrayAlpha all three are the same luma value.
-    let mut colour_buf = vec![0u16; nw * nh * 3];
-    let mut alpha_buf = vec![0u16; nw * nh * 3]; // alpha replicated to RGB
+    // Alpha is always a monochrome plane — 1 sample per pixel.
+    let mut alpha_plane = vec![0u16; nw * nh];
 
-    for (dst_row_idx, (col_row, alp_row)) in colour_buf
-        .chunks_exact_mut(nw * 3)
-        .zip(alpha_buf.chunks_exact_mut(nw * 3))
-        .enumerate()
-    {
-        let sr = dst_row_idx.min(h - 1);
-        let src_row = &pixels[sr * w * ch..(sr * w + w) * ch];
+    let (_, color_stream) = match layout {
+        PixelLayout::Rgba => {
+            // Colour: 3-channel RGB buffer fed to rgb_to_yuv normally.
+            let mut colour_buf = vec![0u16; nw * nh * 3];
 
-        for (dst_col_idx, (col_px, alp_px)) in col_row
-            .chunks_exact_mut(3)
-            .zip(alp_row.chunks_exact_mut(3))
-            .enumerate()
-        {
-            let sc = dst_col_idx.min(w - 1);
-            let src = &src_row[sc * ch..sc * ch + ch];
+            for (dst_row_idx, (col_row, alp_row)) in colour_buf
+                .chunks_exact_mut(nw * 3)
+                .zip(alpha_plane.chunks_exact_mut(nw))
+                .enumerate()
+            {
+                let sr = dst_row_idx.min(h - 1);
+                let src_row = &pixels[sr * w * ch..(sr * w + w) * ch];
 
-            match layout {
-                PixelLayout::Rgba => {
+                for (dst_col_idx, (col_px, alp_px)) in col_row
+                    .chunks_exact_mut(3)
+                    .zip(alp_row.iter_mut())
+                    .enumerate()
+                {
+                    let sc = dst_col_idx.min(w - 1);
+                    let src = &src_row[sc * 4..sc * 4 + 4];
                     col_px.copy_from_slice(&src[..3]);
-                    let a = src[3];
-                    alp_px[0] = a;
-                    alp_px[1] = a;
-                    alp_px[2] = a;
+                    *alp_px = src[3];
                 }
-                PixelLayout::GrayAlpha => {
-                    let y = src[0];
-                    let a = src[1];
-                    col_px[0] = y;
-                    col_px[1] = y;
-                    col_px[2] = y;
-                    alp_px[0] = a;
-                    alp_px[1] = a;
-                    alp_px[2] = a;
-                }
-                // has_alpha() guard above makes these unreachable.
-                _ => unreachable!(),
             }
-        }
-    }
 
-    // For GrayAlpha the colour chroma must be Monochrome; rgb_to_yuv will
-    // produce Y=luma, cb/cr empty. For Rgba we honour cfg.chroma.
-    let colour_chroma = if layout.is_gray() {
-        ChromaFormat::Monochrome
-    } else {
-        cfg.chroma
+            let yuv = yuv::rgb_to_yuv(&colour_buf, enc_w, enc_h, cfg.chroma, cfg.bit_depth);
+            let stream = hevc::encode_intra(&yuv, enc_w, enc_h, cfg.quality)?;
+            (yuv, stream)
+        }
+
+        PixelLayout::GrayAlpha => {
+            // Colour: 1-channel luma plane; build Yuv directly, no rgb_to_yuv needed.
+            let mut luma = vec![0u16; nw * nh];
+
+            for (dst_row_idx, (luma_row, alp_row)) in luma
+                .chunks_exact_mut(nw)
+                .zip(alpha_plane.chunks_exact_mut(nw))
+                .enumerate()
+            {
+                let sr = dst_row_idx.min(h - 1);
+                let src_row = &pixels[sr * w * 2..(sr * w + w) * 2];
+
+                for (dst_col_idx, (luma_px, alp_px)) in
+                    luma_row.iter_mut().zip(alp_row.iter_mut()).enumerate()
+                {
+                    let sc = dst_col_idx.min(w - 1);
+                    *luma_px = src_row[sc * 2];
+                    *alp_px = src_row[sc * 2 + 1];
+                }
+            }
+
+            let yuv = Yuv {
+                y: luma,
+                cb: Vec::new(),
+                cr: Vec::new(),
+                width: enc_w,
+                height: enc_h,
+                display_w: width,
+                display_h: height,
+                chroma: ChromaFormat::Monochrome,
+                bit_depth: cfg.bit_depth,
+            };
+            let stream = hevc::encode_intra(&yuv, enc_w, enc_h, cfg.quality)?;
+            (yuv, stream)
+        }
+
+        _ => unreachable!(), // has_alpha() guard above
     };
 
-    let color_yuv = yuv::rgb_to_yuv(&colour_buf, enc_w, enc_h, colour_chroma, cfg.bit_depth);
-    let color_stream = hevc::encode_intra(&color_yuv, enc_w, enc_h, cfg.quality)?;
-
-    let alpha_yuv = yuv::rgb_to_yuv(
-        &alpha_buf,
-        enc_w,
-        enc_h,
-        ChromaFormat::Monochrome,
-        cfg.bit_depth,
-    );
+    // Alpha is always monochrome — build its Yuv directly from the 1-channel plane.
+    let alpha_yuv = Yuv {
+        y: alpha_plane,
+        cb: Vec::new(),
+        cr: Vec::new(),
+        width: enc_w,
+        height: enc_h,
+        display_w: width,
+        display_h: height,
+        chroma: ChromaFormat::Monochrome,
+        bit_depth: cfg.bit_depth,
+    };
     let alpha_stream = hevc::encode_intra(&alpha_yuv, enc_w, enc_h, cfg.quality)?;
 
-    isobmff::wrap_hevc_image_with_alpha(
-        &color_stream,
-        &alpha_stream,
-        width,
-        height,
-        cfg.bit_depth,
-        &cfg.color,
-        &cfg.metadata,
-    )*/
-    let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
-    let (w, h) = (width as usize, height as usize);
-    let (nw, nh) = (enc_w as usize, enc_h as usize);
-    let mut rgb = vec![0u16; nw * nh * 3];
-    let mut alpha_rgb = vec![0u16; nw * nh * 3];
-    for r in 0..nh {
-        let sr = r.min(h - 1);
-        for c in 0..nw {
-            let sc = c.min(w - 1);
-            let s = (sr * w + sc) * 4;
-            let d = (r * nw + c) * 3;
-            rgb[d..d + 3].copy_from_slice(&pixels[s..s + 3]);
-            let a = pixels[s + 3];
-            alpha_rgb[d] = a;
-            alpha_rgb[d + 1] = a;
-            alpha_rgb[d + 2] = a;
-        }
-    }
-    let color_yuv = yuv::rgb_to_yuv(&rgb, enc_w, enc_h, cfg.chroma, cfg.bit_depth);
-    let color_stream = hevc::encode_intra(&color_yuv, enc_w, enc_h, cfg.quality)?;
-    let alpha_yuv = yuv::rgb_to_yuv(
-        &alpha_rgb,
-        enc_w,
-        enc_h,
-        ChromaFormat::Monochrome,
-        cfg.bit_depth,
-    );
-    let alpha_stream = hevc::encode_intra(&alpha_yuv, enc_w, enc_h, cfg.quality)?;
-    // ispe reports the true visible size (may be odd); both items share it.
     isobmff::wrap_hevc_image_with_alpha(
         &color_stream,
         &alpha_stream,
@@ -610,7 +595,7 @@ fn validate_pixel_buffer(
     layout: PixelLayout,
 ) -> Result<(), EncodeError> {
     let needed = checked_buffer_size::<u16>(width as usize, height as usize, layout.channels())?;
-    if buf.len() < needed {
+    if buf.len() != needed {
         return Err(EncodeError::InvalidInput);
     }
     Ok(())
@@ -769,12 +754,6 @@ mod tests {
     #[test]
     fn pixel_buffer_accepts_exact_rgb() {
         assert!(validate_pixel_buffer(&vec![0u16; 48], 4, 4, PixelLayout::Rgb).is_ok());
-    }
-
-    #[test]
-    fn pixel_buffer_accepts_oversized() {
-        // More samples than needed is fine.
-        assert!(validate_pixel_buffer(&vec![0u16; 64], 4, 4, PixelLayout::Rgb).is_ok());
     }
 
     #[test]

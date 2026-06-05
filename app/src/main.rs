@@ -27,23 +27,25 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig};
+use hpvca::{BitDepth, ChromaFormat, EncodeConfig, PixelLayout};
 use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/abstract_alpha.png").unwrap().to_rgba8();
+    let img = image::open("./assets/abstract_alpha.png")
+        .unwrap()
+        .to_rgba16();
     let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
-    // Use img.as_raw() not &img
     let instant = Instant::now();
     let data = hpvca::encode_with_alpha(
         &arr,
         img.width(),
         img.height(),
+        PixelLayout::Rgba,
         &EncodeConfig::default()
-            .with_bit_depth(BitDepth::Eight)
-            .with_chroma(ChromaFormat::Monochrome),
+            .with_bit_depth(BitDepth::Ten)
+            .with_chroma(ChromaFormat::Yuv420),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

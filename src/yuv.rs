@@ -155,7 +155,7 @@ impl Yuv {
         // Coded dimensions must be on the chroma subsampling grid.
         let sw = self.chroma.sub_w() as u32;
         let sh = self.chroma.sub_h() as u32;
-        if self.width % sw != 0 || self.height % sh != 0 {
+        if !self.width.is_multiple_of(sw) || !self.height.is_multiple_of(sh) {
             return Err(EncodeError::InvalidDimensions {
                 width: self.width,
                 height: self.height,
@@ -179,19 +179,29 @@ pub(crate) fn rgb_to_yuv(
     let maxv = bit_depth.max_val() as f32;
     let neutral = bit_depth.neutral() as f32;
 
-    let mut y_plane = vec![0u16; w * h];
-    for row in 0..h {
-        for col in 0..w {
-            let base = (row * w + col) * 3;
-            let (r, g, b) = (rgb[base] as f32, rgb[base + 1] as f32, rgb[base + 2] as f32);
-            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            y_plane[row * w + col] = y.round().clamp(0.0, maxv) as u16;
-        }
-    }
+    // Hoisted reciprocals — avoid repeated division in the hot loop.
+    const REC_CB: f32 = 1.0 / 1.8556;
+    const REC_CR: f32 = 1.0 / 1.5748;
 
+    // ── Monochrome path ───────────────────────────────────────────────────
     if chroma.is_monochrome() {
+        let channels = rgb.len() / (w * h);
+        let y_plane: Vec<u16> = if channels == 1 {
+            // 1-channel input: direct copy, no matrix.
+            rgb.to_vec()
+        } else {
+            // Multi-channel input: derive luma via BT.709.
+            rgb.chunks_exact(channels)
+                .map(|px| {
+                    let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+                    (0.2126 * r + 0.7152 * g + 0.0722 * b)
+                        .round()
+                        .clamp(0.0, maxv) as u16
+                })
+                .collect()
+        };
         return Yuv {
-            y: rgb.to_vec(),
+            y: y_plane,
             cb: Vec::new(),
             cr: Vec::new(),
             width,
@@ -203,42 +213,58 @@ pub(crate) fn rgb_to_yuv(
         };
     }
 
+    // Luma: one pass over all pixels, 3 samples at a time.
+    let y_plane: Vec<u16> = rgb
+        .chunks_exact(3)
+        .map(|px| {
+            let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+            (0.2126 * r + 0.7152 * g + 0.0722 * b)
+                .round()
+                .clamp(0.0, maxv) as u16
+        })
+        .collect();
+
     let sw = chroma.sub_w();
     let sh = chroma.sub_h();
     let cw = w.div_ceil(sw);
     let ch = h.div_ceil(sh);
-    let mut cb_plane = vec![0u16; cw * ch];
-    let mut cr_plane = vec![0u16; cw * ch];
 
-    for crow in 0..ch {
-        for ccol in 0..cw {
-            let mut sum_cb = 0.0f32;
-            let mut sum_cr = 0.0f32;
-            let mut count = 0u32;
-            for dy in 0..sh {
-                for dx in 0..sw {
+    // Chroma: iterate over chroma block positions.
+    // Each (crow, ccol) averages up to sw×sh luma-block pixels.
+    let (cb_plane, cr_plane): (Vec<u16>, Vec<u16>) = (0..ch)
+        .flat_map(|crow| (0..cw).map(move |ccol| (crow, ccol)))
+        .map(|(crow, ccol)| {
+            // Accumulate over the luma block covered by this chroma sample.
+            let (sum_cb, sum_cr, count) = (0..sh)
+                .flat_map(|dy| (0..sw).map(move |dx| (dy, dx)))
+                .filter(|&(dy, dx)| {
                     let row = crow * sh + dy;
                     let col = ccol * sw + dx;
-                    if row < h && col < w {
-                        let base = (row * w + col) * 3;
-                        let (r, g, b) =
-                            (rgb[base] as f32, rgb[base + 1] as f32, rgb[base + 2] as f32);
-                        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                        // Native-range chroma, centred at the bit-depth neutral.
-                        sum_cb += neutral + (b - y) / 1.8556;
-                        sum_cr += neutral + (r - y) / 1.5748;
-                        count += 1;
-                    }
-                }
-            }
+                    row < h && col < w
+                })
+                .fold((0.0f32, 0.0f32, 0u32), |(s_cb, s_cr, cnt), (dy, dx)| {
+                    let row = crow * sh + dy;
+                    let col = ccol * sw + dx;
+                    let base = (row * w + col) * 3;
+                    let (r, g, b) = (rgb[base] as f32, rgb[base + 1] as f32, rgb[base + 2] as f32);
+                    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    (
+                        s_cb + neutral + (b - y) * REC_CB,
+                        s_cr + neutral + (r - y) * REC_CR,
+                        cnt + 1,
+                    )
+                });
+
             if count > 0 {
-                cb_plane[crow * cw + ccol] =
-                    (sum_cb / count as f32).round().clamp(0.0, maxv) as u16;
-                cr_plane[crow * cw + ccol] =
-                    (sum_cr / count as f32).round().clamp(0.0, maxv) as u16;
+                let rec_count = 1.0 / count as f32;
+                let cb = (sum_cb * rec_count).round().clamp(0.0, maxv) as u16;
+                let cr = (sum_cr * rec_count).round().clamp(0.0, maxv) as u16;
+                (cb, cr)
+            } else {
+                (neutral as u16, neutral as u16)
             }
-        }
-    }
+        })
+        .unzip();
 
     Yuv {
         y: y_plane,
