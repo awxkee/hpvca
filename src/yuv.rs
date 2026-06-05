@@ -190,13 +190,13 @@ fn y_q0(r: i32, g: i32, b: i32) -> i32 {
 #[inline(always)]
 fn rgb_to_cb_q13(r: i32, g: i32, b: i32, neutral_q13: i32) -> i32 {
     let y = y_q0(r, g, b);
-    neutral_q13 + ((b - y) * REC_CB_Q13 + Q13_HALF >> 13)
+    neutral_q13 + (((b - y) * REC_CB_Q13 + Q13_HALF) >> 13)
 }
 
 #[inline(always)]
 fn rgb_to_cr_q13(r: i32, g: i32, b: i32, neutral_q13: i32) -> i32 {
     let y = y_q0(r, g, b);
-    neutral_q13 + ((r - y) * REC_CR_Q13 + Q13_HALF >> 13)
+    neutral_q13 + (((r - y) * REC_CR_Q13 + Q13_HALF) >> 13)
 }
 
 pub(crate) fn rgb_to_yuv(
