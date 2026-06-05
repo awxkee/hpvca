@@ -31,30 +31,98 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Primaries {
-    /// BT.709 / sRGB primaries (value 1).
+    /// For future use by ITU-T | ISO/IEC
+    Reserved,
+    /// Rec. ITU-R BT.709-6<br />
+    /// Rec. ITU-R BT.1361-0 conventional colour gamut system and extended colour gamut system (historical)<br />
+    /// IEC 61966-2-1 sRGB or sYCC IEC 61966-2-4<br />
+    /// Society of Motion Picture and Television Engineers (MPTE) RP 177 (1993) Annex B<br />
     Bt709 = 1,
-    /// Unspecified (value 2).
+    /// Unspecified<br />
+    /// Image characteristics are unknown or are determined by the application.
     Unspecified = 2,
-    /// BT.2020 primaries (value 9).
+    /// Rec. ITU-R BT.470-6 System M (historical)<br />
+    /// United States National Television System Committee 1953 Recommendation for transmission standards for color television<br />
+    /// United States Federal Communications Commission (2003) Title 47 Code of Federal Regulations 73.682 (a) (20)<br />
+    Bt470M = 4,
+    /// Rec. ITU-R BT.470-6 System B, G (historical) Rec. ITU-R BT.601-7 625<br />
+    /// Rec. ITU-R BT.1358-0 625 (historical)<br />
+    /// Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM<br />
+    Bt470Bg = 5,
+    /// Rec. ITU-R BT.601-7 525<br />
+    /// Rec. ITU-R BT.1358-1 525 or 625 (historical) Rec. ITU-R BT.1700-0 NTSC<br />
+    /// SMPTE 170M (2004)<br />
+    /// (functionally the same as the value 7)<br />
+    Bt601 = 6,
+    /// SMPTE 240M (1999) (historical) (functionally the same as the value 6)<br />
+    Smpte240 = 7,
+    /// Generic film (colour filters using Illuminant C)<br />
+    GenericFilm = 8,
+    /// Rec. ITU-R BT.2020-2<br />
+    /// Rec. ITU-R BT.2100-0<br />
     Bt2020 = 9,
-    /// DCI-P3 / Display-P3 primaries (value 12, "P3-D65" via SMPTE RP 431-2 set 11→
-    /// commonly signalled as 12 = SMPTE 432 Display-P3).
-    DisplayP3 = 12,
+    /// SMPTE ST 428-1<br />
+    /// (CIE 1931 XYZ as in ISO 11664-1)<br />
+    Xyz = 10,
+    /// SMPTE RP 431-2 (2011)<br />
+    Smpte431 = 11,
+    /// SMPTE EG 432-1 (2010)<br />
+    Smpte432 = 12,
+    /// EBU Tech. 3213-E (1975)<br />
+    Ebu3213 = 22,
 }
 
 /// CICP transfer characteristics (ISO/IEC 23091-2 Table 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransferFunction {
-    /// BT.709 transfer (value 1).
+    /// For future use by ITU-T | ISO/IEC
+    Reserved,
+    /// Rec. ITU-R BT.709-6<br />
+    /// Rec. ITU-R BT.1361-0 conventional colour gamut system (historical)<br />
+    /// (functionally the same as the values 6, 14 and 15)    <br />
     Bt709 = 1,
-    /// Unspecified (value 2).
+    /// Image characteristics are unknown or are determined by the application.<br />
     Unspecified = 2,
-    /// sRGB / IEC 61966-2-1 transfer (value 13).
+    /// Rec. ITU-R BT.470-6 System M (historical)<br />
+    /// United States National Television System Committee 1953 Recommendation for transmission standards for color television<br />
+    /// United States Federal Communications Commission (2003) Title 47 Code of Federal Regulations 73.682 (a) (20)<br />
+    /// Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM<br />
+    Bt470M = 4,
+    /// Rec. ITU-R BT.470-6 System B, G (historical)<br />
+    Bt470Bg = 5,
+    /// Rec. ITU-R BT.601-7 525 or 625<br />
+    /// Rec. ITU-R BT.1358-1 525 or 625 (historical)<br />
+    /// Rec. ITU-R BT.1700-0 NTSC SMPTE 170M (2004)<br />
+    /// (functionally the same as the values 1, 14 and 15)<br />
+    Bt601 = 6,
+    /// SMPTE 240M (1999) (historical)<br />
+    Smpte240 = 7,
+    /// Linear transfer characteristics<br />
+    Linear = 8,
+    /// Logarithmic transfer characteristic (100:1 range)<br />
+    Log100 = 9,
+    /// Logarithmic transfer characteristic (100 * Sqrt( 10 ) : 1 range)<br />
+    Log100sqrt10 = 10,
+    /// IEC 61966-2-4<br />
+    Iec61966 = 11,
+    /// Rec. ITU-R BT.1361-0 extended colour gamut system (historical)<br />
+    Bt1361 = 12,
+    /// IEC 61966-2-1 sRGB or sYCC<br />
     Srgb = 13,
-    /// SMPTE ST 2084 (PQ) — HDR10 (value 16).
-    Pq = 16,
-    /// ARIB STD-B67 (HLG) (value 18).
+    /// Rec. ITU-R BT.2020-2 (10-bit system)<br />
+    /// (functionally the same as the values 1, 6 and 15)<br />
+    Bt202010bit = 14,
+    /// Rec. ITU-R BT.2020-2 (12-bit system)<br />
+    /// (functionally the same as the values 1, 6 and 14)<br />
+    Bt202012bit = 15,
+    /// SMPTE ST 2084 for 10-, 12-, 14- and 16-bitsystems<br />
+    /// Rec. ITU-R BT.2100-0 perceptual quantization (PQ) system<br />
+    Smpte2084 = 16,
+    /// SMPTE ST 428-1<br />
+    Smpte428 = 17,
+    /// ARIB STD-B67<br />
+    /// Rec. ITU-R BT.2100-0 hybrid log- gamma (HLG) system<br />
     Hlg = 18,
 }
 
@@ -62,14 +130,24 @@ pub enum TransferFunction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MatrixCoefficients {
-    /// Identity — samples are GBR, no colour transform (value 0).
-    Identity = 0,
-    /// BT.709 (value 1).
-    Bt709 = 1,
-    /// Unspecified (value 2).
-    Unspecified = 2,
-    /// BT.2020 non-constant luminance (value 9).
-    Bt2020Ncl = 9,
+    Identity = 0,                // RGB (Identity matrix)
+    Bt709 = 1,                   // Rec. 709
+    Unspecified = 2,             // Unspecified
+    Reserved = 3,                // Reserved
+    Fcc = 4,                     // FCC
+    Bt470Bg = 5,                 // BT.470BG / BT.601-625
+    Smpte170m = 6,               // SMPTE 170M / BT.601-525
+    Smpte240m = 7,               // SMPTE 240M
+    YCgCo = 8,                   // YCgCo
+    Bt2020Ncl = 9,               // BT.2020 (non-constant luminance)
+    Bt2020Cl = 10,               // BT.2020 (constant luminance)
+    Smpte2085 = 11,              // SMPTE ST 2085
+    ChromaticityDerivedNCL = 12, // Chromaticity-derived non-constant luminance
+    ChromaticityDerivedCL = 13,  // Chromaticity-derived constant luminance
+    ICtCp = 14,                  // ICtCp
+    IPtC2 = 15,                  // Color representation developed in SMPTE as IPT-PQ-C2
+    YCgCoRe = 16,                // YCgCo-Re (YCgCo-R type even),
+    YCgCoRo = 17,                // YCgCo-Ro (YCgCo-R type odd),
 }
 
 /// CICP-style colour encoding: the primaries + transfer + matrix the image is
@@ -109,7 +187,7 @@ impl ColorEncoding {
     pub const fn bt2020_pq() -> Self {
         ColorEncoding {
             primaries: Primaries::Bt2020,
-            transfer: TransferFunction::Pq,
+            transfer: TransferFunction::Smpte2084,
             matrix: MatrixCoefficients::Bt2020Ncl,
             full_range: true,
         }
