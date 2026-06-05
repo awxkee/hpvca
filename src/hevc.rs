@@ -1,3 +1,32 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! HEVC bitstream encoder — parameter sets, slice header, CABAC slice data.
 //!
 //! Produces a conformant HEVC still-picture bitstream:
@@ -17,81 +46,29 @@ use crate::{
     yuv::Yuv,
 };
 
-// ─── Public types ─────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
-pub struct Nalu {
-    pub nal_type: u8,
-    pub data: Vec<u8>,
+pub(crate) struct Nalu {
+    #[allow(unused)]
+    pub(crate) nal_type: u8,
+    pub(crate) data: Vec<u8>,
 }
 
-pub struct NaluStream {
-    pub nalus: Vec<Nalu>,
+pub(crate) struct NaluStream {
+    pub(crate) nalus: Vec<Nalu>,
 }
 
 impl NaluStream {
-    /// Annex B byte-stream (4-byte start-codes + RBSP emulation prevention).
-    /// Tracks last two *output* bytes to correctly detect when the tail of a
-    /// just-emitted escape sequence (`00 00 03 00`) pairs with an upcoming `00`
-    /// in the input, which would otherwise form a new `00 00 00` → start-code.
-    pub fn to_annex_b(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for nalu in &self.nalus {
-            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            let mut prev = [0xffu8; 2]; // last two bytes written to `out`
-            for &b in &nalu.data {
-                // If we would write `prev[0] prev[1] b` and that equals
-                // `00 00 XX` with XX <= 3, insert an emulation-prevention byte.
-                if prev[0] == 0 && prev[1] == 0 && b <= 3 {
-                    out.push(0x03);
-                    prev = [prev[1], 0x03];
-                }
-                out.push(b);
-                prev = [prev[1], b];
-            }
-        }
-        out
-    }
-
-    /// Length-prefixed format for ISOBMFF (4-byte big-endian length per NALU).
-    ///
-    /// Per HEVC spec §7.4.1, emulation prevention bytes (0x03 inserted after
-    /// any 00 00 in the NALU body) are part of the RBSP byte sequence.
-    /// Spec-compliant decoders always strip them — even when reading from a
-    /// length-prefixed container. Therefore the bytes stored here MUST include
-    /// emulation prevention, identical to what to_annex_b() produces (minus
-    /// the start-code prefix). The length field reflects the escaped size.
-    pub fn to_length_prefixed(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for nalu in &self.nalus {
-            // Apply emulation prevention — same logic as to_annex_b().
-            let mut escaped: Vec<u8> = Vec::with_capacity(nalu.data.len() + 8);
-            let mut prev = [0xffu8; 2];
-            for &b in &nalu.data {
-                if prev[0] == 0 && prev[1] == 0 && b <= 3 {
-                    escaped.push(0x03);
-                    prev = [prev[1], 0x03];
-                }
-                escaped.push(b);
-                prev = [prev[1], b];
-            }
-            out.extend_from_slice(&(escaped.len() as u32).to_be_bytes());
-            out.extend_from_slice(&escaped);
-        }
-        out
-    }
-
     /// Length-prefixed format for the HEIF mdat image item, containing ONLY the
     /// VCL slice NALUs (not VPS/SPS/PPS). Parameter sets live exclusively in the
     /// hvcC configuration box; libheif and Apple put only the coded slice in mdat.
     /// Including parameter sets here is what some strict decoders (VideoToolbox)
     /// reject. Emulation prevention is applied just like to_length_prefixed().
-    pub fn to_length_prefixed_slices(&self) -> Vec<u8> {
+    pub(crate) fn to_length_prefixed_slices(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for nalu in &self.nalus {
             let nal_type = (nalu.data[0] >> 1) & 0x3f;
             // Skip VPS(32), SPS(33), PPS(34) — they belong only in hvcC.
-            if matches!(nal_type, 32 | 33 | 34) {
+            if matches!(nal_type, 32..=34) {
                 continue;
             }
             let mut escaped: Vec<u8> = Vec::with_capacity(nalu.data.len() + 8);
@@ -113,14 +90,14 @@ impl NaluStream {
 
 // ─── Bit writer ───────────────────────────────────────────────────────────────
 
-pub struct BitWriter {
+pub(crate) struct BitWriter {
     buf: Vec<u8>,
     bit_pos: u32,
     cur_byte: u8,
 }
 
 impl BitWriter {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: Vec::new(),
             bit_pos: 0,
@@ -128,7 +105,7 @@ impl BitWriter {
         }
     }
 
-    pub fn write_bits(&mut self, v: u32, n: u32) {
+    pub(crate) fn write_bits(&mut self, v: u32, n: u32) {
         for i in (0..n).rev() {
             let bit = ((v >> i) & 1) as u8;
             self.cur_byte = (self.cur_byte << 1) | bit;
@@ -141,12 +118,12 @@ impl BitWriter {
         }
     }
 
-    pub fn write_bit(&mut self, v: bool) {
+    pub(crate) fn write_bit(&mut self, v: bool) {
         self.write_bits(v as u32, 1);
     }
 
     /// Unsigned Exp-Golomb.
-    pub fn write_ue(&mut self, mut v: u32) {
+    pub(crate) fn write_ue(&mut self, mut v: u32) {
         v += 1;
         let bits = 32 - v.leading_zeros();
         self.write_bits(0, bits - 1);
@@ -154,7 +131,7 @@ impl BitWriter {
     }
 
     /// Signed Exp-Golomb.
-    pub fn write_se(&mut self, v: i32) {
+    pub(crate) fn write_se(&mut self, v: i32) {
         let u = if v > 0 {
             2 * v as u32 - 1
         } else {
@@ -163,14 +140,14 @@ impl BitWriter {
         self.write_ue(u);
     }
 
-    pub fn rbsp_trailing_bits(&mut self) {
+    pub(crate) fn rbsp_trailing_bits(&mut self) {
         self.write_bit(true);
         while self.bit_pos != 0 {
             self.write_bit(false);
         }
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.bit_pos > 0 {
             self.buf.push(self.cur_byte << (8 - self.bit_pos));
         }
@@ -187,25 +164,9 @@ fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
     bw.write_bits(1, 3); // nuh_temporal_id_plus1 = 1
 }
 
-// ─── profile_tier_level ──────────────────────────────────────────────────────
-
 /// Write the 88-bit decode_profile_tier_level() block (HEVC spec 7.3.3),
 /// then general_level_idc (8 bits).
-///
-/// ffmpeg's decode_profile_tier_level reads exactly 88 bits:
-///   2 profile_space + 1 tier + 5 profile_idc
-///   + 32 compat_flags
-///   + 4 source/packed/frame_only constraint flags
-///   + 43 reserved_zero_43bits   (Main profile; no extended constraint block)
-///   + 1  inbld_flag / reserved_zero_1bit
-///   = 88 bits
-/// Then parse_ptl() appends level_idc (8 bits) and sub-layer tables.
-/// With max_sub_layers=1 there are no sub-layer rows.
-/// Compute general_level_idc for a coded picture of `w`×`h` luma samples, picking
-/// the lowest HEVC level whose MaxLumaPs covers it. A level that is too low for the
-/// picture size causes conformant decoders (including Apple VideoToolbox) to reject
-/// the stream, so this must scale with the image rather than being hardcoded.
-pub fn level_idc_for(w: u32, h: u32) -> u8 {
+pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
     let ps = (w as u64) * (h as u64);
     // (MaxLumaPs, level_idc)
     const TABLE: &[(u64, u8)] = &[
@@ -270,7 +231,7 @@ fn write_profile_tier_level(
 
 // ─── VPS ─────────────────────────────────────────────────────────────────────
 
-pub fn build_vps(
+pub(crate) fn build_vps(
     width: u32,
     height: u32,
     chroma: crate::fmt::ChromaFormat,
@@ -319,7 +280,7 @@ pub fn build_vps(
 
 // ─── SPS ─────────────────────────────────────────────────────────────────────
 
-pub fn build_sps(
+pub(crate) fn build_sps(
     width: u32,
     height: u32,
     chroma: crate::fmt::ChromaFormat,
@@ -459,7 +420,7 @@ fn write_vui(bw: &mut BitWriter) {
 
 // ─── PPS ─────────────────────────────────────────────────────────────────────
 
-pub fn build_pps(qp: u8) -> Nalu {
+pub(crate) fn build_pps(qp: u8) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
 
@@ -519,7 +480,7 @@ pub fn build_pps(qp: u8) -> Nalu {
 // ─── IDR slice ───────────────────────────────────────────────────────────────
 
 /// Encode a still image as a single HEVC IDR picture.
-pub fn encode_intra(
+pub(crate) fn encode_intra(
     yuv: &Yuv,
     width: u32,
     height: u32,
@@ -535,31 +496,32 @@ pub fn encode_intra(
     })
 }
 
-/// Encode and also return the encoder's internal reconstruction (coded dimensions).
-/// Intended for validation: the reconstruction is exactly what a matching decoder
-/// produces, so comparing it to the source measures encode quality without any
-/// external decoder.
-pub fn encode_intra_with_recon(
-    yuv: &Yuv,
-    width: u32,
-    height: u32,
-    quality: u8,
-) -> Result<(NaluStream, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
-    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
-    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
-    let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-    let pps = build_pps(qp_val);
-    let (idr, ry, rcb, rcr) = build_idr_slice(yuv, width, height, quality)?;
-    Ok((
-        NaluStream {
-            nalus: vec![vps, sps, pps, idr],
-        },
-        ry,
-        rcb,
-        rcr,
-    ))
-}
+// /// Encode and also return the encoder's internal reconstruction (coded dimensions).
+// /// Intended for validation: the reconstruction is exactly what a matching decoder
+// /// produces, so comparing it to the source measures encode quality without any
+// /// external decoder.
+// pub(crate) fn encode_intra_with_recon(
+//     yuv: &Yuv,
+//     width: u32,
+//     height: u32,
+//     quality: u8,
+// ) -> Result<(NaluStream, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
+//     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
+//     let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
+//     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
+//     let pps = build_pps(qp_val);
+//     let (idr, ry, rcb, rcr) = build_idr_slice(yuv, width, height, quality)?;
+//     Ok((
+//         NaluStream {
+//             nalus: vec![vps, sps, pps, idr],
+//         },
+//         ry,
+//         rcb,
+//         rcr,
+//     ))
+// }
 
+#[allow(clippy::type_complexity)]
 fn build_idr_slice(
     yuv: &Yuv,
     width: u32,
@@ -580,8 +542,8 @@ fn build_idr_slice(
     let ch = h / sub_h;
     let src_yw = yuv.width as usize;
     let src_yh = yuv.height as usize;
-    let src_cw = (yuv.width as usize + sub_w - 1) / sub_w;
-    let src_ch = (yuv.height as usize + sub_h - 1) / sub_h;
+    let src_cw = (yuv.width as usize).div_ceil(sub_w);
+    let src_ch = (yuv.height as usize).div_ceil(sub_h);
 
     // ── Slice header ────────────────────────────────────────────────────────
     let mut hdr = BitWriter::new();
@@ -708,30 +670,38 @@ fn build_idr_slice(
                         let ch_col = lu_col / sub_w;
                         let _ = (l2_ch_r, l2_ch_c, cu_size_c); // superseded by derivation
 
-                        encode_cu(
-                            &mut cab,
-                            &mut ctx,
-                            &mut ictx,
-                            &yuv.y,
-                            &mut rec_y,
-                            &yuv.cb,
-                            &yuv.cr,
-                            &mut rec_cb,
-                            &mut rec_cr,
-                            src_yw,
-                            src_yh,
-                            w,
-                            src_cw,
-                            src_ch,
-                            cw,
+                        let geo = CuGeometry {
                             lu_row,
                             lu_col,
                             ch_row,
                             ch_col,
+                            yw_stride: w,
+                            src_yh,
+                            cw_stride: cw,
+                            src_cw,
+                            src_ch,
+                        };
+
+                        let src = CuSrcPlanes {
+                            y: &yuv.y,
+                            cb: &yuv.cb,
+                            cr: &yuv.cr,
+                            src_yw,
+                        };
+
+                        let mut rec = CuRecPlanes {
+                            y: &mut rec_y,
+                            cb: &mut rec_cb,
+                            cr: &mut rec_cr,
+                        };
+
+                        let par = CuParams {
                             qp,
-                            yuv.chroma,
-                            yuv.bit_depth,
-                        );
+                            chroma: yuv.chroma,
+                            bit_depth: yuv.bit_depth,
+                        };
+
+                        encode_cu(&mut cab, &mut ctx, &mut ictx, &src, &mut rec, &geo, &par);
                     }
                 }
             }
@@ -882,30 +852,74 @@ fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat) -> u8 {
     }
 }
 
-fn encode_cu(
-    enc: &mut CabacEncoder,
-    ctx: &mut ContextSet,
-    ictx: &mut IntraModeContexts,
-    src_y: &[u16],
-    rec_y: &mut Vec<u16>,
-    src_cb: &[u16],
-    src_cr: &[u16],
-    rec_cb: &mut Vec<u16>,
-    rec_cr: &mut Vec<u16>,
-    src_yw: usize,
-    src_yh: usize,
-    yw_stride: usize,
-    src_cw: usize,
-    src_ch: usize,
-    cw_stride: usize,
+struct CuGeometry {
     lu_row: usize,
     lu_col: usize,
     ch_row: usize,
     ch_col: usize,
+    yw_stride: usize,
+    src_yh: usize,
+    cw_stride: usize,
+    src_cw: usize,
+    src_ch: usize,
+}
+
+struct CuSrcPlanes<'a> {
+    y: &'a [u16],
+    cb: &'a [u16],
+    cr: &'a [u16],
+    src_yw: usize,
+}
+
+struct CuRecPlanes<'a> {
+    y: &'a mut [u16],
+    cb: &'a mut [u16],
+    cr: &'a mut [u16],
+}
+
+struct CuParams {
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+}
+
+fn encode_cu(
+    enc: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    src: &CuSrcPlanes<'_>,
+    rec: &mut CuRecPlanes<'_>,
+    geo: &CuGeometry,
+    par: &CuParams,
 ) {
+    // destructure so the rest of the body is unchanged
+    let CuGeometry {
+        lu_row,
+        lu_col,
+        ch_row,
+        ch_col,
+        yw_stride,
+        src_yh,
+        cw_stride,
+        src_cw,
+        src_ch,
+    } = *geo;
+    let CuSrcPlanes {
+        y: src_y,
+        cb: src_cb,
+        cr: src_cr,
+        src_yw,
+    } = *src;
+    let CuRecPlanes {
+        y: rec_y,
+        cb: rec_cb,
+        cr: rec_cr,
+    } = rec;
+    let CuParams {
+        qp,
+        chroma,
+        bit_depth,
+    } = *par;
     const LU: usize = 8; // luma block size
     let neutral: u16 = bit_depth.neutral(); // 128 (8-bit) / 512 (10-bit)
     let max_val: u16 = bit_depth.max_val(); // 255 / 1023
@@ -1280,17 +1294,6 @@ mod tests {
         bw.write_ue(0); // = 1 → single '1' bit
         bw.rbsp_trailing_bits();
         assert_eq!(bw.finish()[0] >> 7, 1);
-    }
-
-    #[test]
-    fn nalu_stream_to_annex_b() {
-        let stream = NaluStream {
-            nalus: vec![Nalu {
-                nal_type: 32,
-                data: vec![0x40, 0x01],
-            }],
-        };
-        assert_eq!(&stream.to_annex_b()[0..4], &[0, 0, 0, 1]);
     }
 
     #[test]

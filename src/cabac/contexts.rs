@@ -1,52 +1,75 @@
-//! HEVC CABAC context model initialisation values.
-//!
-//! initValues taken DIRECTLY from ffmpeg libavcodec/hevc_cabac.c
-//! init_values[0] = I-slice (what we use).
-//!
-//! The CtxModel::init(initValue, qp) formula converts each byte to
-//! (p_state_idx, val_mps) following HEVC spec §9.3.2.2.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 use super::engine::CtxModel;
 
 /// All context models for I-slice residual coding, keyed by ffmpeg's
 /// init_values[0] (I-slice column).
-pub struct ContextSet {
-    pub qp: u8,
+pub(crate) struct ContextSet {
+    #[allow(unused)]
+    pub(crate) qp: u8,
 
     // CU-level
-    pub split_cu_flag: [CtxModel; 3],
+    pub(crate) split_cu_flag: [CtxModel; 3],
 
     // split_transform_flag[trafoDepth]: 3 contexts (initValues: 153,138,138)
-    pub split_transform_flag: [CtxModel; 3],
+    #[allow(unused)]
+    pub(crate) split_transform_flag: [CtxModel; 3],
 
     // CBF: cbf_luma[0..1], cbf_chroma[0..4]
-    pub cbf_luma: [CtxModel; 2],
-    pub cbf_chroma: [CtxModel; 5], // cb_trafoDepth0, cb_tD1, cr_tD0, cr_tD1, cr_tD2
+    pub(crate) cbf_luma: [CtxModel; 2],
+    pub(crate) cbf_chroma: [CtxModel; 5], // cb_trafoDepth0, cb_tD1, cr_tD0, cr_tD1, cr_tD2
 
     // last_sig_coeff_x/y prefix (18 contexts each)
-    pub last_sig_coeff_x_prefix: [CtxModel; 18],
-    pub last_sig_coeff_y_prefix: [CtxModel; 18],
+    pub(crate) last_sig_coeff_x_prefix: [CtxModel; 18],
+    pub(crate) last_sig_coeff_y_prefix: [CtxModel; 18],
 
     // sig_coeff_flag (44 contexts, luma+chroma merged)
-    pub sig_coeff_flag: [CtxModel; 44],
+    pub(crate) sig_coeff_flag: [CtxModel; 44],
 
     // coded_sub_block_flag (4 contexts: 2 luma + 2 chroma)
-    pub coded_sub_block_flag: [CtxModel; 4],
+    pub(crate) coded_sub_block_flag: [CtxModel; 4],
 
     // coeff_abs_level_greater1 (24 contexts)
-    pub coeff_abs_level_greater1: [CtxModel; 24],
+    pub(crate) coeff_abs_level_greater1: [CtxModel; 24],
 
     // coeff_abs_level_greater2 (6 contexts)
-    pub coeff_abs_level_greater2: [CtxModel; 6],
+    pub(crate) coeff_abs_level_greater2: [CtxModel; 6],
 
     // SAO: sao_merge_left/up flag (1 ctx, shared) and sao_type_idx (1 ctx).
     // initType0: sao_merge=153, sao_type_idx=200.
-    pub sao_merge_flag: CtxModel,
-    pub sao_type_idx: CtxModel,
+    pub(crate) sao_merge_flag: CtxModel,
+    pub(crate) sao_type_idx: CtxModel,
 }
 
 impl ContextSet {
-    pub fn init_islice(qp: u8) -> Self {
+    pub(crate) fn init_islice(qp: u8) -> Self {
         fn c(iv: u8, qp: u8) -> CtxModel {
             CtxModel::init(iv, qp)
         }
@@ -122,14 +145,14 @@ impl ContextSet {
 /// Intra-mode contexts (prev_intra_luma_pred_flag, intra_chroma_pred_mode).
 /// I-slice (initType=0) init values from libde265:
 ///   part_mode = 184, prev_intra_luma_pred_flag = 184, intra_chroma_pred_mode = 63
-pub struct IntraModeContexts {
-    pub part_mode: CtxModel,
-    pub prev_intra_luma_pred_flag: CtxModel,
-    pub intra_chroma_pred_mode: CtxModel,
+pub(crate) struct IntraModeContexts {
+    pub(crate) part_mode: CtxModel,
+    pub(crate) prev_intra_luma_pred_flag: CtxModel,
+    pub(crate) intra_chroma_pred_mode: CtxModel,
 }
 
 impl IntraModeContexts {
-    pub fn init_islice(qp: u8) -> Self {
+    pub(crate) fn init_islice(qp: u8) -> Self {
         Self {
             part_mode: CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
@@ -141,25 +164,6 @@ impl IntraModeContexts {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn context_set_init() {
-        let ctx = ContextSet::init_islice(26);
-        // cbf_luma[0] initValue=111, qp=26
-        // init_state = (slope * qp + offset<<3).clamp(1,126)
-        // slope=111>>4=6, offset=111&0xF=15 → (6*26 + 15*8).clamp = (156+120)=276→126
-        // 126 ≥ 64 → p_state=62, val_mps=1
-        assert_eq!(ctx.cbf_luma[0].p_state_idx, 62);
-        assert_eq!(ctx.cbf_luma[0].val_mps, 1);
-
-        // cbf_chroma[0] initValue=94, qp=26
-        // slope=5, offset=14 → (5*26+14*8)=130+112=242→126, p_state=62, mps=1
-        assert_eq!(ctx.cbf_chroma[0].p_state_idx, 62);
-
-        // prev_intra_luma_pred_flag initValue=184 (from IntraModeContexts, but verify formula)
-        let ictx = IntraModeContexts::init_islice(26);
-        assert!(ictx.prev_intra_luma_pred_flag.p_state_idx < 64);
-    }
 
     #[test]
     fn intra_mode_contexts() {

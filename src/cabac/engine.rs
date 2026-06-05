@@ -1,12 +1,37 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! HEVC CABAC arithmetic encoder.
-//!
-//! Closely follows x265's implementation (entropy.cpp) which uses a 32-bit
-//! m_low accumulator and a buffered-byte carry-propagation output mechanism.
-//! This produces a bitstream the HEVC decoder can decode correctly.
 
 /// LPS range table from HEVC spec Table 9-43.
 #[rustfmt::skip]
-pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
+pub(crate) static RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128,176,208,240],[128,167,197,227],[128,158,187,216],[123,150,178,205],
     [116,142,169,195],[111,135,160,185],[105,128,152,175],[100,122,144,166],
     [ 95,116,137,158],[ 90,110,130,150],[ 85,104,123,142],[ 81, 99,117,135],
@@ -27,7 +52,7 @@ pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
 
 /// State transition: MPS path.
 #[rustfmt::skip]
-pub const TRANS_IDX_MPS: [u8; 64] = [
+pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
      1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,
     17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
     33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
@@ -36,7 +61,7 @@ pub const TRANS_IDX_MPS: [u8; 64] = [
 
 /// State transition: LPS path.
 #[rustfmt::skip]
-pub const TRANS_IDX_LPS: [u8; 64] = [
+pub(crate) static TRANS_IDX_LPS: [u8; 64] = [
      0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9,11,11,12,
     13,13,15,15,16,16,18,18,19,19,21,21,22,22,23,24,
     24,25,26,26,27,27,28,29,29,30,30,30,31,32,32,33,
@@ -45,24 +70,17 @@ pub const TRANS_IDX_LPS: [u8; 64] = [
 
 /// Number of renorm bits for a given LPS range value.
 /// Index is lps>>3 (0..31). Values from x265/openHEVC renorm table.
-#[rustfmt::skip]
-#[allow(dead_code)]
-static RENORM_TABLE: [u32; 32] = [
-    6,5,4,4,3,3,3,3,2,2,2,2,2,2,2,2,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-];
-
 /// A single CABAC context model: probability state index + MPS value.
 #[derive(Clone, Copy, Debug)]
-pub struct CtxModel {
-    pub p_state_idx: u8,
-    pub val_mps: u8,
+pub(crate) struct CtxModel {
+    pub(crate) p_state_idx: u8,
+    pub(crate) val_mps: u8,
 }
 
 impl CtxModel {
     /// Initialise from HEVC spec §9.3.2.2.
-    pub fn init(init_value: u8, qp: u8) -> Self {
-        // HEVC §9.3.2.2 context initialisation.
+    pub(crate) fn init(init_value: u8, qp: u8) -> Self {
+        // HEVC §9.3.2.2 context initialization.
         let slope_idx = (init_value >> 4) as i32;
         let offset_idx = (init_value & 0x0F) as i32;
         let m = slope_idx * 5 - 45;
@@ -84,7 +102,7 @@ impl CtxModel {
 
     /// Test-only constructor with an explicit probability state and MPS value.
     #[cfg(test)]
-    pub fn fixed(p: u8, m: u8) -> Self {
+    pub(crate) fn fixed(p: u8, m: u8) -> Self {
         CtxModel {
             p_state_idx: p,
             val_mps: m,
@@ -99,18 +117,18 @@ impl CtxModel {
 /// the H.264/HEVC reference software. This produces a bitstream exactly
 /// compatible with the HEVC arithmetic decoder (verified by an independent
 /// decoder over tens of thousands of random symbol sequences).
-pub struct CabacEncoder {
+pub(crate) struct CabacEncoder {
     low: u32,              // 10-bit working low register
     m_range: u32,          // current range [256, 510]
     bits_outstanding: u32, // count of pending carry-dependent bits
     first_bit: bool,       // suppress the very first put_bit (H.264/HEVC convention)
     bit_buffer: u8,        // partial output byte
     bit_count: u8,         // bits filled in bit_buffer (0..8)
-    pub output: Vec<u8>,
+    pub(crate) output: Vec<u8>,
 }
 
 impl CabacEncoder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         CabacEncoder {
             low: 0,
             m_range: 510,
@@ -122,7 +140,6 @@ impl CabacEncoder {
         }
     }
 
-    // ── Internal bit output ─────────────────────────────────────────────────
     #[inline]
     fn emit_bit(&mut self, b: u32) {
         self.bit_buffer = (self.bit_buffer << 1) | (b as u8 & 1);
@@ -150,7 +167,6 @@ impl CabacEncoder {
 
     /// Renormalise after a context-coded bin.
     #[inline]
-    #[inline]
     fn renorm(&mut self) {
         while self.m_range < 256 {
             if self.low < 256 {
@@ -171,7 +187,7 @@ impl CabacEncoder {
 
     /// Context-adaptive binary encoding.
     #[inline]
-    pub fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+    pub(crate) fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
         let state = ctx.p_state_idx as usize;
         let lps = RANGE_TAB_LPS[state][(self.m_range >> 6) as usize & 3] as u32;
         self.m_range -= lps;
@@ -193,7 +209,7 @@ impl CabacEncoder {
 
     /// Equal-probability bypass encoding.
     #[inline]
-    pub fn encode_bypass(&mut self, bin_val: u8) {
+    pub(crate) fn encode_bypass(&mut self, bin_val: u8) {
         self.low <<= 1;
         if bin_val != 0 {
             self.low += self.m_range;
@@ -210,7 +226,7 @@ impl CabacEncoder {
     }
 
     /// Encode end_of_slice_segment_flag (terminate bin).
-    pub fn encode_terminate(&mut self, flag: u8) {
+    pub(crate) fn encode_terminate(&mut self, flag: u8) {
         self.m_range -= 2;
         if flag != 0 {
             self.low += self.m_range;
@@ -240,7 +256,7 @@ impl CabacEncoder {
     }
 
     /// Finish encoding and return the byte-aligned output buffer.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         // Byte-align: pad the partial byte with zeros.
         if self.bit_count > 0 {
             self.bit_buffer <<= 8 - self.bit_count;

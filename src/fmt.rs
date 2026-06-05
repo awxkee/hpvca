@@ -1,12 +1,32 @@
-//! Pixel-format description: chroma subsampling and bit depth.
-//!
-//! This module centralises the format parameters so the encoder can support
-//! multiple chroma formats (4:0:0/4:2:0/4:2:2/4:4:4) and bit depths (8/10) without
-//! scattering magic numbers through the codebase.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
-/// Sample bit depth. Owns the invariants that 8- and 10-bit code repeatedly needs,
-/// so the magic `1<<(bd-1)` / `(1<<bd)-1` / `6*(bd-8)` arithmetic lives in one place
-/// and a depth can never be silently mismatched with the samples it describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitDepth {
     Eight,
@@ -120,19 +140,6 @@ impl ChromaFormat {
             ChromaFormat::Yuv422 => 2,
             ChromaFormat::Yuv444 => 1,
         }
-    }
-}
-
-/// Full pixel-format description: chroma subsampling and sample bit depth.
-#[derive(Clone, Copy, Debug)]
-pub struct PixelFormat {
-    pub chroma: ChromaFormat,
-    pub bit_depth: BitDepth,
-}
-
-impl PixelFormat {
-    pub fn new(chroma: ChromaFormat, bit_depth: BitDepth) -> Self {
-        PixelFormat { chroma, bit_depth }
     }
 }
 

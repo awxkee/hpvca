@@ -1,13 +1,31 @@
-//! Colour signalling for the HEIF `colr` box and the HEVC VUI.
-//!
-//! Two forms are supported, mirroring the `colr` box's two `colour_type`s:
-//!   - `nclx` — CICP enumerated coding-independent code points (primaries,
-//!     transfer characteristics, matrix coefficients, full/limited range).
-//!   - `prof` — an embedded ICC profile (raw bytes).
-//!
-//! The CICP values follow ISO/IEC 23091-2 (identical to the HEVC VUI enums), so a
-//! single [`ColorEncoding`] also drives the VUI `colour_primaries`,
-//! `transfer_characteristics`, `matrix_coeffs`, and `video_full_range_flag`.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 /// CICP colour primaries (ISO/IEC 23091-2 Table 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,11 +71,6 @@ pub enum MatrixCoefficients {
     /// BT.2020 non-constant luminance (value 9).
     Bt2020Ncl = 9,
 }
-
-/// Whether sample values use the full code range (`true`, JPEG-style 0..=max) or the
-/// studio/limited range (`false`, 16..235-style scaled to the bit depth).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FullRange(pub bool);
 
 /// CICP-style colour encoding: the primaries + transfer + matrix the image is
 /// authored in, plus the sample range. Drives both the HEIF `colr` (nclx) box and
@@ -138,11 +151,6 @@ pub enum ColorMetadata {
 }
 
 impl ColorMetadata {
-    /// The default sRGB ICC profile (what libheif embeds), for broad compatibility.
-    pub fn icc_srgb() -> Self {
-        ColorMetadata::Icc(crate::icc_profile::SRGB_ICC.to_vec())
-    }
-
     /// The colour-authoring encoding these metadata imply, used to drive the VUI.
     /// An ICC profile is treated as sRGB for VUI purposes (the working space).
     pub fn color_encoding(&self) -> ColorEncoding {
@@ -155,7 +163,7 @@ impl ColorMetadata {
 
 impl Default for ColorMetadata {
     fn default() -> Self {
-        ColorMetadata::icc_srgb()
+        ColorMetadata::Cicp(ColorEncoding::default())
     }
 }
 
@@ -172,14 +180,6 @@ mod tests {
         assert_eq!(u16::from_be_bytes([p[8], p[9]]), 1); // BT709 matrix
         assert_eq!(p[10] >> 7, 1); // full range
         assert_eq!(p.len(), 11);
-    }
-
-    #[test]
-    fn srgb_default_is_icc() {
-        match ColorMetadata::default() {
-            ColorMetadata::Icc(bytes) => assert!(!bytes.is_empty()),
-            _ => panic!("default should be ICC sRGB"),
-        }
     }
 
     #[test]

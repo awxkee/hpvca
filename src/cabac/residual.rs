@@ -1,17 +1,38 @@
-//! HEVC residual CABAC coding — context indices match ffmpeg's hevc_cabac.c exactly.
-//!
-//! Context index formulas and initValues are taken from ffmpeg's
-//! `elem_offset[]` table and `init_values[0][]` (I-slice).
-
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 use super::{contexts::ContextSet, engine::CabacEncoder};
-
-// ─── CBF ─────────────────────────────────────────────────────────────────────
 
 /// Encode cbf_luma (trafo_depth 0 or 1).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_LUMA] + !trafo_depth)
 /// cbf_luma[0] = trafo_depth != 0, cbf_luma[1] = trafo_depth == 0 (i.e. root TU).
 /// We always call at trafo_depth=0 (root), so use cbf_luma[1].
-pub fn encode_cbf_luma(
+pub(crate) fn encode_cbf_luma(
     enc: &mut CabacEncoder,
     ctx: &mut ContextSet,
     flag: bool,
@@ -23,7 +44,7 @@ pub fn encode_cbf_luma(
 
 /// Encode cbf_cb or cbf_cr at given trafo_depth (0..4).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_CB_CR] + trafo_depth)
-pub fn encode_cbf_chroma(
+pub(crate) fn encode_cbf_chroma(
     enc: &mut CabacEncoder,
     ctx: &mut ContextSet,
     flag: bool,
@@ -33,8 +54,6 @@ pub fn encode_cbf_chroma(
     enc.encode_bin(flag as u8, &mut ctx.cbf_chroma[idx]);
 }
 
-// ─── Full residual_coding() ───────────────────────────────────────────────────
-
 /// Encode a coefficient block using HEVC CABAC residual_coding() syntax.
 ///
 /// `coeffs`  — coefficients in HEVC sub-block-major diagonal scan order
@@ -42,7 +61,7 @@ pub fn encode_cbf_chroma(
 ///             `k` within sub-block `sb`.
 /// `log2_ts` — log2 of the TU size (3 = 8×8, 2 = 4×4)
 /// `is_luma` — selects luma vs chroma contexts
-pub fn encode_residual(
+pub(crate) fn encode_residual(
     enc: &mut CabacEncoder,
     ctx: &mut ContextSet,
     coeffs: &[i16],
@@ -102,7 +121,7 @@ pub fn encode_residual(
             .iter()
             .any(|&c| c != 0);
 
-        let mut sub_block_coded;
+        let sub_block_coded;
         let mut infer_dc = false;
         if sb != 0 && sb != last_sb {
             // coded_sub_block_flag is explicitly coded; ctx from neighbor code.
@@ -195,7 +214,7 @@ pub fn encode_residual(
 
 /// Sub-block diagonal scan for a 2×2 grid of 4×4 sub-blocks (an 8×8 TU).
 /// Index = sub-block number used in coeffs[sb*16+..]; value = (sbx, sby).
-const SB_DIAG_2X2: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+static SB_DIAG_2X2: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
 /// Trivial 1×1 grid (a 4×4 TU).
 const SB_DIAG_1X1: [(usize, usize); 1] = [(0, 0)];
 

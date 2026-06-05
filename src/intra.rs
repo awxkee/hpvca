@@ -1,3 +1,32 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! HEVC intra prediction for 8×8 luma and 4×4/8×8 chroma blocks.
 //!
 //! HEVC spec §8.4.4. The encoder uses PLANAR mode everywhere (mode 0), which keeps
@@ -9,7 +38,7 @@
 /// `above[0..n]` = row above (above[0] is sample at x=0), `above[n]` = top-right.
 /// `left[0..n]`  = column left, `left[n]` = bottom-left.
 #[inline]
-pub fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
+pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
     let mut pred = vec![0u16; n * n];
     let top_right = above[n] as i32;
     let bottom_left = left[n] as i32;
@@ -32,7 +61,7 @@ pub fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
 /// layout that `predict_planar` consumes (length n+1 each). Endpoints that have
 /// no outer neighbour (top-right, bottom-left) are filtered using the sample
 /// beyond them, which for our restricted reference we approximate by clamping.
-pub fn filter_references(
+pub(crate) fn filter_references(
     corner: u16,
     above: &[u16],
     left: &[u16],
@@ -101,6 +130,7 @@ fn decode_order(r: usize, c: usize, blk: usize, ctu: usize, ctus_x: usize) -> i6
 
 /// Returns true if neighbour pixel (nr,nc) was already reconstructed when coding
 /// the block whose top-left is (block_row, block_col).
+#[allow(clippy::too_many_arguments)]
 fn is_available(
     nr: i64,
     nc: i64,
@@ -131,7 +161,7 @@ fn is_available(
 /// with the block size `n` these drive the decode-order availability test so the
 /// encoder never references a neighbour the decoder has not yet reconstructed.
 /// Public wrapper exposing luma decode order for chroma availability mapping.
-pub fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
+pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
     decode_order(r, c, 8, 64, ctus_x)
 }
 
@@ -145,7 +175,7 @@ pub fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
 /// `sub_w`/`sub_h` are the subsampling factors; `luma_w`/`luma_h` the luma picture
 /// dimensions; `luma_ctus_x` the luma CTUs per row.
 #[allow(clippy::too_many_arguments)]
-pub fn get_reference_samples_chroma(
+pub(crate) fn get_reference_samples_chroma(
     plane: &[u16],
     stride: usize,
     block_row: usize,
@@ -260,7 +290,8 @@ pub fn get_reference_samples_chroma(
     (corner, above, left)
 }
 
-pub fn get_reference_samples(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_reference_samples(
     plane: &[u16],
     stride: usize,
     block_row: usize,
@@ -362,7 +393,7 @@ pub fn get_reference_samples(
 ///
 /// Returns `orig[i] - pred[i]` as f32 (level-shifted by -128 already handled
 /// at caller level, so we work in pixel domain here).
-pub fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> Vec<f32> {
+pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> Vec<f32> {
     debug_assert_eq!(orig.len(), n * n);
     debug_assert_eq!(pred.len(), n * n);
     orig.iter()
@@ -373,7 +404,7 @@ pub fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> Vec<f32> {
 
 /// Reconstruct pixels: clamp(pred[i] + residual[i]) to [0, max_val] → u16.
 /// `max_val` is (1<<bit_depth)-1 (255 for 8-bit, 1023 for 10-bit).
-pub fn reconstruct(pred: &[u16], residual: &[f32], n: usize, max_val: u16) -> Vec<u16> {
+pub(crate) fn reconstruct(pred: &[u16], residual: &[f32], n: usize, max_val: u16) -> Vec<u16> {
     let _ = n;
     pred.iter()
         .zip(residual.iter())

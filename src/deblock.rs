@@ -1,16 +1,34 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! HEVC in-loop deblocking filter (spec §8.7.2), specialized for this encoder's
 //! intra-only, fixed-structure streams.
-//!
-//! Because every coding unit is intra and every 8×8 luma block is both a CU and a
-//! TU, every edge that lies on the 8×8 luma sample grid is a prediction/transform
-//! boundary with boundary strength bS = 2. Chroma (4:2:0) is filtered on the
-//! corresponding 16-luma-sample grid, also at bS = 2.
-//!
-//! The filter is applied to the reconstruction in place: ALL vertical edges across
-//! the whole picture first, then ALL horizontal edges (reading the already
-//! vertically-filtered samples), exactly as a conformant decoder does. With the
-//! deblocking filter enabled in the PPS (default offsets), the encoder's
-//! reconstruction therefore matches the decoder's output bit-for-bit.
 
 static BETA_TABLE: [i32; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
@@ -49,7 +67,8 @@ fn table8_22(qpi: i32) -> i32 {
 /// `y` is the luma plane (`w`×`h`), `cb`/`cr` the chroma planes
 /// (`w/2`×`h/2`, 4:2:0). `qp` is the (constant) luma QP. All dimensions are the
 /// coded dimensions (multiples of the CTU size).
-pub fn deblock(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deblock(
     y: &mut [u16],
     w: usize,
     h: usize,
@@ -68,7 +87,7 @@ pub fn deblock(
 }
 
 /// Luma-only deblocking, for monochrome (4:0:0) pictures that have no chroma.
-pub fn deblock_luma_only(
+pub(crate) fn deblock_luma_only(
     y: &mut [u16],
     w: usize,
     h: usize,
@@ -119,6 +138,7 @@ fn deblock_luma(y: &mut [u16], w: usize, h: usize, qp: u8, vertical: bool, bit_d
 /// Filter one 4-sample luma edge segment. For a vertical edge, (ex,ey) is the
 /// top sample of the boundary column (q side at column ex, p side at ex-1), and
 /// the segment spans rows ey..ey+4. For a horizontal edge it is transposed.
+#[allow(clippy::too_many_arguments)]
 fn filter_luma_segment(
     y: &mut [u16],
     stride: usize,

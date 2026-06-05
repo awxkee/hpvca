@@ -1,16 +1,33 @@
-//! YCbCr conversion from packed RGB, supporting 4:0:0/4:2:0/4:2:2/4:4:4 and 8/10-bit.
-//!
-//! Uses full-range BT.709 coefficients (consistent with the SPS VUI and the HEIF
-//! colr ICC profile):
-//!   Y  =  0.2126 R + 0.7152 G + 0.0722 B
-//!   Cb = 128 + (B - Y) / 1.8556   (then scaled to the target bit depth)
-//!   Cr = 128 + (R - Y) / 1.5748
-//!
-//! Samples are stored as u16 so 8-bit (0..255) and 10-bit (0..1023) share one path.
-//! 8-bit RGB input is scaled to the target depth by bit-replication
-//! (v10 = (v8<<2)|(v8>>6)), which maps 255→1023 exactly and is the standard upscale.
-
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 use crate::fmt::{BitDepth, ChromaFormat};
+use crate::{EncodeError, checked_buffer_size, validate_dims};
 
 /// Planar YCbCr image. Samples are u16 (valid range depends on bit depth).
 ///
@@ -59,8 +76,8 @@ impl Yuv {
                 return Err(crate::error::EncodeError::InvalidInput);
             }
         } else {
-            let cw = (w + chroma.sub_w() - 1) / chroma.sub_w();
-            let ch = (h + chroma.sub_h() - 1) / chroma.sub_h();
+            let cw = w.div_ceil(chroma.sub_w());
+            let ch = h.div_ceil(chroma.sub_h());
             if cb.len() != cw * ch || cr.len() != cw * ch {
                 return Err(crate::error::EncodeError::InvalidInput);
             }
@@ -92,24 +109,65 @@ impl Yuv {
         self.width as usize
     }
     pub fn chroma_stride(&self) -> usize {
-        (self.width as usize + self.chroma.sub_w() - 1) / self.chroma.sub_w()
+        (self.width as usize).div_ceil(self.chroma.sub_w())
     }
     pub fn chroma_height(&self) -> usize {
-        (self.height as usize + self.chroma.sub_h() - 1) / self.chroma.sub_h()
+        (self.height as usize).div_ceil(self.chroma.sub_h())
+    }
+}
+
+impl Yuv {
+    pub fn validate(&self) -> Result<(), EncodeError> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        validate_dims(self.width, self.height)?;
+
+        // Luma plane must hold exactly w × h samples.
+        let expected_luma = checked_buffer_size::<u16>(w, h, 1)?;
+        if self.y.len() < expected_luma {
+            return Err(EncodeError::InvalidInput);
+        }
+
+        // Chroma planes: size depends on subsampling.
+        if self.chroma.is_monochrome() {
+            // 4:0:0: both chroma planes must be empty.
+            if !self.cb.is_empty() || !self.cr.is_empty() {
+                return Err(EncodeError::InvalidInput);
+            }
+        } else {
+            let cw = w.div_ceil(self.chroma.sub_w());
+            let ch = h.div_ceil(self.chroma.sub_h());
+            let expected_chroma = checked_buffer_size::<u16>(cw, ch, 1)?;
+            if self.cb.len() < expected_chroma {
+                return Err(EncodeError::InvalidInput);
+            }
+            if self.cr.len() < expected_chroma {
+                return Err(EncodeError::InvalidInput);
+            }
+        }
+
+        // Display size must not exceed coded size.
+        if self.display_w > self.width || self.display_h > self.height {
+            return Err(EncodeError::InvalidInput);
+        }
+
+        // Coded dimensions must be on the chroma subsampling grid.
+        let sw = self.chroma.sub_w() as u32;
+        let sh = self.chroma.sub_h() as u32;
+        if self.width % sw != 0 || self.height % sh != 0 {
+            return Err(EncodeError::InvalidDimensions {
+                width: self.width,
+                height: self.height,
+            });
+        }
+
+        Ok(())
     }
 }
 
 /// Convert planar RGB samples to planar YCbCr in the requested chroma format.
-///
-/// `rgb` holds one `u16` per channel (R,G,B interleaved), already at the target
-/// `bit_depth`'s native range — i.e. 0..=255 for 8-bit, 0..=1023 for 10-bit. The
-/// library does not guess or rescale the input range; a caller with an 8-bit source
-/// that wants a 10-bit encode upscales the samples itself before calling.
-///
-/// Uses full-range BT.709: Y = 0.2126R + 0.7152G + 0.0722B, and chroma centred at
-/// `neutral = 2^(bit_depth-1)` with the standard 1.8556 / 1.5748 divisors (which
-/// operate on native-range sample differences, so they are bit-depth independent).
-pub fn rgb_to_yuv(
+pub(crate) fn rgb_to_yuv(
     rgb: &[u16],
     width: u32,
     height: u32,
@@ -133,7 +191,7 @@ pub fn rgb_to_yuv(
 
     if chroma.is_monochrome() {
         return Yuv {
-            y: y_plane,
+            y: rgb.to_vec(),
             cb: Vec::new(),
             cr: Vec::new(),
             width,
@@ -147,8 +205,8 @@ pub fn rgb_to_yuv(
 
     let sw = chroma.sub_w();
     let sh = chroma.sub_h();
-    let cw = (w + sw - 1) / sw;
-    let ch = (h + sh - 1) / sh;
+    let cw = w.div_ceil(sw);
+    let ch = h.div_ceil(sh);
     let mut cb_plane = vec![0u16; cw * ch];
     let mut cr_plane = vec![0u16; cw * ch];
 
@@ -193,12 +251,6 @@ pub fn rgb_to_yuv(
         chroma,
         bit_depth,
     }
-}
-
-/// Backwards-compatible 8-bit 4:2:0 helper (accepts packed 8-bit RGB).
-pub fn rgb_to_yuv420(rgb: &[u8], width: u32, height: u32) -> Yuv {
-    let wide: Vec<u16> = rgb.iter().map(|&b| b as u16).collect();
-    rgb_to_yuv(&wide, width, height, ChromaFormat::Yuv420, BitDepth::Eight)
 }
 
 #[cfg(test)]
