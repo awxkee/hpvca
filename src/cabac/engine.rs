@@ -150,6 +150,7 @@ impl CabacEncoder {
 
     /// Renormalise after a context-coded bin.
     #[inline]
+    #[inline]
     fn renorm(&mut self) {
         while self.m_range < 256 {
             if self.low < 256 {
@@ -169,6 +170,7 @@ impl CabacEncoder {
     // ── Public API ────────────────────────────────────────────────────────────
 
     /// Context-adaptive binary encoding.
+    #[inline]
     pub fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
         let state = ctx.p_state_idx as usize;
         let lps = RANGE_TAB_LPS[state][(self.m_range >> 6) as usize & 3] as u32;
@@ -190,6 +192,7 @@ impl CabacEncoder {
     }
 
     /// Equal-probability bypass encoding.
+    #[inline]
     pub fn encode_bypass(&mut self, bin_val: u8) {
         self.low <<= 1;
         if bin_val != 0 {

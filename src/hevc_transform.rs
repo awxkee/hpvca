@@ -32,53 +32,45 @@ static T8: [[i32; 8]; 8] = [
 static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
-fn t_row(n: usize, i: usize, j: usize) -> i64 {
-    (if n == 8 { T8[i][j] } else { T4[i][j] }) as i64
+/// Forward integer transform of an N×N residual block (N = 4 or 8).
+pub fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> Vec<i64> {
+    match n {
+        4 => fwd_transform_n::<4>(res, &T4, bit_depth),
+        8 => fwd_transform_n::<8>(res, &T8, bit_depth),
+        _ => panic!("unsupported transform size {n}"),
+    }
 }
 
-/// Forward integer transform of an N×N residual block (N = 4 or 8), 8-bit.
-/// Returns transform coefficients (pre-quantisation).
-pub fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> Vec<i64> {
-    let log2n = if n == 8 { 3 } else { 2 };
+#[inline]
+fn fwd_transform_n<const N: usize>(res: &[i32], t: &[[i32; N]; N], bit_depth: u8) -> Vec<i64> {
+    let log2n = N.trailing_zeros() as i64;
     let bd = bit_depth as i64;
-    // Stage 1 (rows): tmp = T * res  (apply transform along columns of res rows)
-    // We compute coeff = T * res * T^T with two 1-D passes.
-    let shift1 = log2n + bd - 9; // 8x8:2, 4x4:1
+    let shift1 = log2n + bd - 9;
     let add1 = if shift1 > 0 { 1i64 << (shift1 - 1) } else { 0 };
-    // pass 1: along rows (horizontal): tmp[i][j] = sum_k T[i][k]*res[k][j]?
-    // Standard HM: first transform the rows of the residual, i.e.
-    //   tmp = res * T^T  then  coeff = T * tmp ... order doesn't matter for square sep.
-    // We do: tmp[i][j] = (sum_k T[i][k] * res[j][k]) >> shift1   (rows of res)
-    let mut tmp = vec![0i64; n * n];
-    for j in 0..n {
-        // res row j
-        let mut rowv = [0i64; 8];
-        for k in 0..n {
-            rowv[k] = res[j * n + k] as i64;
-        }
-        for i in 0..n {
-            let mut s = 0i64;
-            for k in 0..n {
-                s += t_row(n, i, k) * rowv[k];
-            }
-            tmp[j * n + i] = (s + add1) >> shift1;
+    let mut tmp = [0i64; 64]; // N*N <= 64
+    // pass 1 (rows of res): tmp[j*N+i] = (sum_k T[i][k]*res[j*N+k]) >> shift1
+    for (j, res_row) in res.chunks_exact(N).enumerate().take(N) {
+        for (i, trow) in t.iter().enumerate() {
+            let s: i64 = trow
+                .iter()
+                .zip(res_row)
+                .map(|(&a, &b)| a as i64 * b as i64)
+                .sum();
+            tmp[j * N + i] = (s + add1) >> shift1;
         }
     }
-    // pass 2: along columns: coeff[i][j] = (sum_k T[i][k]*tmp[k][j]) >> shift2
-    let shift2 = log2n + 6; // 8x8:9, 4x4:8
+    // pass 2 (columns): coeff[i*N+j] = (sum_k T[i][k]*tmp[k*N+j]) >> shift2
+    let shift2 = log2n + 6;
     let add2 = 1i64 << (shift2 - 1);
-    let mut coeff = vec![0i64; n * n];
-    for j in 0..n {
-        let mut colv = [0i64; 8];
-        for k in 0..n {
-            colv[k] = tmp[k * n + j];
+    let mut coeff = vec![0i64; N * N];
+    let mut colv = [0i64; N];
+    for j in 0..N {
+        for (k, cv) in colv.iter_mut().enumerate() {
+            *cv = tmp[k * N + j];
         }
-        for i in 0..n {
-            let mut s = 0i64;
-            for k in 0..n {
-                s += t_row(n, i, k) * colv[k];
-            }
-            coeff[i * n + j] = (s + add2) >> shift2;
+        for (i, trow) in t.iter().enumerate() {
+            let s: i64 = trow.iter().zip(&colv).map(|(&a, &b)| a as i64 * b).sum();
+            coeff[i * N + j] = (s + add2) >> shift2;
         }
     }
     coeff
@@ -91,67 +83,75 @@ pub fn quantize(coeff: &[i64], n: usize, qp: u8, bit_depth: u8) -> Vec<i16> {
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let offset = 171i64 << (q_bits - 9); // intra
-    let mut out = vec![0i16; n * n];
-    for idx in 0..n * n {
-        let c = coeff[idx];
-        let level = (c.abs() * q_scale + offset) >> q_bits;
-        let level = if c < 0 { -level } else { level };
-        out[idx] = level.clamp(-32768, 32767) as i16;
-    }
-    out
+    coeff
+        .iter()
+        .map(|&c| {
+            let level = (c.abs() * q_scale + offset) >> q_bits;
+            let level = if c < 0 { -level } else { level };
+            level.clamp(-32768, 32767) as i16
+        })
+        .collect()
 }
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3).
 pub fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> Vec<i64> {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
     let bd = bit_depth as i64;
-    let bd_shift = bd + log2n - 5; // 8x8:6, 4x4:5
+    let bd_shift = bd + log2n - 5;
     let add = 1i64 << (bd_shift - 1);
     let scale = DEQUANT_SCALE[(qp % 6) as usize];
     let per = 1i64 << ((qp as i64) / 6);
-    let mut out = vec![0i64; n * n];
-    for idx in 0..n * n {
-        let v = (level[idx] as i64 * scale * per * 16 + add) >> bd_shift;
-        out[idx] = v.clamp(-32768, 32767);
-    }
-    out
+    let factor = scale * per * 16;
+    level
+        .iter()
+        .map(|&l| ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767))
+        .collect()
 }
 
-/// Inverse integer transform (spec 8.6.4.2), 8-bit. Returns residual.
+/// Inverse integer transform (spec 8.6.4.2). Returns residual.
 pub fn inv_transform(coeff: &[i64], n: usize, bit_depth: u8) -> Vec<i32> {
+    match n {
+        4 => inv_transform_n::<4>(coeff, &T4, bit_depth),
+        8 => inv_transform_n::<8>(coeff, &T8, bit_depth),
+        _ => panic!("unsupported transform size {n}"),
+    }
+}
+
+#[inline]
+fn inv_transform_n<const N: usize>(coeff: &[i64], t: &[[i32; N]; N], bit_depth: u8) -> Vec<i32> {
     let bd = bit_depth as i64;
-    // Stage 1 (columns): out[n] = sum_k T[k][n] * coeff[k]  (= T^T @ col)
+    // Stage 1 (columns): tmp[m*N+c] = clip(sum_k T[k][m]*coeff[k*N+c]) >> 7
     let shift1 = 7i64;
     let add1 = 1i64 << (shift1 - 1);
-    let mut tmp = vec![0i64; n * n];
-    for c in 0..n {
-        let mut colv = [0i64; 8];
-        for k in 0..n {
-            colv[k] = coeff[k * n + c];
+    let mut tmp = [0i64; 64];
+    let mut colv = [0i64; N];
+    for c in 0..N {
+        for (k, cv) in colv.iter_mut().enumerate() {
+            *cv = coeff[k * N + c];
         }
-        for m in 0..n {
-            let mut s = 0i64;
-            for k in 0..n {
-                s += t_row(n, k, m) * colv[k];
-            }
-            tmp[m * n + c] = ((s + add1) >> shift1).clamp(-32768, 32767);
+        for m in 0..N {
+            // column m of T: T[k][m]
+            let s: i64 = t
+                .iter()
+                .zip(&colv)
+                .map(|(trow, &v)| trow[m] as i64 * v)
+                .sum();
+            tmp[m * N + c] = ((s + add1) >> shift1).clamp(-32768, 32767);
         }
     }
-    // Stage 2 (rows): out[n] = sum_k T[k][n] * tmp_row[k]
-    let shift2 = 20 - bd; // 12
+    // Stage 2 (rows): out[r*N+m] = (sum_k T[k][m]*tmp[r*N+k]) >> (20-bd)
+    let shift2 = 20 - bd;
     let add2 = 1i64 << (shift2 - 1);
-    let mut out = vec![0i32; n * n];
-    for r in 0..n {
-        let mut rowv = [0i64; 8];
-        for k in 0..n {
-            rowv[k] = tmp[r * n + k];
-        }
-        for m in 0..n {
-            let mut s = 0i64;
-            for k in 0..n {
-                s += t_row(n, k, m) * rowv[k];
-            }
-            out[r * n + m] = ((s + add2) >> shift2) as i32;
+    let mut out = vec![0i32; N * N];
+    for r in 0..N {
+        let rowv = &tmp[r * N..r * N + N];
+        for m in 0..N {
+            let s: i64 = t
+                .iter()
+                .zip(rowv)
+                .map(|(trow, &v)| trow[m] as i64 * v)
+                .sum();
+            out[r * N + m] = ((s + add2) >> shift2) as i32;
         }
     }
     out

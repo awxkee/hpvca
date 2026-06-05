@@ -21,7 +21,7 @@ pub use yuv::Yuv;
 /// latest source and aren't running a stale checkpoint.
 pub const BUILD_ID: &str = "apple-compat-2026-06-04: 64x64 CTB, IDR_N_LP(20), \
 slice-only mdat, iloc-before-iinf, array_completeness=0, BT.709 full-range, \
-configurable-colr(nclx+ICC), true-display-dims-via-ispe, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10+12-bit, EncodeConfig-builder, YUV-direct-API";
+configurable-colr(nclx+ICC), true-display-dims-via-ispe, level-scales-with-size, PTL-frame-only-constraints, 64-mult-full-CTB, DPB3, ICC-v2-colr-profile, SAO-enabled, x265-aligned-full, spec-EncodeFlush-termination, monomorphized-transform+stack-refs, 4:0:0+4:2:0+4:2:2+4:4:4-chroma, alpha-aux-item, 8+10+12-bit, EncodeConfig-builder, YUV-direct-API";
 
 /// Encoder configuration. Build with [`EncodeConfig::new`] and the `with_*` methods,
 /// then pass to [`encode`] / [`encode_with_alpha`] / [`encode_yuv`].

@@ -8,6 +8,7 @@
 ///
 /// `above[0..n]` = row above (above[0] is sample at x=0), `above[n]` = top-right.
 /// `left[0..n]`  = column left, `left[n]` = bottom-left.
+#[inline]
 pub fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
     let mut pred = vec![0u16; n * n];
     let top_right = above[n] as i32;
@@ -162,10 +163,11 @@ pub fn get_reference_samples_chroma(
 ) -> (u16, Vec<u16>, Vec<u16>) {
     let width = stride;
     let ext = 2 * n;
+    const MAXE: usize = 17;
     let mut above = vec![0u16; ext + 1];
     let mut left = vec![0u16; ext + 1];
-    let mut avail_above = vec![false; ext + 1];
-    let mut avail_left = vec![false; ext + 1];
+    let mut avail_above = [false; MAXE];
+    let mut avail_left = [false; MAXE];
     let mut corner = 0u16;
     let mut avail_corner = false;
 
@@ -222,8 +224,9 @@ pub fn get_reference_samples_chroma(
 
     // Same substitution scan as the luma path.
     let total = (ext + 1) + 1 + (ext + 1);
-    let mut vals = vec![0u16; total];
-    let mut av = vec![false; total];
+    const MAXT: usize = 35;
+    let mut vals = [0u16; MAXT];
+    let mut av = [false; MAXT];
     for i in 0..=ext {
         vals[i] = left[ext - i];
         av[i] = avail_left[ext - i];
@@ -234,7 +237,7 @@ pub fn get_reference_samples_chroma(
         vals[(ext + 2) + i] = above[i];
         av[(ext + 2) + i] = avail_above[i];
     }
-    let first = av.iter().position(|&a| a).unwrap();
+    let first = av[..total].iter().position(|&a| a).unwrap();
     let firstval = vals[first];
     for k in 0..first {
         vals[k] = firstval;
@@ -270,10 +273,12 @@ pub fn get_reference_samples(
 ) -> (u16, Vec<u16>, Vec<u16>) {
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
-    let mut above = vec![0u16; ext + 1]; // above[0..2n]
-    let mut left = vec![0u16; ext + 1]; // left[0..2n]
-    let mut avail_above = vec![false; ext + 1];
-    let mut avail_left = vec![false; ext + 1];
+    // ext <= 16 (n <= 8); scratch availability flags live on the stack.
+    const MAXE: usize = 17; // ext+1 <= 17
+    let mut above = vec![0u16; ext + 1]; // above[0..2n] (returned)
+    let mut left = vec![0u16; ext + 1]; // left[0..2n]  (returned)
+    let mut avail_above = [false; MAXE];
+    let mut avail_left = [false; MAXE];
     let mut corner = 0u16;
     let mut avail_corner = false;
 
@@ -315,9 +320,11 @@ pub fn get_reference_samples(
     }
 
     // Ordered scan: bottom-most left (left[2n]) up to left[0], corner, above[0..2n].
+    // total = 2*(ext+1)+1 <= 35; keep the scratch on the stack.
     let total = (ext + 1) + 1 + (ext + 1);
-    let mut vals = vec![0u16; total];
-    let mut av = vec![false; total];
+    const MAXT: usize = 35;
+    let mut vals = [0u16; MAXT];
+    let mut av = [false; MAXT];
     for i in 0..=ext {
         vals[i] = left[ext - i];
         av[i] = avail_left[ext - i];
@@ -328,7 +335,7 @@ pub fn get_reference_samples(
         vals[(ext + 2) + i] = above[i];
         av[(ext + 2) + i] = avail_above[i];
     }
-    let first = av.iter().position(|&a| a).unwrap();
+    let first = av[..total].iter().position(|&a| a).unwrap();
     let firstval = vals[first];
     for k in 0..first {
         vals[k] = firstval;
