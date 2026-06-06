@@ -8,18 +8,15 @@ A tiny HEVC encoder in Rust.
 fn main() {
     let img = image::open("./assets/abstract_alpha.png")
         .unwrap()
-        .to_rgba16();
-    let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
+        .to_rgba8();
+    let arr = img.to_vec();
 
     let instant = Instant::now();
-    let data = hpvca::encode_with_alpha(
+    let data = hpvca::encode_rgba_with_alpha(
         &arr,
         img.width(),
         img.height(),
-        PixelLayout::Rgba,
-        &EncodeConfig::default()
-            .with_bit_depth(BitDepth::Ten)
-            .with_chroma(ChromaFormat::Yuv420),
+        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv444),
     )
         .unwrap();
     std::fs::write("output.heic", &data).expect("failed to write output");

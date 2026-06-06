@@ -142,7 +142,7 @@ impl EncodeConfig {
 /// Encode a packed 8-bit RGB image to HEIC.
 ///
 /// `rgb` must hold exactly `width * height * 3` bytes in R, G, B order.
-pub fn encode_rgb8(
+pub fn encode_rgb(
     rgb: &[u8],
     width: u32,
     height: u32,
@@ -156,10 +156,10 @@ pub fn encode_rgb8(
 }
 
 /// Encode a packed 8-bit RGBA image to HEIC. Alpha is **discarded**.
-/// Use [`encode_rgba8_with_alpha`] to preserve it.
+/// Use [`encode_rgba_with_alpha`] to preserve it.
 ///
 /// `rgba` must hold exactly `width * height * 4` bytes in R, G, B, A order.
-pub fn encode_rgba8(
+pub fn encode_rgba(
     rgba: &[u8],
     width: u32,
     height: u32,
@@ -179,7 +179,7 @@ pub fn encode_rgba8(
 /// monochrome auxiliary image per ISO/IEC 23008-12.
 ///
 /// `rgba` must hold exactly `width * height * 4` bytes in R, G, B, A order.
-pub fn encode_rgba8_with_alpha(
+pub fn encode_rgba_with_alpha(
     rgba: &[u8],
     width: u32,
     height: u32,
@@ -299,7 +299,7 @@ pub fn encode_rgba12_with_alpha(
 /// Encode a packed 8-bit greyscale image to HEIC (monochrome, no chroma).
 ///
 /// `gray` must hold exactly `width * height` bytes.
-pub fn encode_gray8(
+pub fn encode_gray(
     gray: &[u8],
     width: u32,
     height: u32,
@@ -316,7 +316,7 @@ pub fn encode_gray8(
 /// Use [`encode_gray_alpha8_with_alpha`] to preserve it.
 ///
 /// `ya` must hold exactly `width * height * 2` bytes in Y, A order.
-pub fn encode_gray_alpha8(
+pub fn encode_gray_alpha(
     ya: &[u8],
     width: u32,
     height: u32,
@@ -333,7 +333,7 @@ pub fn encode_gray_alpha8(
 /// alpha auxiliary image per ISO/IEC 23008-12.
 ///
 /// `ya` must hold exactly `width * height * 2` bytes in Y, A order.
-pub fn encode_gray_alpha8_with_alpha(
+pub fn encode_gray_alpha_with_alpha(
     ya: &[u8],
     width: u32,
     height: u32,
@@ -345,8 +345,6 @@ pub fn encode_gray_alpha8_with_alpha(
     let wide: Vec<u16> = ya.iter().map(|&b| b as u16).collect();
     encode_gray_alpha_wide(&wide, width, height, BitDepth::Eight, cfg)
 }
-
-// ── 10-bit Gray / GrayAlpha ───────────────────────────────────────────────────
 
 /// Encode a 10-bit greyscale image to HEIC.
 ///
@@ -396,8 +394,6 @@ pub fn encode_gray_alpha10_with_alpha(
     validate_buf_u16(ya, width, height, 2)?;
     encode_gray_alpha_wide(ya, width, height, BitDepth::Ten, cfg)
 }
-
-// ── 12-bit Gray / GrayAlpha ───────────────────────────────────────────────────
 
 /// Encode a 12-bit greyscale image to HEIC.
 ///
@@ -760,31 +756,31 @@ mod tests {
     #[test]
     fn rejects_wrong_buffer_size() {
         // 2 short of 4×4×3
-        assert!(encode_rgb8(&vec![0u8; 46], 4, 4, &cfg()).is_err());
+        assert!(encode_rgb(&vec![0u8; 46], 4, 4, &cfg()).is_err());
         // 1 over
-        assert!(encode_rgb8(&vec![0u8; 49], 4, 4, &cfg()).is_err());
+        assert!(encode_rgb(&vec![0u8; 49], 4, 4, &cfg()).is_err());
         // exact accepted
-        assert!(encode_rgb8(&vec![0u8; 48], 4, 4, &cfg()).is_ok());
+        assert!(encode_rgb(&vec![0u8; 48], 4, 4, &cfg()).is_ok());
     }
 
     // ── 8-bit RGB / RGBA ─────────────────────────────────────────────────
 
     #[test]
     fn encode_rgb8_produces_heic() {
-        let out = encode_rgb8(&vec![100u8; 16 * 16 * 3], 16, 16, &cfg()).unwrap();
+        let out = encode_rgb(&vec![100u8; 16 * 16 * 3], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
     }
 
     #[test]
     fn encode_rgba8_strips_alpha() {
-        let out = encode_rgba8(&vec![100u8; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
+        let out = encode_rgba(&vec![100u8; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
     }
 
     #[test]
     fn encode_rgba8_with_alpha_produces_heic() {
-        let out = encode_rgba8_with_alpha(&vec![200u8; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
+        let out = encode_rgba_with_alpha(&vec![200u8; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
     }
@@ -825,24 +821,22 @@ mod tests {
         assert!(out.len() > 100);
     }
 
-    // ── 8-bit Gray / GrayAlpha ───────────────────────────────────────────
-
     #[test]
     fn encode_gray8_produces_heic() {
-        let out = encode_gray8(&vec![128u8; 16 * 16], 16, 16, &cfg()).unwrap();
+        let out = encode_gray(&vec![128u8; 16 * 16], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
     }
 
     #[test]
     fn encode_gray_alpha8_strips_alpha() {
-        let out = encode_gray_alpha8(&vec![200u8; 16 * 16 * 2], 16, 16, &cfg()).unwrap();
+        let out = encode_gray_alpha(&vec![200u8; 16 * 16 * 2], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
     }
 
     #[test]
     fn encode_gray_alpha8_with_alpha_produces_heic() {
-        let out = encode_gray_alpha8_with_alpha(&vec![180u8; 16 * 16 * 2], 16, 16, &cfg()).unwrap();
+        let out = encode_gray_alpha_with_alpha(&vec![180u8; 16 * 16 * 2], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
     }
@@ -859,8 +853,6 @@ mod tests {
             encode_gray_alpha10_with_alpha(&vec![512u16; 16 * 16 * 2], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
     }
-
-    // ── 12-bit Gray / GrayAlpha ──────────────────────────────────────────
 
     #[test]
     fn encode_gray12_produces_heic() {
@@ -903,7 +895,7 @@ mod tests {
     #[test]
     fn odd_dimensions_reported_in_ispe() {
         let rgb = vec![100u8; 281 * 181 * 3];
-        let out = encode_rgb8(&rgb, 281, 181, &cfg().with_chroma(ChromaFormat::Yuv420)).unwrap();
+        let out = encode_rgb(&rgb, 281, 181, &cfg().with_chroma(ChromaFormat::Yuv420)).unwrap();
 
         let ispe = out.windows(4).position(|w| w == b"ispe").expect("ispe");
         let wpos = ispe + 4 + 4; // skip box-size(4) + tag(4)
@@ -914,17 +906,17 @@ mod tests {
 
     #[test]
     fn encode_1x1_rgb8() {
-        assert!(encode_rgb8(&[255, 0, 0], 1, 1, &cfg()).is_ok());
+        assert!(encode_rgb(&[255, 0, 0], 1, 1, &cfg()).is_ok());
     }
 
     #[test]
     fn encode_1x1_gray8() {
-        assert!(encode_gray8(&[128], 1, 1, &cfg()).is_ok());
+        assert!(encode_gray(&[128], 1, 1, &cfg()).is_ok());
     }
 
     #[test]
     fn encode_1x1_rgba8_with_alpha() {
-        assert!(encode_rgba8_with_alpha(&[255, 0, 0, 255], 1, 1, &cfg()).is_ok());
+        assert!(encode_rgba_with_alpha(&[255, 0, 0, 255], 1, 1, &cfg()).is_ok());
     }
 
     // ── checked_buffer_size ──────────────────────────────────────────────
