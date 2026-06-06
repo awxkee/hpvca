@@ -662,192 +662,6 @@ fn build_hvcc(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError
     Ok(r)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hevc::NaluStream;
-
-    fn make_stream(chroma: crate::fmt::ChromaFormat, bd: crate::fmt::BitDepth) -> NaluStream {
-        use crate::hevc::{build_pps, build_sps, build_vps};
-        NaluStream {
-            nalus: vec![
-                build_vps(16, 16, chroma, bd),
-                build_sps(16, 16, chroma, bd),
-                build_pps(30),
-            ],
-        }
-    }
-    fn make_test_stream() -> NaluStream {
-        make_stream(
-            crate::fmt::ChromaFormat::Yuv420,
-            crate::fmt::BitDepth::Eight,
-        )
-    }
-
-    #[test]
-    fn ftyp_heic_for_420() {
-        let b = wrap_hevc_image(
-            &make_test_stream(),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        assert_eq!(&b[4..8], b"ftyp");
-        assert_eq!(&b[8..12], b"heic", "4:2:0 8-bit must use heic brand");
-    }
-
-    #[test]
-    fn ftyp_heix_for_422() {
-        let b = wrap_hevc_image(
-            &make_stream(crate::fmt::ChromaFormat::Yuv422, crate::fmt::BitDepth::Ten),
-            16,
-            16,
-            crate::fmt::BitDepth::Ten,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        assert_eq!(&b[8..12], b"heix", "4:2:2 must use heix brand");
-    }
-
-    #[test]
-    fn ftyp_heix_for_444() {
-        let b = wrap_hevc_image(
-            &make_stream(
-                crate::fmt::ChromaFormat::Yuv444,
-                crate::fmt::BitDepth::Eight,
-            ),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        assert_eq!(&b[8..12], b"heix", "4:4:4 must use heix brand");
-    }
-
-    #[test]
-    fn iloc_version_0() {
-        let b = wrap_hevc_image(
-            &make_test_stream(),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        // windows().position() returns the start of the fourcc bytes directly.
-        let iloc_fourcc = b.windows(4).position(|w| w == b"iloc").unwrap();
-        let ver = b[iloc_fourcc + 4]; // version byte (first fullbox byte)
-        let base_sz = (b[iloc_fourcc + 9] >> 4) & 0xF; // field2 high nibble = base_offset_size
-        assert_eq!(ver, 0, "iloc must be version 0");
-        assert_eq!(base_sz, 4, "base_offset_size must be 4");
-    }
-
-    #[test]
-    fn box_order_ftyp_meta_mdat() {
-        let b = wrap_hevc_image(
-            &make_test_stream(),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
-        assert_eq!(&b[ftyp_size + 4..ftyp_size + 8], b"meta");
-        let meta_size =
-            u32::from_be_bytes(b[ftyp_size..ftyp_size + 4].try_into().unwrap()) as usize;
-        assert_eq!(
-            &b[ftyp_size + meta_size + 4..ftyp_size + meta_size + 8],
-            b"mdat"
-        );
-    }
-
-    #[test]
-    fn iloc_offset_points_into_mdat() {
-        let b = wrap_hevc_image(
-            &make_test_stream(),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        let mut pos = 0usize;
-        let mut mdat_payload = 0u32;
-        while pos + 8 <= b.len() {
-            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
-            if &b[pos + 4..pos + 8] == b"mdat" {
-                mdat_payload = (pos + 8) as u32;
-                break;
-            }
-            pos += sz;
-        }
-        assert!(mdat_payload > 0, "mdat not found");
-        // iloc v0+base4 layout:
-        //   box(8) + fullbox(4) + fields(2) + item_count(2) = 16
-        //   item: item_id(2) + data_ref(2) + base_offset(4) + extent_count(2) = 10
-        //   extent_offset here (4 bytes)
-        let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
-        let offset_pos = iloc_pos + 16 + 10;
-        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos + 4].try_into().unwrap());
-        assert_eq!(extent_offset, mdat_payload);
-    }
-
-    #[test]
-    fn ipco_order_hvcC_colr_ispe_pixi() {
-        let b = wrap_hevc_image(
-            &make_test_stream(),
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        let ipco_start = b.windows(4).position(|w| w == b"ipco").unwrap() + 4;
-        let first_child = &b[ipco_start + 4..ipco_start + 8];
-        assert_eq!(first_child, b"hvcC", "first ipco property must be hvcC");
-        // second property should be colr
-        let hvcC_sz =
-            u32::from_be_bytes(b[ipco_start..ipco_start + 4].try_into().unwrap()) as usize;
-        let second_child = &b[ipco_start + hvcC_sz + 4..ipco_start + hvcC_sz + 8];
-        assert_eq!(second_child, b"colr", "second ipco property must be colr");
-    }
-
-    #[test]
-    fn alpha_container_structure() {
-        let color = make_test_stream();
-        let alpha = make_test_stream();
-        let b = wrap_hevc_image_with_alpha(
-            &color,
-            &alpha,
-            16,
-            16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
-        )
-        .unwrap();
-        let s = b.as_slice();
-        assert!(s.windows(4).any(|w| w == b"iref"));
-        assert!(s.windows(4).any(|w| w == b"auxl"));
-        assert!(s.windows(4).any(|w| w == b"auxC"));
-        assert!(s.windows(26).any(|w| w == b"urn:mpeg:hevc:2015:auxid:1"));
-        let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
-        let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
-        assert_eq!(entry_count, 2);
-    }
-}
-
 /// Write a HEIC file whose primary item is an image grid assembled from
 /// pre-encoded HEVC tile streams arranged in row-major order.
 ///
@@ -1217,4 +1031,665 @@ pub(crate) fn wrap_hevc_grid(
     }
 
     Ok(f)
+}
+
+/// Write a HEIC file with a tiled primary image **and** a tiled alpha auxiliary
+/// image, both assembled as HEIF grids.
+///
+/// Item-ID layout:
+/// - `1..=n_tiles`          : color tile items (hidden `hvc1`)
+/// - `n_tiles+1`            : color grid item (primary)
+/// - `n_tiles+2..=2*n_tiles+1` : alpha tile items (hidden `hvc1`)
+/// - `2*n_tiles+2`          : alpha grid item (`auxl` → color grid)
+///
+/// Both grids share the same tile/image dimensions and use `construction_method=1`
+/// (inline `idat`) for their grid descriptors; tile samples are in `mdat`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_hevc_grid_with_alpha(
+    color_tiles: &[NaluStream],
+    alpha_tiles: &[NaluStream],
+    cols: u32,
+    rows: u32,
+    tile_w: u32,
+    tile_h: u32,
+    full_w: u32,
+    full_h: u32,
+    bit_depth: crate::fmt::BitDepth,
+    color_meta: &crate::color::ColorMetadata,
+    metadata: &crate::metadata::Metadata,
+) -> Result<Vec<u8>, EncodeError> {
+    assert_eq!(color_tiles.len(), (cols * rows) as usize);
+    assert_eq!(alpha_tiles.len(), (cols * rows) as usize);
+
+    const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
+
+    let color_hvcc = build_hvcc(&color_tiles[0], bit_depth.bits())?;
+    let alpha_hvcc = build_hvcc(&alpha_tiles[0], bit_depth.bits())?;
+    let chroma_idc = sps_chroma_format_idc(&color_tiles[0]).unwrap_or(1);
+
+    let color_samples: Vec<Vec<u8>> = color_tiles
+        .iter()
+        .map(|t| t.to_length_prefixed_slices())
+        .collect();
+    let alpha_samples: Vec<Vec<u8>> = alpha_tiles
+        .iter()
+        .map(|t| t.to_length_prefixed_slices())
+        .collect();
+
+    // Build both grid descriptors (identical geometry, packed sequentially in idat).
+    let use_32bit = full_w > 65535 || full_h > 65535;
+    let grid_payload: Vec<u8> = {
+        let flags: u8 = if use_32bit { 2 } else { 0 };
+        let mut g = vec![0u8, flags, (rows - 1) as u8, (cols - 1) as u8];
+        if use_32bit {
+            g.extend_from_slice(&full_w.to_be_bytes());
+            g.extend_from_slice(&full_h.to_be_bytes());
+        } else {
+            g.extend_from_slice(&(full_w as u16).to_be_bytes());
+            g.extend_from_slice(&(full_h as u16).to_be_bytes());
+        }
+        g
+    };
+    // Alpha grid has identical geometry — reuse the same descriptor bytes.
+    let alpha_grid_offset = grid_payload.len() as u32; // offset into idat
+
+    let n = color_tiles.len() as u16; // tiles per image
+    let color_grid_id = n + 1;
+    let alpha_tile_base = n + 2; // first alpha tile item-id
+    let alpha_grid_id = alpha_tile_base + n;
+
+    let has_exif = metadata.exif.is_some();
+    let exif_id = alpha_grid_id + 1;
+    let exif_payload: Vec<u8> = metadata
+        .exif
+        .as_ref()
+        .map(|e| {
+            let mut p = Vec::with_capacity(e.len() + 4);
+            p.extend_from_slice(&0u32.to_be_bytes());
+            p.extend_from_slice(e);
+            p
+        })
+        .unwrap_or_default();
+
+    let mut f: Vec<u8> = Vec::new();
+
+    // ── ftyp ─────────────────────────────────────────────────────────────────
+    write_ftyp(&mut f, chroma_idc, bit_depth.bits());
+
+    // ── meta ─────────────────────────────────────────────────────────────────
+    let meta_start = f.len();
+    write_fullbox(&mut f, b"meta", 0, 0);
+
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"hdlr", 0, 0);
+        w32(&mut f, 0);
+        f.extend_from_slice(b"pict");
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        f.push(0);
+        patch(&mut f, s);
+    }
+
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"pitm", 0, 0);
+        w16(&mut f, color_grid_id);
+        patch(&mut f, s);
+    }
+
+    // iloc version=1: mixed construction methods
+    let mut color_tile_patches: Vec<usize> = Vec::with_capacity(n as usize);
+    let mut alpha_tile_patches: Vec<usize> = Vec::with_capacity(n as usize);
+    let mut exif_patch_pos = 0usize;
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iloc", 1, 0);
+        f.push(0x44); // offset_size=4, length_size=4
+        f.push(0x00); // base_offset_size=0, index_size=0
+        let total = 2 * n + 2 + if has_exif { 1 } else { 0 };
+        w16(&mut f, total);
+
+        // Color tiles (cm=0, mdat)
+        for i in 0..n {
+            w16(&mut f, i + 1);
+            w16(&mut f, 0);
+            w16(&mut f, 0);
+            w16(&mut f, 1);
+            let pp = f.len();
+            w32(&mut f, 0);
+            w32(&mut f, color_samples[i as usize].len() as u32);
+            color_tile_patches.push(pp);
+        }
+        // Color grid (cm=1, idat offset=0)
+        w16(&mut f, color_grid_id);
+        w16(&mut f, 1);
+        w16(&mut f, 0);
+        w16(&mut f, 1);
+        w32(&mut f, 0);
+        w32(&mut f, grid_payload.len() as u32);
+
+        // Alpha tiles (cm=0, mdat)
+        for i in 0..n {
+            w16(&mut f, alpha_tile_base + i);
+            w16(&mut f, 0);
+            w16(&mut f, 0);
+            w16(&mut f, 1);
+            let pp = f.len();
+            w32(&mut f, 0);
+            w32(&mut f, alpha_samples[i as usize].len() as u32);
+            alpha_tile_patches.push(pp);
+        }
+        // Alpha grid (cm=1, idat offset=after color descriptor)
+        w16(&mut f, alpha_grid_id);
+        w16(&mut f, 1);
+        w16(&mut f, 0);
+        w16(&mut f, 1);
+        w32(&mut f, alpha_grid_offset);
+        w32(&mut f, grid_payload.len() as u32);
+
+        if has_exif {
+            w16(&mut f, exif_id);
+            w16(&mut f, 0);
+            w16(&mut f, 0);
+            w16(&mut f, 1);
+            exif_patch_pos = f.len();
+            w32(&mut f, 0);
+            w32(&mut f, exif_payload.len() as u32);
+        }
+        patch(&mut f, s);
+    }
+
+    // iinf
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        let count = 2 * n + 2 + if has_exif { 1 } else { 0 };
+        w16(&mut f, count);
+
+        // Hidden color tiles
+        for i in 0..n {
+            let si = f.len();
+            w32(&mut f, 0);
+            f.extend_from_slice(b"infe");
+            f.push(2);
+            f.push(0);
+            f.push(0);
+            f.push(1); // version=2, flags=hidden
+            w16(&mut f, i + 1);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"hvc1");
+            f.push(0);
+            patch(&mut f, si);
+        }
+        // Color grid (visible, primary)
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, color_grid_id);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"grid");
+            f.push(0);
+            patch(&mut f, si);
+        }
+
+        // Hidden alpha tiles
+        for i in 0..n {
+            let si = f.len();
+            w32(&mut f, 0);
+            f.extend_from_slice(b"infe");
+            f.push(2);
+            f.push(0);
+            f.push(0);
+            f.push(1);
+            w16(&mut f, alpha_tile_base + i);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"hvc1");
+            f.push(0);
+            patch(&mut f, si);
+        }
+        // Alpha grid (visible — alpha items are not hidden per HEIF spec §6.6.4.2)
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, alpha_grid_id);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"grid");
+            f.push(0);
+            patch(&mut f, si);
+        }
+
+        if has_exif {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, exif_id);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"Exif");
+            f.push(0);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iref
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iref", 0, 0);
+        // dimg: color grid → color tiles
+        {
+            let sr = f.len();
+            write_box(&mut f, b"dimg");
+            w16(&mut f, color_grid_id);
+            w16(&mut f, n);
+            for i in 1..=n {
+                w16(&mut f, i);
+            }
+            patch(&mut f, sr);
+        }
+        // dimg: alpha grid → alpha tiles
+        {
+            let sr = f.len();
+            write_box(&mut f, b"dimg");
+            w16(&mut f, alpha_grid_id);
+            w16(&mut f, n);
+            for i in 0..n {
+                w16(&mut f, alpha_tile_base + i);
+            }
+            patch(&mut f, sr);
+        }
+        // auxl: alpha grid is auxiliary for color grid
+        {
+            let sr = f.len();
+            write_box(&mut f, b"auxl");
+            w16(&mut f, alpha_grid_id);
+            w16(&mut f, 1);
+            w16(&mut f, color_grid_id);
+            patch(&mut f, sr);
+        }
+        if has_exif {
+            let sr = f.len();
+            write_box(&mut f, b"cdsc");
+            w16(&mut f, exif_id);
+            w16(&mut f, 1);
+            w16(&mut f, color_grid_id);
+            patch(&mut f, sr);
+        }
+        patch(&mut f, s);
+    }
+
+    // iprp
+    // ipco indices (1-based):
+    //  1 hvcC(color)  2 ispe(tile)  3 ispe(full)  4 colr  5 pixi(color,3ch)
+    //  6 hvcC(alpha)  7 pixi(alpha,1ch)  8 auxC  9+ irot/imir/clli
+    let mut irot_idx = 0u8;
+    let mut imir_idx = 0u8;
+    let mut clli_idx = 0u8;
+    {
+        let s = f.len();
+        write_box(&mut f, b"iprp");
+        {
+            let si = f.len();
+            write_box(&mut f, b"ipco");
+            // 1: hvcC (color)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"hvcC");
+                f.extend_from_slice(&color_hvcc);
+                patch(&mut f, sh);
+            }
+            // 2: ispe (tile)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"ispe", 0, 0);
+                w32(&mut f, tile_w);
+                w32(&mut f, tile_h);
+                patch(&mut f, sh);
+            }
+            // 3: ispe (full)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"ispe", 0, 0);
+                w32(&mut f, full_w);
+                w32(&mut f, full_h);
+                patch(&mut f, sh);
+            }
+            // 4: colr
+            write_colr(&mut f, color_meta);
+            // 5: pixi (color, 3ch)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"pixi", 0, 0);
+                f.push(3);
+                f.push(bit_depth.bits());
+                f.push(bit_depth.bits());
+                f.push(bit_depth.bits());
+                patch(&mut f, sh);
+            }
+            // 6: hvcC (alpha)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"hvcC");
+                f.extend_from_slice(&alpha_hvcc);
+                patch(&mut f, sh);
+            }
+            // 7: pixi (alpha, 1ch)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"pixi", 0, 0);
+                f.push(1);
+                f.push(bit_depth.bits());
+                patch(&mut f, sh);
+            }
+            // 8: auxC
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"auxC", 0, 0);
+                f.extend_from_slice(ALPHA_URN);
+                patch(&mut f, sh);
+            }
+            // 9+: orientation / HDR (color grid only)
+            let mut next: u8 = 9;
+            if metadata.orientation.irot_steps() != 0 {
+                let sh = f.len();
+                write_box(&mut f, b"irot");
+                f.push(metadata.orientation.irot_steps() & 3);
+                patch(&mut f, sh);
+                irot_idx = next;
+                next += 1;
+            }
+            if let Some(ax) = metadata.orientation.imir_axis() {
+                let sh = f.len();
+                write_box(&mut f, b"imir");
+                f.push(if ax { 1 } else { 0 });
+                patch(&mut f, sh);
+                imir_idx = next;
+                next += 1;
+            }
+            if let Some(cll) = metadata.content_light_level {
+                let sh = f.len();
+                write_box(&mut f, b"clli");
+                f.extend_from_slice(&cll.clli_payload());
+                patch(&mut f, sh);
+                clli_idx = next;
+                next += 1;
+            }
+            let _ = next;
+            patch(&mut f, si);
+        }
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"ipma", 0, 0);
+            let entry_count = 2 * n + 2; // color tiles + color grid + alpha tiles + alpha grid
+            w32(&mut f, entry_count as u32);
+
+            // Color tiles: hvcC(1*) ispe_tile(2*) colr(4*)
+            for i in 1..=n {
+                w16(&mut f, i);
+                f.push(3);
+                f.push(0x80 | 1);
+                f.push(0x80 | 2);
+                f.push(0x80 | 4);
+            }
+            // Color grid: ispe_full(3) colr(4*) pixi(5) + optionals
+            w16(&mut f, color_grid_id);
+            let mut ga: Vec<u8> = vec![3, 0x80 | 4, 5];
+            if irot_idx != 0 {
+                ga.push(0x80 | irot_idx);
+            }
+            if imir_idx != 0 {
+                ga.push(0x80 | imir_idx);
+            }
+            if clli_idx != 0 {
+                ga.push(clli_idx);
+            }
+            f.push(ga.len() as u8);
+            f.extend_from_slice(&ga);
+
+            // Alpha tiles: hvcC(6*) ispe_tile(2*)
+            for i in 0..n {
+                w16(&mut f, alpha_tile_base + i);
+                f.push(2);
+                f.push(0x80 | 6);
+                f.push(0x80 | 2);
+            }
+            // Alpha grid: ispe_full(3) pixi(7) auxC(8)
+            w16(&mut f, alpha_grid_id);
+            f.push(3);
+            f.push(3);
+            f.push(7);
+            f.push(8);
+
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // idat — both grid descriptors inline (color at 0, alpha at alpha_grid_offset)
+    {
+        let s = f.len();
+        write_box(&mut f, b"idat");
+        f.extend_from_slice(&grid_payload); // color grid descriptor (offset=0)
+        f.extend_from_slice(&grid_payload); // alpha grid descriptor (same geometry)
+        patch(&mut f, s);
+    }
+
+    patch(&mut f, meta_start);
+
+    // mdat — all tile samples
+    let mdat_start = f.len();
+    write_box(&mut f, b"mdat");
+    let mut color_abs: Vec<u32> = Vec::with_capacity(n as usize);
+    for s in &color_samples {
+        color_abs.push(f.len() as u32);
+        f.extend_from_slice(s);
+    }
+    let mut alpha_abs: Vec<u32> = Vec::with_capacity(n as usize);
+    for s in &alpha_samples {
+        alpha_abs.push(f.len() as u32);
+        f.extend_from_slice(s);
+    }
+    let exif_abs = f.len() as u32;
+    if has_exif {
+        f.extend_from_slice(&exif_payload);
+    }
+    patch(&mut f, mdat_start);
+
+    for (i, &abs) in color_abs.iter().enumerate() {
+        f[color_tile_patches[i]..color_tile_patches[i] + 4].copy_from_slice(&abs.to_be_bytes());
+    }
+    for (i, &abs) in alpha_abs.iter().enumerate() {
+        f[alpha_tile_patches[i]..alpha_tile_patches[i] + 4].copy_from_slice(&abs.to_be_bytes());
+    }
+    if has_exif {
+        f[exif_patch_pos..exif_patch_pos + 4].copy_from_slice(&exif_abs.to_be_bytes());
+    }
+
+    Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hevc::NaluStream;
+
+    fn make_stream(chroma: crate::fmt::ChromaFormat, bd: crate::fmt::BitDepth) -> NaluStream {
+        use crate::hevc::{build_pps, build_sps, build_vps};
+        NaluStream {
+            nalus: vec![
+                build_vps(16, 16, chroma, bd),
+                build_sps(16, 16, chroma, bd),
+                build_pps(30),
+            ],
+        }
+    }
+    fn make_test_stream() -> NaluStream {
+        make_stream(
+            crate::fmt::ChromaFormat::Yuv420,
+            crate::fmt::BitDepth::Eight,
+        )
+    }
+
+    #[test]
+    fn ftyp_heic_for_420() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        assert_eq!(&b[4..8], b"ftyp");
+        assert_eq!(&b[8..12], b"heic", "4:2:0 8-bit must use heic brand");
+    }
+
+    #[test]
+    fn ftyp_heix_for_422() {
+        let b = wrap_hevc_image(
+            &make_stream(crate::fmt::ChromaFormat::Yuv422, crate::fmt::BitDepth::Ten),
+            16,
+            16,
+            crate::fmt::BitDepth::Ten,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        assert_eq!(&b[8..12], b"heix", "4:2:2 must use heix brand");
+    }
+
+    #[test]
+    fn ftyp_heix_for_444() {
+        let b = wrap_hevc_image(
+            &make_stream(
+                crate::fmt::ChromaFormat::Yuv444,
+                crate::fmt::BitDepth::Eight,
+            ),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        assert_eq!(&b[8..12], b"heix", "4:4:4 must use heix brand");
+    }
+
+    #[test]
+    fn iloc_version_0() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        // windows().position() returns the start of the fourcc bytes directly.
+        let iloc_fourcc = b.windows(4).position(|w| w == b"iloc").unwrap();
+        let ver = b[iloc_fourcc + 4]; // version byte (first fullbox byte)
+        let base_sz = (b[iloc_fourcc + 9] >> 4) & 0xF; // field2 high nibble = base_offset_size
+        assert_eq!(ver, 0, "iloc must be version 0");
+        assert_eq!(base_sz, 4, "base_offset_size must be 4");
+    }
+
+    #[test]
+    fn box_order_ftyp_meta_mdat() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&b[ftyp_size + 4..ftyp_size + 8], b"meta");
+        let meta_size =
+            u32::from_be_bytes(b[ftyp_size..ftyp_size + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &b[ftyp_size + meta_size + 4..ftyp_size + meta_size + 8],
+            b"mdat"
+        );
+    }
+
+    #[test]
+    fn iloc_offset_points_into_mdat() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        let mut pos = 0usize;
+        let mut mdat_payload = 0u32;
+        while pos + 8 <= b.len() {
+            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            if &b[pos + 4..pos + 8] == b"mdat" {
+                mdat_payload = (pos + 8) as u32;
+                break;
+            }
+            pos += sz;
+        }
+        assert!(mdat_payload > 0, "mdat not found");
+        // iloc v0+base4 layout:
+        //   box(8) + fullbox(4) + fields(2) + item_count(2) = 16
+        //   item: item_id(2) + data_ref(2) + base_offset(4) + extent_count(2) = 10
+        //   extent_offset here (4 bytes)
+        let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
+        let offset_pos = iloc_pos + 16 + 10;
+        let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos + 4].try_into().unwrap());
+        assert_eq!(extent_offset, mdat_payload);
+    }
+
+    #[test]
+    fn ipco_order_hvcc_colr_ispe_pixi() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        let ipco_start = b.windows(4).position(|w| w == b"ipco").unwrap() + 4;
+        let first_child = &b[ipco_start + 4..ipco_start + 8];
+        assert_eq!(first_child, b"hvcC", "first ipco property must be hvcC");
+        // second property should be colr
+        let hvcc_sz =
+            u32::from_be_bytes(b[ipco_start..ipco_start + 4].try_into().unwrap()) as usize;
+        let second_child = &b[ipco_start + hvcc_sz + 4..ipco_start + hvcc_sz + 8];
+        assert_eq!(second_child, b"colr", "second ipco property must be colr");
+    }
+
+    #[test]
+    fn alpha_container_structure() {
+        let color = make_test_stream();
+        let alpha = make_test_stream();
+        let b = wrap_hevc_image_with_alpha(
+            &color,
+            &alpha,
+            16,
+            16,
+            crate::fmt::BitDepth::Eight,
+            &crate::color::ColorMetadata::default(),
+            &crate::metadata::Metadata::default(),
+        )
+        .unwrap();
+        let s = b.as_slice();
+        assert!(s.windows(4).any(|w| w == b"iref"));
+        assert!(s.windows(4).any(|w| w == b"auxl"));
+        assert!(s.windows(4).any(|w| w == b"auxC"));
+        assert!(s.windows(26).any(|w| w == b"urn:mpeg:hevc:2015:auxid:1"));
+        let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
+        let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
+        assert_eq!(entry_count, 2);
+    }
 }
