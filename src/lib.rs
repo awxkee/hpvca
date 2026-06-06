@@ -146,8 +146,6 @@ impl EncodeConfig {
     }
 }
 
-// ── Public entry points ───────────────────────────────────────────────────────
-
 /// Encode a packed 8-bit RGB image to HEIC.
 ///
 /// `rgb` must hold exactly `width * height * 3` bytes in R, G, B order.
