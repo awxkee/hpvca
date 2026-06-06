@@ -155,24 +155,8 @@ fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
     bw.write_bits(1, 3); // nuh_temporal_id_plus1 = 1
 }
 
-// ─── profile_tier_level ──────────────────────────────────────────────────────
-
 /// Write the 88-bit decode_profile_tier_level() block (HEVC spec 7.3.3),
 /// then general_level_idc (8 bits).
-///
-/// ffmpeg's decode_profile_tier_level reads exactly 88 bits:
-///   2 profile_space + 1 tier + 5 profile_idc
-///   + 32 compat_flags
-///   + 4 source/packed/frame_only constraint flags
-///   + 43 reserved_zero_43bits   (Main profile; no extended constraint block)
-///   + 1  inbld_flag / reserved_zero_1bit
-///   = 88 bits
-/// Then parse_ptl() appends level_idc (8 bits) and sub-layer tables.
-/// With max_sub_layers=1 there are no sub-layer rows.
-/// Compute general_level_idc for a coded picture of `w`×`h` luma samples, picking
-/// the lowest HEVC level whose MaxLumaPs covers it. A level that is too low for the
-/// picture size causes conformant decoders (including Apple VideoToolbox) to reject
-/// the stream, so this must scale with the image rather than being hardcoded.
 pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
     let ps = (w as u64) * (h as u64);
     // (MaxLumaPs, level_idc)
@@ -1071,23 +1055,31 @@ fn encode_cu(
         &dct::ZIGZAG
     };
 
+    #[derive(Clone, Copy)]
     struct ChromaTb {
-        cb_zz: Vec<i16>,
+        cb_zz: [i16; 64],
         cb_nz: bool,
-        cr_zz: Vec<i16>,
+        cr_zz: [i16; 64],
         cr_nz: bool,
     }
 
-    let mut tbs: Vec<ChromaTb> = Vec::with_capacity(n_chroma_tb);
-    for t in 0..n_chroma_tb {
+    // n_chroma_tb is 1 (4:2:0 / 4:4:4) or 2 (4:2:2) — keep the TBs on the stack.
+    let mut tbs = [ChromaTb {
+        cb_zz: [0i16; 64],
+        cb_nz: false,
+        cr_zz: [0i16; 64],
+        cr_nz: false,
+    }; 2];
+    for (t, tbs) in tbs[..n_chroma_tb].iter_mut().enumerate() {
         let sub_ch_row = ch_row + t * ctb;
         // Predict this chroma TB (PLANAR, DM_CHROMA). Availability follows the luma
         // decode order; a lower stacked TB sees the reconstructed upper TB.
         // For 4:4:4 (ChromaArrayType==3) the 8×8 chroma reference is smoothed with the
         // [1 2 1]/4 filter exactly like luma (HEVC §8.4.4.2.3); 4×4 chroma is not.
         let filt = ctb > 4; // true only for 4:4:4 8×8 chroma
-        let (bc0, ba, bl) = intra::get_reference_samples_chroma(
+        let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
             rec_cb,
+            rec_cr,
             cw_stride,
             sub_ch_row,
             ch_col,
@@ -1108,41 +1100,29 @@ fn encode_cu(
             (ba, bl)
         };
         let cb_pred = intra::predict_planar(&baf, &blf, ctb);
-        let (rc0, ra, rl) = intra::get_reference_samples_chroma(
-            rec_cr,
-            cw_stride,
-            sub_ch_row,
-            ch_col,
-            coded_ch_h,
-            ctb,
-            sub_w,
-            sub_h,
-            yw_stride,
-            coded_yh,
-            luma_ctus_x,
-            lu_row,
-            lu_col,
-            neutral,
-        );
         let (raf, rlf) = if filt {
             intra::filter_references(rc0, &ra, &rl, ctb)
         } else {
             (ra, rl)
         };
         let cr_pred = intra::predict_planar(&raf, &rlf, ctb);
-
         let b_orig = extract_block_dyn(src_cb, src_cw, src_ch, sub_ch_row, ch_col, ctb);
         let r_orig = extract_block_dyn(src_cr, src_cw, src_ch, sub_ch_row, ch_col, ctb);
-        let b_res: Vec<i32> = b_orig
-            .iter()
-            .zip(&cb_pred)
-            .map(|(&o, &p)| o as i32 - p as i32)
-            .collect();
-        let r_res: Vec<i32> = r_orig
-            .iter()
-            .zip(&cr_pred)
-            .map(|(&o, &p)| o as i32 - p as i32)
-            .collect();
+        let n_ch = ctb * ctb;
+        let mut b_res = [0i32; 64];
+        let mut r_res = [0i32; 64];
+        for (d, (&o, &p)) in b_res[..n_ch]
+            .iter_mut()
+            .zip(b_orig[..n_ch].iter().zip(&cb_pred[..n_ch]))
+        {
+            *d = o as i32 - p as i32;
+        }
+        for (d, (&o, &p)) in r_res[..n_ch]
+            .iter_mut()
+            .zip(r_orig[..n_ch].iter().zip(&cr_pred[..n_ch]))
+        {
+            *d = o as i32 - p as i32;
+        }
         let cb_level = crate::hevc_transform::quantize(
             &crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits()),
             ctb,
@@ -1155,30 +1135,24 @@ fn encode_cu(
             chroma_qp,
             bit_depth.bits(),
         );
-        let cb_zz: Vec<i16> = chroma_scan
-            .iter()
-            .map(|&(r, c)| cb_level[r * ctb + c])
-            .collect();
-        let cr_zz: Vec<i16> = chroma_scan
-            .iter()
-            .map(|&(r, c)| cr_level[r * ctb + c])
-            .collect();
+        let mut cb_zz = [0i16; 64];
+        let mut cr_zz = [0i16; 64];
+        for (&(r, c), dst) in chroma_scan.iter().zip(cb_zz.iter_mut()) {
+            *dst = cb_level[r * ctb + c];
+        }
+        for (&(r, c), dst) in chroma_scan.iter().zip(cr_zz.iter_mut()) {
+            *dst = cr_level[r * ctb + c];
+        }
         let cb_nz = cb_zz.iter().any(|&x| x != 0);
         let cr_nz = cr_zz.iter().any(|&x| x != 0);
 
         // Reconstruct this TB so the next stacked TB (4:2:2) sees it as a reference.
         let b_dq = crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp, bit_depth.bits());
-        let b_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits())
-            .iter()
-            .map(|&v| v as f32)
-            .collect();
-        let b_rec = intra::reconstruct(&cb_pred, &b_rec_f, ctb, max_val);
+        let b_inv = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits());
+        let b_rec = intra::reconstruct(&cb_pred, &b_inv, ctb, max_val);
         let r_dq = crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp, bit_depth.bits());
-        let r_rec_f: Vec<f32> = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits())
-            .iter()
-            .map(|&v| v as f32)
-            .collect();
-        let r_rec = intra::reconstruct(&cr_pred, &r_rec_f, ctb, max_val);
+        let r_inv = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits());
+        let r_rec = intra::reconstruct(&cr_pred, &r_inv, ctb, max_val);
         for r in 0..ctb {
             for c in 0..ctb {
                 let (row, col) = (sub_ch_row + r, ch_col + c);
@@ -1189,12 +1163,12 @@ fn encode_cu(
             }
         }
 
-        tbs.push(ChromaTb {
+        *tbs = ChromaTb {
             cb_zz,
             cb_nz,
             cr_zz,
             cr_nz,
-        });
+        };
     }
 
     // ── HEVC integer transform + quantize: luma 8×8 ───────────────────────
@@ -1217,10 +1191,10 @@ fn encode_cu(
     // cbf order (HEVC §7.3.8.8): for ChromaArrayType==2 (4:2:2) the two stacked
     // chroma TBs each have their own cbf, signalled cb[0],cb[1] then cr[0],cr[1],
     // before cbf_luma. For 4:2:0 there is one of each.
-    for t in &tbs {
+    for t in &tbs[..n_chroma_tb] {
         encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
     }
-    for t in &tbs {
+    for t in &tbs[..n_chroma_tb] {
         encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
     }
     encode_cbf_luma(enc, ctx, y_nz, 0);
@@ -1231,12 +1205,12 @@ fn encode_cu(
     if y_nz {
         encode_residual(enc, ctx, &y_zigzag, 3, true);
     }
-    for t in &tbs {
+    for t in &tbs[..n_chroma_tb] {
         if t.cb_nz {
             encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false);
         }
     }
-    for t in &tbs {
+    for t in &tbs[..n_chroma_tb] {
         if t.cr_nz {
             encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false);
         }
@@ -1245,8 +1219,7 @@ fn encode_cu(
     // ── Reconstruct luma (integer dequant + inverse transform) ─────────────
     let y_dq = crate::hevc_transform::dequantize(&y_level, LU, qp, bit_depth.bits());
     let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, LU, bit_depth.bits());
-    let y_res_rec_f: Vec<f32> = y_res_rec.iter().map(|&v| v as f32).collect();
-    let y_rec = intra::reconstruct(&y_pred, &y_res_rec_f, LU, max_val);
+    let y_rec = intra::reconstruct(&y_pred, &y_res_rec, LU, max_val);
     for r in 0..LU {
         for c in 0..LU {
             let (row, col) = (lu_row + r, lu_col + c);
@@ -1266,8 +1239,8 @@ fn extract_block_n<const N: usize>(
     src_h: usize,
     row: usize,
     col: usize,
-) -> Vec<u16> {
-    let mut out = vec![128u16; N * N];
+) -> [u16; 64] {
+    let mut out = [128u16; 64];
     for r in 0..N {
         for c in 0..N {
             out[r * N + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
@@ -1285,8 +1258,8 @@ fn extract_block_dyn(
     row: usize,
     col: usize,
     n: usize,
-) -> Vec<u16> {
-    let mut out = vec![128u16; n * n];
+) -> [u16; 64] {
+    let mut out = [128u16; 64];
     for r in 0..n {
         for c in 0..n {
             out[r * n + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];

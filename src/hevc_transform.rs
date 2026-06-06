@@ -53,68 +53,80 @@ static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 /// Forward integer transform of an N×N residual block (N = 4 or 8).
-pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> Vec<i64> {
+/// Returns a fixed 64-entry buffer; only the first `n*n` entries are written.
+pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; 64] {
+    let mut out = [0i32; 64];
     match n {
-        4 => fwd_transform_n::<4>(res, &T4, bit_depth),
-        8 => fwd_transform_n::<8>(res, &T8, bit_depth),
+        4 => fwd_transform_n::<4>(res, &T4, bit_depth, &mut out),
+        8 => fwd_transform_n::<8>(res, &T8, bit_depth, &mut out),
         _ => panic!("unsupported transform size {n}"),
     }
+    out
 }
 
 #[inline]
-fn fwd_transform_n<const N: usize>(res: &[i32], t: &[[i32; N]; N], bit_depth: u8) -> Vec<i64> {
-    let log2n = N.trailing_zeros() as i64;
-    let bd = bit_depth as i64;
+fn fwd_transform_n<const N: usize>(
+    res: &[i32],
+    t: &[[i32; N]; N],
+    bit_depth: u8,
+    out: &mut [i32; 64],
+) {
+    let log2n = N.trailing_zeros() as i32;
+    let bd = bit_depth as i32;
     let shift1 = log2n + bd - 9;
-    let add1 = if shift1 > 0 { 1i64 << (shift1 - 1) } else { 0 };
-    let mut tmp = [0i64; 64]; // N*N <= 64
-    // pass 1 (rows of res): tmp[j*N+i] = (sum_k T[i][k]*res[j*N+k]) >> shift1
+    let add1 = if shift1 > 0 { 1i32 << (shift1 - 1) } else { 0 };
+    // i32 throughout: products (|coeff|≤90 · |residual|≤4095) and the ≤N-term
+    // sums stay well inside i32 for every supported bit depth.
+    let mut tmp = [0i32; 64]; // N*N <= 64
+    // pass 1 (rows of res): tmp[j*N+i] = (Σ_k T[i][k]·res[j*N+k]) >> shift1
     for (j, res_row) in res.chunks_exact(N).enumerate().take(N) {
         for (i, trow) in t.iter().enumerate() {
-            let s: i64 = trow
-                .iter()
-                .zip(res_row)
-                .map(|(&a, &b)| a as i64 * b as i64)
-                .sum();
-            tmp[j * N + i] = (s + add1) >> shift1;
+            let mut s = 0i32;
+            for k in 0..N {
+                s += trow[k] * res_row[k];
+            }
+            tmp[j * N + i] = if shift1 > 0 { (s + add1) >> shift1 } else { s };
         }
     }
-    // pass 2 (columns): coeff[i*N+j] = (sum_k T[i][k]*tmp[k*N+j]) >> shift2
+    // pass 2 (columns): coeff[i*N+j] = (Σ_k T[i][k]·tmp[k*N+j]) >> shift2
     let shift2 = log2n + 6;
-    let add2 = 1i64 << (shift2 - 1);
-    let mut coeff = vec![0i64; N * N];
-    let mut colv = [0i64; N];
+    let add2 = 1i32 << (shift2 - 1);
+    let mut colv = [0i32; N];
     for j in 0..N {
         for (k, cv) in colv.iter_mut().enumerate() {
             *cv = tmp[k * N + j];
         }
         for (i, trow) in t.iter().enumerate() {
-            let s: i64 = trow.iter().zip(&colv).map(|(&a, &b)| a as i64 * b).sum();
-            coeff[i * N + j] = (s + add2) >> shift2;
+            let mut s = 0i32;
+            for k in 0..N {
+                s += trow[k] * colv[k];
+            }
+            out[i * N + j] = (s + add2) >> shift2;
         }
     }
-    coeff
 }
 
-/// Forward quantization: coeff → level
-pub(crate) fn quantize(coeff: &[i64], n: usize, qp: u8, bit_depth: u8) -> Vec<i16> {
+/// Forward quantization: coeff → level. Returns a fixed 64-entry buffer.
+pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; 64] {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
     let bd = bit_depth as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let offset = 171i64 << (q_bits - 9); // intra
-    coeff
-        .iter()
-        .map(|&c| {
-            let level = (c.abs() * q_scale + offset) >> q_bits;
-            let level = if c < 0 { -level } else { level };
-            level.clamp(-32768, 32767) as i16
-        })
-        .collect()
+    let mut out = [0i16; 64];
+    for (o, &c) in out[..n * n].iter_mut().zip(coeff) {
+        // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
+        // overflows i32; keep this one multiply in i64.
+        let c = c as i64;
+        let level = (c.abs() * q_scale + offset) >> q_bits;
+        let level = if c < 0 { -level } else { level };
+        *o = level.clamp(-32768, 32767) as i16;
+    }
+    out
 }
 
-/// Dequantisation: level → transform coefficient (spec 8.6.3).
-pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> Vec<i64> {
+/// Dequantisation: level → transform coefficient (spec 8.6.3). Fixed 64-entry buffer.
+pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; 64] {
     let log2n = if n == 8 { 3 } else { 2 } as i64;
     let bd = bit_depth as i64;
     let bd_shift = bd + log2n - 5;
@@ -122,57 +134,77 @@ pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> Vec<
     let scale = DEQUANT_SCALE[(qp % 6) as usize];
     let per = 1i64 << ((qp as i64) / 6);
     let factor = scale * per * 16;
-    level
-        .iter()
-        .map(|&l| ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767))
-        .collect()
+    let mut out = [0i32; 64];
+    for (o, &l) in out[..n * n].iter_mut().zip(level) {
+        *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
+    }
+    out
 }
 
-/// Inverse integer transform (spec 8.6.4.2). Returns residual.
-pub(crate) fn inv_transform(coeff: &[i64], n: usize, bit_depth: u8) -> Vec<i32> {
+/// Inverse integer transform (spec 8.6.4.2). Returns residual in a fixed buffer.
+pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; 64] {
+    let mut out = [0i32; 64];
     match n {
-        4 => inv_transform_n::<4>(coeff, &T4, bit_depth),
-        8 => inv_transform_n::<8>(coeff, &T8, bit_depth),
+        4 => inv_transform_n::<4>(coeff, &T4, bit_depth, &mut out),
+        8 => inv_transform_n::<8>(coeff, &T8, bit_depth, &mut out),
         _ => panic!("unsupported transform size {n}"),
     }
+    out
 }
 
 #[inline]
-fn inv_transform_n<const N: usize>(coeff: &[i64], t: &[[i32; N]; N], bit_depth: u8) -> Vec<i32> {
-    let bd = bit_depth as i64;
-    // Stage 1 (columns): tmp[m*N+c] = clip(sum_k T[k][m]*coeff[k*N+c]) >> 7
-    let shift1 = 7i64;
-    let add1 = 1i64 << (shift1 - 1);
-    let mut tmp = [0i64; 64];
-    let mut colv = [0i64; N];
-    for c in 0..N {
-        for (k, cv) in colv.iter_mut().enumerate() {
-            *cv = coeff[k * N + c];
-        }
-        for m in 0..N {
-            // column m of T: T[k][m]
-            let s: i64 = t
-                .iter()
-                .zip(&colv)
-                .map(|(trow, &v)| trow[m] as i64 * v)
-                .sum();
-            tmp[m * N + c] = ((s + add1) >> shift1).clamp(-32768, 32767);
-        }
-    }
-    // Stage 2 (rows): out[r*N+m] = (sum_k T[k][m]*tmp[r*N+k]) >> (20-bd)
+fn inv_transform_n<const N: usize>(
+    coeff: &[i32],
+    t: &[[i32; N]; N],
+    bit_depth: u8,
+    out: &mut [i32; 64],
+) {
+    let bd = bit_depth as i32;
+    let shift1 = 7i32;
+    let add1 = 1i32 << (shift1 - 1);
     let shift2 = 20 - bd;
-    let add2 = 1i64 << (shift2 - 1);
-    let mut out = vec![0i32; N * N];
-    for r in 0..N {
-        let rowv = &tmp[r * N..r * N + N];
+    let add2 = 1i32 << (shift2 - 1);
+
+    // i32 accumulation is exact (dequant clamps to ±32768); basis rows are read
+    // contiguously and zero coefficients are skipped — residual blocks are
+    // mostly zero, so the skip removes the bulk of the work.
+    let mut tmp = [0i32; 64];
+    let mut acc = [0i32; N];
+
+    // Stage 1 (columns): tmp[m*N+c] = clip( Σ_k T[k][m]·coeff[k*N+c] ) >> 7
+    for c in 0..N {
+        acc[..N].fill(0);
+        for k in 0..N {
+            let ck = coeff[k * N + c];
+            if ck == 0 {
+                continue;
+            }
+            let trow = &t[k];
+            for m in 0..N {
+                acc[m] += trow[m] * ck;
+            }
+        }
         for m in 0..N {
-            let s: i64 = t
-                .iter()
-                .zip(rowv)
-                .map(|(trow, &v)| trow[m] as i64 * v)
-                .sum();
-            out[r * N + m] = ((s + add2) >> shift2) as i32;
+            tmp[m * N + c] = ((acc[m] + add1) >> shift1).clamp(-32768, 32767);
         }
     }
-    out
+
+    // Stage 2 (rows): out[r*N+m] = ( Σ_k T[k][m]·tmp[r*N+k] ) >> (20-bd)
+    for r in 0..N {
+        acc[..N].fill(0);
+        let rowv = &tmp[r * N..r * N + N];
+        for k in 0..N {
+            let rk = rowv[k];
+            if rk == 0 {
+                continue;
+            }
+            let trow = &t[k];
+            for m in 0..N {
+                acc[m] += trow[m] * rk;
+            }
+        }
+        for m in 0..N {
+            out[r * N + m] = (acc[m] + add2) >> shift2;
+        }
+    }
 }

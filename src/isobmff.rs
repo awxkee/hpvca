@@ -623,10 +623,10 @@ fn build_hvcc(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError
             c.copy_from_slice(&s[8..14]);
             (s[3], cp, c, s[14])
         } else {
-            (0b00_0_00100, [0x00, 0, 0, 0], [0x90, 0, 0, 0, 0, 0], 93)
+            (0b0000_0100, [0x00, 0, 0, 0], [0x90, 0, 0, 0, 0, 0], 93)
         }
     } else {
-        (0b00_0_00100, [0x00, 0, 0, 0], [0x90, 0, 0, 0, 0, 0], 93)
+        (0b0000_0100, [0x00, 0, 0, 0], [0x90, 0, 0, 0, 0, 0], 93)
     };
 
     r.push(profile_byte);
@@ -642,7 +642,7 @@ fn build_hvcc(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError
     r.push(0xF8 | (bit_depth - 8)); // bit_depth_chroma_minus8
     r.push(0x00);
     r.push(0x00); // avgFrameRate
-    r.push(0b00_001_1_11); // cFR=0, numTL=1, tidNested=1, lengthSizeM1=3
+    r.push(0b0000_1111); // cFR=0, numTL=1, tidNested=1, lengthSizeM1=3
 
     let arrays: &[(u8, &Vec<&[u8]>)] = &[(32, &vps), (33, &sps), (34, &pps)];
     r.push(arrays.len() as u8);

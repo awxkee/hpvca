@@ -38,8 +38,8 @@
 /// `above[0..n]` = row above (above[0] is sample at x=0), `above[n]` = top-right.
 /// `left[0..n]`  = column left, `left[n]` = bottom-left.
 #[inline]
-pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> Vec<u16> {
-    let mut pred = vec![0u16; n * n];
+pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 64] {
+    let mut pred = [0u16; 64];
     let top_right = above[n] as i32;
     let bottom_left = left[n] as i32;
     let log2 = n.trailing_zeros();
@@ -66,16 +66,18 @@ pub(crate) fn filter_references(
     above: &[u16],
     left: &[u16],
     n: usize,
-) -> (Vec<u16>, Vec<u16>) {
+) -> ([u16; 17], [u16; 17]) {
     // `above` and `left` have length 2n+1 (indices 0..2n). The HEVC [1 2 1]/4
     // filter (§8.4.4.2.3) is applied to every interior reference sample; only the
     // two extreme endpoints (corner and the farthest above-right / below-left,
     // index 2n) are left unfiltered. predict_planar reads indices 0..=n, so we
     // need filtered values at 0..=n, which requires unfiltered neighbours up to
     // index n+1 — present because we gathered 2n samples.
-    let mut fa = above.to_vec();
-    let mut fl = left.to_vec();
+    let mut fa = [0u16; 17];
+    let mut fl = [0u16; 17];
     let ext = above.len() - 1; // = 2n
+    fa[..=ext].copy_from_slice(&above[..=ext]);
+    fl[..=ext].copy_from_slice(&left[..=ext]);
     // above[0] uses the corner as its previous neighbour.
     if ext >= 1 {
         fa[0] = ((corner as i32 + 2 * above[0] as i32 + above[1] as i32 + 2) >> 2) as u16;
@@ -165,94 +167,27 @@ pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
     decode_order(r, c, 8, 64, ctus_x)
 }
 
-/// Reference samples for a chroma N×N block, with availability computed in LUMA
-/// space. Chroma TBs are decoded in lockstep with their co-located luma CU, so a
-/// chroma neighbour is available iff the luma block covering the corresponding luma
-/// position was decoded before the current luma CU. This is correct for both 4:2:0
-/// (sub_h = 2) and 4:2:2 (sub_h = 1), where the chroma CTB is non-square and a plain
-/// chroma Morton scan would be wrong.
-///
-/// `sub_w`/`sub_h` are the subsampling factors; `luma_w`/`luma_h` the luma picture
-/// dimensions; `luma_ctus_x` the luma CTUs per row.
+/// Shared reference-sample substitution (HEVC §8.4.4.2.1): fill unavailable
+/// reference positions from their available neighbours along the scan order
+/// (bottom-left → corner → top-right). `above`/`left` carry the raw samples;
+/// the `avail_*` flags say which were populated.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_reference_samples_chroma(
-    plane: &[u16],
-    stride: usize,
-    block_row: usize,
-    block_col: usize,
-    chroma_h: usize,
-    n: usize,
-    sub_w: usize,
-    sub_h: usize,
-    luma_w: usize,
-    luma_h: usize,
-    luma_ctus_x: usize,
-    cur_luma_row: usize,
-    cur_luma_col: usize,
+fn substitute_refs(
+    mut corner: u16,
+    mut above: [u16; 17],
+    mut left: [u16; 17],
+    avail_corner: bool,
+    avail_above: &[bool; 17],
+    avail_left: &[bool; 17],
+    ext: usize,
     neutral: u16,
-) -> (u16, Vec<u16>, Vec<u16>) {
-    let width = stride;
-    let ext = 2 * n;
-    const MAXE: usize = 17;
-    let mut above = vec![0u16; ext + 1];
-    let mut left = vec![0u16; ext + 1];
-    let mut avail_above = [false; MAXE];
-    let mut avail_left = [false; MAXE];
-    let mut corner = 0u16;
-    let mut avail_corner = false;
-
-    let cur_luma = luma_decode_order(cur_luma_row, cur_luma_col, luma_ctus_x);
-    let avail = |nr: i64, nc: i64, block_row: usize| -> bool {
-        if nr < 0 || nc < 0 || nr as usize >= chroma_h || nc as usize >= width {
-            return false;
-        }
-        let lr = (nr as usize) * sub_h;
-        let lc = (nc as usize) * sub_w;
-        if lr >= luma_h || lc >= luma_w {
-            return false;
-        }
-        let nb_luma = luma_decode_order(lr, lc, luma_ctus_x);
-        if nb_luma < cur_luma {
-            return true;
-        }
-        nb_luma == cur_luma && (nr as usize) < block_row
-    };
-
-    {
-        let nr = block_row as i64 - 1;
-        let nc = block_col as i64 - 1;
-        if avail(nr, nc, block_row) {
-            corner = plane[(nr as usize) * stride + nc as usize];
-            avail_corner = true;
-        }
-    }
-    {
-        let nr = block_row as i64 - 1;
-        for i in 0..=ext {
-            let nc = block_col as i64 + i as i64;
-            if avail(nr, nc, block_row) {
-                above[i] = plane[(nr as usize) * stride + nc as usize];
-                avail_above[i] = true;
-            }
-        }
-    }
-    {
-        let nc = block_col as i64 - 1;
-        for i in 0..=ext {
-            let nr = block_row as i64 + i as i64;
-            if avail(nr, nc, block_row) {
-                left[i] = plane[(nr as usize) * stride + nc as usize];
-                avail_left[i] = true;
-            }
-        }
-    }
-
-    let any = avail_corner || avail_above.iter().any(|&a| a) || avail_left.iter().any(|&a| a);
+) -> (u16, [u16; 17], [u16; 17]) {
+    let any = avail_corner
+        || avail_above[..=ext].iter().any(|&a| a)
+        || avail_left[..=ext].iter().any(|&a| a);
     if !any {
-        return (neutral, vec![neutral; ext + 1], vec![neutral; ext + 1]);
+        return (neutral, [neutral; 17], [neutral; 17]);
     }
-
-    // Same substitution scan as the luma path.
     let total = (ext + 1) + 1 + (ext + 1);
     const MAXT: usize = 35;
     let mut vals = [0u16; MAXT];
@@ -286,8 +221,118 @@ pub(crate) fn get_reference_samples_chroma(
     for i in 0..=ext {
         above[i] = vals[(ext + 2) + i];
     }
-
     (corner, above, left)
+}
+
+/// Gather chroma reference samples for **both** the Cb and Cr planes in one
+/// pass. The availability of each reference position depends only on geometry
+/// (the luma decode order), not on the plane data, so the per-sample Morton
+/// `decode_order` work — the dominant cost — is done once and shared, instead of
+/// being recomputed identically for Cb and then Cr.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn get_reference_samples_chroma_pair(
+    plane_cb: &[u16],
+    plane_cr: &[u16],
+    stride: usize,
+    block_row: usize,
+    block_col: usize,
+    chroma_h: usize,
+    n: usize,
+    sub_w: usize,
+    sub_h: usize,
+    luma_w: usize,
+    luma_h: usize,
+    luma_ctus_x: usize,
+    cur_luma_row: usize,
+    cur_luma_col: usize,
+    neutral: u16,
+) -> ((u16, [u16; 17], [u16; 17]), (u16, [u16; 17], [u16; 17])) {
+    let width = stride;
+    let ext = 2 * n;
+    const MAXE: usize = 17;
+    let mut cb_above = [0u16; MAXE];
+    let mut cb_left = [0u16; MAXE];
+    let mut cr_above = [0u16; MAXE];
+    let mut cr_left = [0u16; MAXE];
+    let mut avail_above = [false; MAXE];
+    let mut avail_left = [false; MAXE];
+    let mut cb_corner = 0u16;
+    let mut cr_corner = 0u16;
+    let mut avail_corner = false;
+
+    let cur_luma = luma_decode_order(cur_luma_row, cur_luma_col, luma_ctus_x);
+    let avail = |nr: i64, nc: i64, block_row: usize| -> bool {
+        if nr < 0 || nc < 0 || nr as usize >= chroma_h || nc as usize >= width {
+            return false;
+        }
+        let lr = (nr as usize) * sub_h;
+        let lc = (nc as usize) * sub_w;
+        if lr >= luma_h || lc >= luma_w {
+            return false;
+        }
+        let nb_luma = luma_decode_order(lr, lc, luma_ctus_x);
+        if nb_luma < cur_luma {
+            return true;
+        }
+        nb_luma == cur_luma && (nr as usize) < block_row
+    };
+
+    {
+        let nr = block_row as i64 - 1;
+        let nc = block_col as i64 - 1;
+        if avail(nr, nc, block_row) {
+            let idx = (nr as usize) * stride + nc as usize;
+            cb_corner = plane_cb[idx];
+            cr_corner = plane_cr[idx];
+            avail_corner = true;
+        }
+    }
+    {
+        let nr = block_row as i64 - 1;
+        for i in 0..=ext {
+            let nc = block_col as i64 + i as i64;
+            if avail(nr, nc, block_row) {
+                let idx = (nr as usize) * stride + nc as usize;
+                cb_above[i] = plane_cb[idx];
+                cr_above[i] = plane_cr[idx];
+                avail_above[i] = true;
+            }
+        }
+    }
+    {
+        let nc = block_col as i64 - 1;
+        for i in 0..=ext {
+            let nr = block_row as i64 + i as i64;
+            if avail(nr, nc, block_row) {
+                let idx = (nr as usize) * stride + nc as usize;
+                cb_left[i] = plane_cb[idx];
+                cr_left[i] = plane_cr[idx];
+                avail_left[i] = true;
+            }
+        }
+    }
+
+    let cb = substitute_refs(
+        cb_corner,
+        cb_above,
+        cb_left,
+        avail_corner,
+        &avail_above,
+        &avail_left,
+        ext,
+        neutral,
+    );
+    let cr = substitute_refs(
+        cr_corner,
+        cr_above,
+        cr_left,
+        avail_corner,
+        &avail_above,
+        &avail_left,
+        ext,
+        neutral,
+    );
+    (cb, cr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,13 +346,13 @@ pub(crate) fn get_reference_samples(
     ctu: usize,
     ctus_x: usize,
     neutral: u16,
-) -> (u16, Vec<u16>, Vec<u16>) {
+) -> (u16, [u16; 17], [u16; 17]) {
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
-    // ext <= 16 (n <= 8); scratch availability flags live on the stack.
+    // ext <= 16 (n <= 8); reference rows live entirely on the stack.
     const MAXE: usize = 17; // ext+1 <= 17
-    let mut above = vec![0u16; ext + 1]; // above[0..2n] (returned)
-    let mut left = vec![0u16; ext + 1]; // left[0..2n]  (returned)
+    let mut above = [0u16; MAXE]; // above[0..2n] (returned)
+    let mut left = [0u16; MAXE]; // left[0..2n]  (returned)
     let mut avail_above = [false; MAXE];
     let mut avail_left = [false; MAXE];
     let mut corner = 0u16;
@@ -347,7 +392,7 @@ pub(crate) fn get_reference_samples(
 
     let any = avail_corner || avail_above.iter().any(|&a| a) || avail_left.iter().any(|&a| a);
     if !any {
-        return (neutral, vec![neutral; ext + 1], vec![neutral; ext + 1]);
+        return (neutral, [neutral; 17], [neutral; 17]);
     }
 
     // Ordered scan: bottom-most left (left[2n]) up to left[0], corner, above[0..2n].
@@ -393,23 +438,28 @@ pub(crate) fn get_reference_samples(
 ///
 /// Returns `orig[i] - pred[i]` as f32 (level-shifted by -128 already handled
 /// at caller level, so we work in pixel domain here).
-pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> Vec<f32> {
-    debug_assert_eq!(orig.len(), n * n);
-    debug_assert_eq!(pred.len(), n * n);
-    orig.iter()
-        .zip(pred.iter())
-        .map(|(&o, &p)| o as f32 - p as f32)
-        .collect()
+pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> [f32; 64] {
+    let mut res = [0f32; 64];
+    for (r, (&o, &p)) in res[..n * n].iter_mut().zip(orig.iter().zip(pred.iter())) {
+        *r = o as f32 - p as f32;
+    }
+    res
 }
 
 /// Reconstruct pixels: clamp(pred[i] + residual[i]) to [0, max_val] → u16.
-/// `max_val` is (1<<bit_depth)-1 (255 for 8-bit, 1023 for 10-bit).
-pub(crate) fn reconstruct(pred: &[u16], residual: &[f32], n: usize, max_val: u16) -> Vec<u16> {
-    let _ = n;
-    pred.iter()
-        .zip(residual.iter())
-        .map(|(&p, &r)| (p as f32 + r).round().clamp(0.0, max_val as f32) as u16)
-        .collect()
+/// `max_val` is (1<<bit_depth)-1 (255 for 8-bit, 1023 for 10-bit). The residual
+/// from the inverse transform is integer-valued, so this is exact integer math
+/// (the previous `(p as f32 + r).round()` was a no-op round on integers).
+pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 64] {
+    let mut out = [0u16; 64];
+    let mx = max_val as i32;
+    for (o, (&p, &r)) in out[..n * n]
+        .iter_mut()
+        .zip(pred.iter().zip(residual.iter()))
+    {
+        *o = (p as i32 + r).clamp(0, mx) as u16;
+    }
+    out
 }
 
 #[cfg(test)]
