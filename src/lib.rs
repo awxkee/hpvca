@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![deny(unreachable_pub)]
+use std::mem::size_of;
 mod cabac;
 mod color;
 mod dct;
@@ -48,6 +49,12 @@ pub use yuv::Yuv;
 
 const MIN_DIM: u32 = 1;
 const MAX_DIM: u32 = 16_384;
+
+/// Images wider or taller than this are encoded as a HEIF grid of 512×512
+/// tiles. The value matches Apple's tile size for compatibility.
+const TILE_SIZE: u32 = 512;
+
+// ── EncodeConfig ──────────────────────────────────────────────────────────────
 
 /// Encoder configuration shared by all entry points.
 ///
@@ -139,6 +146,8 @@ impl EncodeConfig {
     }
 }
 
+// ── Public entry points ───────────────────────────────────────────────────────
+
 /// Encode a packed 8-bit RGB image to HEIC.
 ///
 /// `rgb` must hold exactly `width * height * 3` bytes in R, G, B order.
@@ -179,6 +188,11 @@ pub fn encode_rgba(
 /// monochrome auxiliary image per ISO/IEC 23008-12.
 ///
 /// `rgba` must hold exactly `width * height * 4` bytes in R, G, B, A order.
+///
+/// # Large images
+/// Images larger than 512×512 are not tiled when alpha is present. If you need
+/// tiled output with alpha, pre-tile and call this function per tile, or use
+/// [`encode_yuv`] on pre-converted YCbCr data.
 pub fn encode_rgba_with_alpha(
     rgba: &[u8],
     width: u32,
@@ -313,7 +327,7 @@ pub fn encode_gray(
 }
 
 /// Encode a packed 8-bit greyscale + alpha image to HEIC. Alpha is **discarded**.
-/// Use [`encode_gray_alpha8_with_alpha`] to preserve it.
+/// Use [`encode_gray_alpha_with_alpha`] to preserve it.
 ///
 /// `ya` must hold exactly `width * height * 2` bytes in Y, A order.
 pub fn encode_gray_alpha(
@@ -453,12 +467,17 @@ pub fn encode_gray_alpha12_with_alpha(
 /// for callers that already hold YCbCr data (camera pipeline, decoder output,
 /// etc.). The visible `width`/`height` are read from the [`Yuv`] itself.
 ///
+/// Images wider or taller than 512 px are encoded as a HEIF grid of 512×512
+/// tiles automatically.
+///
 /// Plane dimensions must satisfy the chroma subsampling grid. Use
 /// [`Yuv::from_planes`] or [`yuv::rgb_to_yuv`] to produce a conformant
 /// [`Yuv`]; those functions validate plane sizes on construction.
 pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
-    yuv.validate()?;
     cfg.validate()?;
+    if needs_tiling(yuv.display_w, yuv.display_h) {
+        return encode_yuv_tiled(yuv, cfg);
+    }
     let nalu_stream = hevc::encode_intra(yuv, yuv.width, yuv.height, cfg.quality)?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -470,9 +489,13 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
     )
 }
 
-// ── private implementation helpers ────────────────────────────────────────────
+/// Returns true if the image is large enough to need grid tiling.
+fn needs_tiling(width: u32, height: u32) -> bool {
+    width > TILE_SIZE || height > TILE_SIZE
+}
 
-/// Core RGB encoder. `rgb` is always 3-channel at this point.
+/// Core RGB path: dispatches to tiled grid for large images, single `hvc1`
+/// item otherwise. `rgb` is always 3-channel u16 at this point.
 fn encode_rgb_wide(
     rgb: &[u16],
     width: u32,
@@ -480,6 +503,9 @@ fn encode_rgb_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_tiling(width, height) {
+        return encode_rgb_tiled(rgb, width, height, bit_depth, cfg);
+    }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
     let mut yuv = if enc_w != width || enc_h != height {
         let padded = pad_buf(rgb, width, height, enc_w, enc_h, 3);
@@ -491,7 +517,9 @@ fn encode_rgb_wide(
     encode_yuv_raw(&yuv, cfg)
 }
 
-/// Core RGBA-with-alpha encoder. Splits interleaved RGBA into colour + alpha.
+/// Core RGBA-with-alpha path. Alpha images are not tiled; large images are
+/// encoded as a single item. Tiled alpha support would require extending
+/// `isobmff::wrap_hevc_grid` to produce paired grid+auxl items.
 fn encode_rgba_with_alpha_wide(
     rgba: &[u16],
     width: u32,
@@ -542,7 +570,8 @@ fn encode_rgba_with_alpha_wide(
     )
 }
 
-/// Core greyscale encoder. `gray` is 1-channel luma; always encodes Monochrome.
+/// Core greyscale path: dispatches to tiled grid for large images.
+/// Always encodes as Monochrome regardless of `cfg.chroma`.
 fn encode_gray_wide(
     gray: &[u16],
     width: u32,
@@ -550,6 +579,9 @@ fn encode_gray_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_tiling(width, height) {
+        return encode_gray_tiled(gray, width, height, bit_depth, cfg);
+    }
     // Greyscale is always Monochrome regardless of cfg.chroma.
     let (enc_w, enc_h) = encoded_dims(width, height, ChromaFormat::Monochrome);
     let luma = if enc_w != width || enc_h != height {
@@ -561,7 +593,7 @@ fn encode_gray_wide(
     encode_yuv_raw(&yuv, cfg)
 }
 
-/// Core greyscale-with-alpha encoder. `ya` is 2-channel interleaved (Y, A).
+/// Core greyscale-with-alpha path. Not tiled; see `encode_rgba_with_alpha_wide`.
 fn encode_gray_alpha_wide(
     ya: &[u16],
     width: u32,
@@ -644,6 +676,208 @@ fn build_mono_yuv(
     }
 }
 
+// ── Tiling helpers ────────────────────────────────────────────────────────────
+
+/// Encode a large RGB image as a HEIF grid of [`TILE_SIZE`]×[`TILE_SIZE`] tiles.
+fn encode_rgb_tiled(
+    rgb: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: BitDepth,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    let cols = width.div_ceil(TILE_SIZE);
+    let rows = height.div_ceil(TILE_SIZE);
+    // TILE_SIZE=512 is always chroma-even for sub_w/sub_h ∈ {1,2}, so
+    // encoded_dims returns (512,512) for every subsampling format.
+    let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
+
+    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
+            let yuv = yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth);
+            tile_streams.push(hevc::encode_intra(&yuv, enc_tw, enc_th, cfg.quality)?);
+        }
+    }
+    isobmff::wrap_hevc_grid(
+        &tile_streams,
+        cols,
+        rows,
+        enc_tw,
+        enc_th,
+        width,
+        height,
+        bit_depth,
+        &cfg.color,
+        &cfg.metadata,
+    )
+}
+
+/// Encode a large greyscale image as a HEIF grid of monochrome tiles.
+fn encode_gray_tiled(
+    gray: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: BitDepth,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    let cols = width.div_ceil(TILE_SIZE);
+    let rows = height.div_ceil(TILE_SIZE);
+
+    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let luma = extract_plane_tile(
+                gray,
+                width as usize,
+                height as usize,
+                (col * TILE_SIZE) as usize,
+                (row * TILE_SIZE) as usize,
+                TILE_SIZE as usize,
+                TILE_SIZE as usize,
+            );
+            let yuv = build_mono_yuv(luma, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth);
+            tile_streams.push(hevc::encode_intra(&yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?);
+        }
+    }
+    isobmff::wrap_hevc_grid(
+        &tile_streams,
+        cols,
+        rows,
+        TILE_SIZE,
+        TILE_SIZE,
+        width,
+        height,
+        bit_depth,
+        &cfg.color,
+        &cfg.metadata,
+    )
+}
+
+/// Encode a large pre-converted [`Yuv`] image as a HEIF grid. Splits all
+/// planes (Y, Cb, Cr) into tiles respecting the chroma subsampling ratio.
+fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    let cols = yuv.display_w.div_ceil(TILE_SIZE);
+    let rows = yuv.display_h.div_ceil(TILE_SIZE);
+    let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, yuv.chroma);
+
+    let sw = yuv.chroma.sub_w() as u32;
+    let sh = yuv.chroma.sub_h() as u32;
+    // Chroma tile dimensions after subsampling.
+    let c_tw = (enc_tw / sw) as usize;
+    let c_th = (enc_th / sh) as usize;
+    // Full chroma plane dimensions (yuv.width is already chroma-even padded).
+    let c_src_w = (yuv.width / sw) as usize;
+    let c_src_h = (yuv.height / sh) as usize;
+
+    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let x0 = (col * TILE_SIZE) as usize;
+            let y0 = (row * TILE_SIZE) as usize;
+
+            let y_tile = extract_plane_tile(
+                &yuv.y,
+                yuv.width as usize,
+                yuv.height as usize,
+                x0,
+                y0,
+                enc_tw as usize,
+                enc_th as usize,
+            );
+            let (cb_tile, cr_tile) = if yuv.chroma.is_monochrome() {
+                (Vec::new(), Vec::new())
+            } else {
+                let cx0 = x0 / sw as usize;
+                let cy0 = y0 / sh as usize;
+                (
+                    extract_plane_tile(&yuv.cb, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+                    extract_plane_tile(&yuv.cr, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+                )
+            };
+
+            let tile_yuv = Yuv {
+                y: y_tile,
+                cb: cb_tile,
+                cr: cr_tile,
+                width: enc_tw,
+                height: enc_th,
+                display_w: enc_tw,
+                display_h: enc_th,
+                chroma: yuv.chroma,
+                bit_depth: yuv.bit_depth,
+            };
+            tile_streams.push(hevc::encode_intra(&tile_yuv, enc_tw, enc_th, cfg.quality)?);
+        }
+    }
+    isobmff::wrap_hevc_grid(
+        &tile_streams,
+        cols,
+        rows,
+        enc_tw,
+        enc_th,
+        yuv.display_w,
+        yuv.display_h,
+        yuv.bit_depth,
+        &cfg.color,
+        &cfg.metadata,
+    )
+}
+
+/// Extract a [`TILE_SIZE`]×[`TILE_SIZE`] interleaved-channel tile from a wide
+/// pixel buffer, replication-padding at the right and bottom edges.
+fn extract_rgb_tile(
+    src: &[u16],
+    src_w: u32,
+    src_h: u32,
+    col: u32,
+    row: u32,
+    tile_size: u32,
+    channels: usize,
+) -> Vec<u16> {
+    let (sw, sh) = (src_w as usize, src_h as usize);
+    let ts = tile_size as usize;
+    let x0 = (col * tile_size) as usize;
+    let y0 = (row * tile_size) as usize;
+    let mut tile = vec![0u16; ts * ts * channels];
+    for ty in 0..ts {
+        let sy = (y0 + ty).min(sh - 1);
+        let src_row = &src[sy * sw * channels..(sy * sw + sw) * channels];
+        let dst_row = &mut tile[ty * ts * channels..(ty * ts + ts) * channels];
+        for tx in 0..ts {
+            let sx = (x0 + tx).min(sw - 1);
+            dst_row[tx * channels..(tx + 1) * channels]
+                .copy_from_slice(&src_row[sx * channels..(sx + 1) * channels]);
+        }
+    }
+    tile
+}
+
+/// Extract a single-channel plane tile, replication-padding at edges.
+fn extract_plane_tile(
+    plane: &[u16],
+    src_w: usize,
+    src_h: usize,
+    x0: usize,
+    y0: usize,
+    tile_w: usize,
+    tile_h: usize,
+) -> Vec<u16> {
+    let mut tile = vec![0u16; tile_w * tile_h];
+    for ty in 0..tile_h {
+        let sy = (y0 + ty).min(src_h - 1);
+        let src_row = &plane[sy * src_w..(sy + 1) * src_w];
+        let dst_row = &mut tile[ty * tile_w..(ty + 1) * tile_w];
+        for tx in 0..tile_w {
+            dst_row[tx] = src_row[(x0 + tx).min(src_w - 1)];
+        }
+    }
+    tile
+}
+
+// ── Validation helpers ────────────────────────────────────────────────────────
+
 pub(crate) fn validate_dims(width: u32, height: u32) -> Result<(), EncodeError> {
     if width < MIN_DIM || height < MIN_DIM || width > MAX_DIM || height > MAX_DIM {
         return Err(EncodeError::InvalidDimensions { width, height });
@@ -684,12 +918,11 @@ pub(crate) fn checked_buffer_size<T>(
         .checked_mul(height)
         .and_then(|v| v.checked_mul(channels))
         .and_then(|v| {
-            // Verify byte total fits in isize (Rust allocation limit).
             v.checked_mul(pixel_size)
                 .and_then(|b| isize::try_from(b).ok())?;
             Some(v)
         })
-        .ok_or(EncodeError::DimensionTooLarge { width, height })
+        .ok_or(EncodeError::InvalidInput)
 }
 
 fn encoded_dims(width: u32, height: u32, chroma: ChromaFormat) -> (u32, u32) {
@@ -721,7 +954,7 @@ fn pad_buf(src: &[u16], w: u32, h: u32, nw: u32, nh: u32, channels: usize) -> Ve
     out
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -755,11 +988,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_buffer_size() {
-        // 2 short of 4×4×3
         assert!(encode_rgb(&vec![0u8; 46], 4, 4, &cfg()).is_err());
-        // 1 over
         assert!(encode_rgb(&vec![0u8; 49], 4, 4, &cfg()).is_err());
-        // exact accepted
         assert!(encode_rgb(&vec![0u8; 48], 4, 4, &cfg()).is_ok());
     }
 
@@ -820,6 +1050,8 @@ mod tests {
         let out = encode_rgba12_with_alpha(&vec![2048u16; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
     }
+
+    // ── greyscale ────────────────────────────────────────────────────────
 
     #[test]
     fn encode_gray8_produces_heic() {
@@ -898,7 +1130,7 @@ mod tests {
         let out = encode_rgb(&rgb, 281, 181, &cfg().with_chroma(ChromaFormat::Yuv420)).unwrap();
 
         let ispe = out.windows(4).position(|w| w == b"ispe").expect("ispe");
-        let wpos = ispe + 4 + 4; // skip box-size(4) + tag(4)
+        let wpos = ispe + 4 + 4;
         let w = u32::from_be_bytes(out[wpos..wpos + 4].try_into().unwrap());
         let h = u32::from_be_bytes(out[wpos + 4..wpos + 8].try_into().unwrap());
         assert_eq!((w, h), (281, 181));
@@ -917,6 +1149,63 @@ mod tests {
     #[test]
     fn encode_1x1_rgba8_with_alpha() {
         assert!(encode_rgba_with_alpha(&[255, 0, 0, 255], 1, 1, &cfg()).is_ok());
+    }
+
+    // ── tiling ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tiled_rgb8_produces_grid_heic() {
+        // 1024×768 triggers 2×2 grid tiling.
+        let px: Vec<u8> = (0u32..1024 * 768 * 3).map(|i| (i % 256) as u8).collect();
+        let out = encode_rgb(&px, 1024, 768, &cfg()).unwrap();
+        assert!(out.len() > 1000);
+        assert_eq!(&out[4..8], b"ftyp");
+        // A grid HEIC has a 'grid' item type in iinf.
+        assert!(out.windows(4).any(|w| w == b"grid"), "expected grid item");
+    }
+
+    #[test]
+    fn tiled_rgb10_produces_grid_heic() {
+        let px = vec![512u16; 1024 * 768 * 3];
+        let out = encode_rgb10(&px, 1024, 768, &cfg()).unwrap();
+        assert!(out.windows(4).any(|w| w == b"grid"));
+    }
+
+    #[test]
+    fn tiled_gray8_produces_grid_heic() {
+        let px: Vec<u8> = (0u32..1024 * 768).map(|i| (i % 256) as u8).collect();
+        let out = encode_gray(&px, 1024, 768, &cfg()).unwrap();
+        assert!(out.windows(4).any(|w| w == b"grid"));
+    }
+
+    #[test]
+    fn tiled_yuv_produces_grid_heic() {
+        let rgb = vec![200u16; 1024 * 768 * 3];
+        let yuv = yuv::rgb_to_yuv(&rgb, 1024, 768, ChromaFormat::Yuv420, BitDepth::Eight);
+        let out = encode_yuv(&yuv, &cfg()).unwrap();
+        assert!(out.windows(4).any(|w| w == b"grid"));
+    }
+
+    #[test]
+    fn tiled_grid_has_correct_ispe() {
+        // ispe for the grid item should reflect the full image dimensions.
+        let px: Vec<u8> = vec![128u8; 1024 * 768 * 3];
+        let out = encode_rgb(&px, 1024, 768, &cfg()).unwrap();
+        // Find the ispe that has 1024×768 (not the tile-size ispe 512×512).
+        let mut found = false;
+        let mut i = 0;
+        while i + 16 <= out.len() {
+            if &out[i..i + 4] == b"ispe" {
+                let w = u32::from_be_bytes(out[i + 8..i + 12].try_into().unwrap());
+                let h = u32::from_be_bytes(out[i + 12..i + 16].try_into().unwrap());
+                if w == 1024 && h == 768 {
+                    found = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        assert!(found, "no ispe 1024×768 found in tiled output");
     }
 
     // ── checked_buffer_size ──────────────────────────────────────────────

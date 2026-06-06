@@ -27,14 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! HEVC bitstream encoder — parameter sets, slice header, CABAC slice data.
-//!
-//! Produces a conformant HEVC still-picture bitstream:
-//!   - VPS  NAL type 32  (fixed, one-layer, one-temporal-layer)
-//!   - SPS  NAL type 33  (Main profile, level 3.1, 8-bit 4:2:0, conformance window)
-//!   - PPS  NAL type 34  (minimal, cu_qp_delta disabled)
-//!   - IDR  NAL type 19  (intra-only, CABAC, DC/Planar per CU, reconstruct loop)
-
 use crate::{
     cabac::{
         CabacEncoder, ContextSet, IntraModeContexts, encode_cbf_chroma, encode_cbf_luma,
@@ -48,8 +40,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct Nalu {
-    #[allow(unused)]
-    pub(crate) nal_type: u8,
+    pub(crate) _nal_type: u8,
     pub(crate) data: Vec<u8>,
 }
 
@@ -164,8 +155,24 @@ fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
     bw.write_bits(1, 3); // nuh_temporal_id_plus1 = 1
 }
 
+// ─── profile_tier_level ──────────────────────────────────────────────────────
+
 /// Write the 88-bit decode_profile_tier_level() block (HEVC spec 7.3.3),
 /// then general_level_idc (8 bits).
+///
+/// ffmpeg's decode_profile_tier_level reads exactly 88 bits:
+///   2 profile_space + 1 tier + 5 profile_idc
+///   + 32 compat_flags
+///   + 4 source/packed/frame_only constraint flags
+///   + 43 reserved_zero_43bits   (Main profile; no extended constraint block)
+///   + 1  inbld_flag / reserved_zero_1bit
+///   = 88 bits
+/// Then parse_ptl() appends level_idc (8 bits) and sub-layer tables.
+/// With max_sub_layers=1 there are no sub-layer rows.
+/// Compute general_level_idc for a coded picture of `w`×`h` luma samples, picking
+/// the lowest HEVC level whose MaxLumaPs covers it. A level that is too low for the
+/// picture size causes conformant decoders (including Apple VideoToolbox) to reject
+/// the stream, so this must scale with the image rather than being hardcoded.
 pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
     let ps = (w as u64) * (h as u64);
     // (MaxLumaPs, level_idc)
@@ -193,38 +200,59 @@ fn write_profile_tier_level(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
 ) {
-    // Profile/Tier/Level, matched to x265's RExt output. The RExt constraint flags
-    // must be consistent with the actual chroma format: a 4:2:2 stream must NOT set
-    // max_420chroma_constraint_flag.
+    // Select profile based on chroma and bit depth (matching Apple / x265 behaviour):
+    //   4:2:0 / mono 8-bit  → profile 3 (Main Still Picture), compat 0x70000000
+    //   4:2:0 / mono 10-bit → profile 2 (Main10),            compat 0x20000000
+    //   4:2:2 / 4:4:4 / 12-bit → profile 4 (RExt),          compat 0x08000000
+    let is_420 = matches!(
+        chroma,
+        crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
+    );
+    let bits = bit_depth.bits();
+    let is_rext = !is_420 || bits > 10;
+
+    let (profile_idc, compat): (u32, u32) = if is_rext {
+        (4, 0x0800_0000) // RExt
+    } else if bits <= 8 {
+        (3, 0x7000_0000) // Main Still Picture (compatible w/ Main + Main10 + MSP)
+    } else {
+        (2, 0x2000_0000) // Main10
+    };
+
     bw.write_bits(0, 2); // general_profile_space = 0
     bw.write_bit(false); // general_tier_flag = 0 (Main tier)
-    bw.write_bits(4, 5); // general_profile_idc = 4 (Format Range Extensions)
+    bw.write_bits(profile_idc, 5); // general_profile_idc
+    bw.write_bits(compat, 32); // general_profile_compatibility_flags
 
-    bw.write_bits(0x0800_0000, 32); // compatibility: bit 4 (RExt)
+    // Source constraint flags — common to all profiles.
+    // non_packed_constraint = 1 signals no frame-packing arrangement (correct for
+    // all still images and matches Apple's encoder output).
+    bw.write_bit(true); // general_progressive_source_flag    = 1
+    bw.write_bit(false); // general_interlaced_source_flag     = 0
+    bw.write_bit(true); // general_non_packed_constraint_flag = 1
+    bw.write_bit(true); // general_frame_only_constraint_flag = 1
 
-    bw.write_bit(true); // general_progressive_source_flag   = 1
-    bw.write_bit(false); // general_interlaced_source_flag    = 0
-    bw.write_bit(false); // general_non_packed_constraint_flag= 0
-    bw.write_bit(true); // general_frame_only_constraint_flag= 1
-    // RExt bit-depth constraint flags. Each `max_Nbit` flag asserts the stream uses
-    // at most N bits, so it is set when bit_depth <= N (HEVC Annex A).
-    let bits = bit_depth.bits();
-    bw.write_bit(bits <= 12); // max_12bit_constraint_flag
-    bw.write_bit(bits <= 10); // max_10bit_constraint_flag
-    bw.write_bit(bits <= 8); // max_8bit_constraint_flag
-    // For monochrome, the stream satisfies all the chroma constraints (max_422,
-    // max_420 are true) and additionally max_monochrome = 1.
-    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
-    let is_420 = matches!(chroma, crate::fmt::ChromaFormat::Yuv420);
-    let is_mono = matches!(chroma, crate::fmt::ChromaFormat::Monochrome);
-    bw.write_bit(!is_444 || is_mono); // max_422chroma_constraint_flag
-    bw.write_bit(is_420 || is_mono); // max_420chroma_constraint_flag
-    bw.write_bit(is_mono); // max_monochrome_constraint_flag
-    bw.write_bit(true); // intra_constraint_flag        = 1
-    bw.write_bit(false); // one_picture_only_constraint_flag = 0
-    bw.write_bit(true); // lower_bit_rate_constraint_flag   = 1
-    bw.write_bits(0, 32); // reserved
-    bw.write_bits(0, 3); // reserved (35 reserved bits total after 13 constraint bits)
+    if is_rext {
+        // RExt extended constraint block (44 bits = 10 named flags + 34 zeros)
+        let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
+        let is_mono = matches!(chroma, crate::fmt::ChromaFormat::Monochrome);
+        bw.write_bit(bits <= 12); // max_12bit_constraint_flag
+        bw.write_bit(bits <= 10); // max_10bit_constraint_flag
+        bw.write_bit(bits <= 8); // max_8bit_constraint_flag
+        bw.write_bit(!is_444 || is_mono); // max_422chroma_constraint_flag
+        bw.write_bit(is_420 || is_mono); // max_420chroma_constraint_flag
+        bw.write_bit(is_mono); // max_monochrome_constraint_flag
+        bw.write_bit(true); // intra_constraint_flag = 1
+        bw.write_bit(false); // one_picture_only_constraint_flag = 0
+        bw.write_bit(true); // lower_bit_rate_constraint_flag = 1
+        bw.write_bit(bits <= 14); // max_14bit_constraint_flag
+        bw.write_bits(0, 32);
+        bw.write_bits(0, 2); // 34 reserved zeros
+    } else {
+        // Non-RExt (Main / Main10 / Main Still Picture): 44 reserved zeros
+        bw.write_bits(0, 32);
+        bw.write_bits(0, 12);
+    }
 
     bw.write_bits(level_idc as u32, 8);
 }
@@ -255,7 +283,7 @@ pub(crate) fn build_vps(
 
     // vps_sub_layer_ordering_info_present_flag = false → only [0] entry
     bw.write_bit(false);
-    bw.write_ue(2); // vps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches SPS)
+    bw.write_ue(0); // vps_max_dec_pic_buffering_minus1[0] = 0 → DPB 1 (matches SPS)
     bw.write_ue(0); // vps_max_num_reorder_pics[0] = 0
     bw.write_ue(0); // vps_max_latency_increase_plus1[0] = 0
 
@@ -273,7 +301,7 @@ pub(crate) fn build_vps(
 
     bw.rbsp_trailing_bits();
     Nalu {
-        nal_type: 32,
+        _nal_type: 32,
         data: bw.finish(),
     }
 }
@@ -337,9 +365,9 @@ pub(crate) fn build_sps(
 
     // sps_sub_layer_ordering_info_present_flag = false
     bw.write_bit(false);
-    bw.write_ue(2); // sps_max_dec_pic_buffering_minus1[0] = 2 → DPB 3 (matches x265;
-    // hardware decoders allocate the DPB from this and may reject a
-    // value smaller than they expect for the pipeline).
+    bw.write_ue(0); // sps_max_dec_pic_buffering_minus1[0] = 0 → DPB 1 (intra-only
+    // still image; Apple's encoder also uses 0. VideoToolbox may reject
+    // tiles with dpb > 0 in grid mode due to resource constraints).
     bw.write_ue(0); // sps_max_num_reorder_pics[0]
     bw.write_ue(0); // sps_max_latency_increase_plus1[0]
 
@@ -381,11 +409,32 @@ pub(crate) fn build_sps(
     bw.write_bit(true); // vui_parameters_present_flag
     write_vui(&mut bw);
 
-    bw.write_bit(false); // sps_extension_present_flag
+    // sps_extension: RExt profiles require sps_range_extension to be present
+    // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
+    // Apple's decoder rejects 12-bit streams whose SPS lacks the range extension.
+    let need_range_ext = bit_depth.bits() > 8;
+    bw.write_bit(need_range_ext); // sps_extension_present_flag
+    if need_range_ext {
+        bw.write_bit(true); // sps_range_extension_flag = 1
+        bw.write_bit(false); // sps_multilayer_extension_flag = 0
+        bw.write_bit(false); // sps_3d_extension_flag = 0
+        bw.write_bit(false); // sps_scc_extension_flag = 0
+        bw.write_bits(0, 4); // sps_extension_4bits = 0
+        // sps_range_extension() — all flags 0 (no RExt features used for intra-only)
+        bw.write_bit(false); // transform_skip_rotation_enabled_flag
+        bw.write_bit(false); // transform_skip_context_enabled_flag
+        bw.write_bit(false); // implicit_rdpcm_enabled_flag
+        bw.write_bit(false); // explicit_rdpcm_enabled_flag
+        bw.write_bit(false); // extended_precision_processing_flag
+        bw.write_bit(false); // intra_smoothing_disabled_flag
+        bw.write_bit(false); // high_precision_offsets_enabled_flag
+        bw.write_bit(false); // persistent_rice_adaptation_enabled_flag
+        bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
+    }
 
     bw.rbsp_trailing_bits();
     Nalu {
-        nal_type: 33,
+        _nal_type: 33,
         data: bw.finish(),
     }
 }
@@ -472,7 +521,7 @@ pub(crate) fn build_pps(qp: u8) -> Nalu {
 
     bw.rbsp_trailing_bits();
     Nalu {
-        nal_type: 34,
+        _nal_type: 34,
         data: bw.finish(),
     }
 }
@@ -495,31 +544,6 @@ pub(crate) fn encode_intra(
         nalus: vec![vps, sps, pps, idr],
     })
 }
-
-// /// Encode and also return the encoder's internal reconstruction (coded dimensions).
-// /// Intended for validation: the reconstruction is exactly what a matching decoder
-// /// produces, so comparing it to the source measures encode quality without any
-// /// external decoder.
-// pub(crate) fn encode_intra_with_recon(
-//     yuv: &Yuv,
-//     width: u32,
-//     height: u32,
-//     quality: u8,
-// ) -> Result<(NaluStream, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
-//     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
-//     let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
-//     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-//     let pps = build_pps(qp_val);
-//     let (idr, ry, rcb, rcr) = build_idr_slice(yuv, width, height, quality)?;
-//     Ok((
-//         NaluStream {
-//             nalus: vec![vps, sps, pps, idr],
-//         },
-//         ry,
-//         rcb,
-//         rcr,
-//     ))
-// }
 
 #[allow(clippy::type_complexity)]
 fn build_idr_slice(
@@ -738,7 +762,7 @@ fn build_idr_slice(
 
     Ok((
         Nalu {
-            nal_type: 20,
+            _nal_type: 20,
             data: nalu_data,
         },
         rec_y,
@@ -1023,7 +1047,6 @@ fn encode_cu(
             enc.encode_bypass(((rem >> i) & 1) as u8);
         }
     }
-
     // ── Chroma intra pred mode (DM_CHROMA → single '0' bin) ──────────────
     // Present only when ChromaArrayType != 0 (HEVC §7.3.8.5). DM_CHROMA means chroma
     // uses the luma mode = PLANAR, so we predict chroma with PLANAR.
@@ -1201,7 +1224,6 @@ fn encode_cu(
     for t in &tbs {
         encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
     }
-    // cbf_luma at trafoDepth=0 (intra, single TU → always coded)
     encode_cbf_luma(enc, ctx, y_nz, 0);
 
     // ── CABAC: residuals (HEVC §7.3.8.11) ─────────────────────────────────
