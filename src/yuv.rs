@@ -285,7 +285,6 @@ pub(crate) fn rgb_to_yuv(
                     .clamp(0, maxv) as u16;
             }
 
-            // Odd-width trailing pixel: no horizontal neighbour, use as-is.
             if !remainder.is_empty() {
                 let (r, g, b) = (
                     remainder[0] as i32,
@@ -302,8 +301,6 @@ pub(crate) fn rgb_to_yuv(
         }
     };
 
-    // Blend a second row's horizontal chroma into an already-written chroma
-    // row (vertical average for 4:2:0). Values are Q0 throughout.
     let blend_chroma_row = |src: &[u16], cb_row: &mut [u16], cr_row: &mut [u16]| {
         let pairs = src.chunks_exact(6);
         let remainder = pairs.remainder();
@@ -339,8 +336,6 @@ pub(crate) fn rgb_to_yuv(
     };
 
     match chroma {
-        // ── 4:4:4 ─────────────────────────────────────────────────────────
-        // One chroma sample per luma pixel — no averaging at all.
         ChromaFormat::Yuv444 => {
             for (row, ((y_row, cb_row), cr_row)) in y_plane
                 .chunks_exact_mut(w)
@@ -362,9 +357,6 @@ pub(crate) fn rgb_to_yuv(
                 }
             }
         }
-
-        // ── 4:2:2 ─────────────────────────────────────────────────────────
-        // One chroma sample per horizontal pair of luma pixels, full height.
         ChromaFormat::Yuv422 => {
             for (row, ((y_row, cb_row), cr_row)) in y_plane
                 .chunks_exact_mut(w)
@@ -377,10 +369,6 @@ pub(crate) fn rgb_to_yuv(
             }
         }
 
-        // ── 4:2:0 ─────────────────────────────────────────────────────────
-        // One chroma sample per 2×2 luma block.
-        // Process two luma rows at a time → one chroma row.
-        // Handles odd height: the last unpaired row is treated as 4:2:2.
         ChromaFormat::Yuv420 => {
             // Full pairs of luma rows.
             let full_pairs = h / 2;

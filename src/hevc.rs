@@ -1304,16 +1304,11 @@ mod tests {
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
         );
-        // NAL header byte 0: forbidden(1) | type(6) | layer_id[5:0] high bits
-        // For VPS type=32=0b100000: byte0 = 0b0_100000_0 = 0x40
         assert_eq!(vps.data[0], 0x40, "VPS first byte should be 0x40");
     }
 
     #[test]
     fn sps_conformance_window() {
-        // 65×49 → padded to 72×56, window right=3/2=3 (but integer: (72-65)/2=3 wait no)
-        // coded_w=72, crop_right=(72-65)/2=3... actually 65 is odd so (72-65)=7 which isn't /2
-        // Let's try 64×48 → no padding needed
         let sps = build_sps(
             64,
             48,
@@ -1326,7 +1321,6 @@ mod tests {
     #[test]
     fn pps_builds_cleanly() {
         let pps = build_pps(30);
-        // PPS first byte: type=34=0b100010 → 0b0_100010_0 = 0x44
         assert_eq!(pps.data[0], 0x44, "PPS first byte should be 0x44");
     }
 }
