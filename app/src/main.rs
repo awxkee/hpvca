@@ -33,7 +33,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgba16();
+    let img = image::open("./assets/aak.jpg").unwrap().to_rgba16();
     let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
@@ -41,7 +41,7 @@ fn main() {
         &arr,
         img.width(),
         img.height(),
-        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv422),
+        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv444),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

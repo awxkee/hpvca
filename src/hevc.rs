@@ -591,7 +591,6 @@ fn build_idr_slice(
     hdr.rbsp_trailing_bits();
     let header_bytes = hdr.finish();
 
-    // ── CABAC slice data ─────────────────────────────────────────────────────
     // HEVC slice_segment_data(): for each CTU row-major:
     //   coding_tree_unit()  → luma 8×8 CU + chroma 4×4 CU×2
     //   end_of_slice_segment_flag (terminate = 0 or 1)
