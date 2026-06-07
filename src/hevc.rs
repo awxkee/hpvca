@@ -79,8 +79,6 @@ impl NaluStream {
     }
 }
 
-// ─── Bit writer ───────────────────────────────────────────────────────────────
-
 pub(crate) struct BitWriter {
     buf: Vec<u8>,
     bit_pos: u32,
@@ -145,8 +143,6 @@ impl BitWriter {
         self.buf
     }
 }
-
-// ─── NALU header ─────────────────────────────────────────────────────────────
 
 fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
     bw.write_bit(false); // forbidden_zero_bit
@@ -241,7 +237,6 @@ fn write_profile_tier_level(
     bw.write_bits(level_idc as u32, 8);
 }
 
-// ─── VPS ─────────────────────────────────────────────────────────────────────
 
 pub(crate) fn build_vps(
     width: u32,
