@@ -285,8 +285,6 @@ pub(crate) fn build_vps(
     }
 }
 
-// ─── SPS ─────────────────────────────────────────────────────────────────────
-
 pub(crate) fn build_sps(
     width: u32,
     height: u32,
