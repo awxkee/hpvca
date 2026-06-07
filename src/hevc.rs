@@ -446,8 +446,6 @@ fn write_vui(bw: &mut BitWriter) {
     bw.write_bit(false); // bitstream_restriction_flag
 }
 
-// ─── PPS ─────────────────────────────────────────────────────────────────────
-
 pub(crate) fn build_pps(qp: u8) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
