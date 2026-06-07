@@ -113,6 +113,8 @@ pub(crate) fn scan_idx_for(mode: u8, log2_ts: u32, is_luma: bool, is_444: bool) 
 }
 
 /// Raw scan order over a `blk`×`blk` array, returning `(x, y)` = `(col, row)`.
+/// Runtime reference generator, kept only to cross-check the const tables in tests.
+#[cfg(test)]
 fn raw_scan(blk: usize, scan_idx: u8) -> Vec<(usize, usize)> {
     let mut v = Vec::with_capacity(blk * blk);
     match scan_idx {
@@ -169,42 +171,158 @@ pub(crate) fn coeff_scan(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize)
             _ => panic!("unsupported transform size log2={log2_ts}"),
         };
     }
-    &scan_tables().coeff[(log2_ts as usize) * 3 + scan_idx as usize]
+    match (log2_ts, scan_idx) {
+        (2, 1) => &COEFF_SCAN_4_H,
+        (2, 2) => &COEFF_SCAN_4_V,
+        (3, 1) => &COEFF_SCAN_8_H,
+        (3, 2) => &COEFF_SCAN_8_V,
+        (4, 1) => &COEFF_SCAN_16_H,
+        (4, 2) => &COEFF_SCAN_16_V,
+        _ => panic!("unsupported scan log2={log2_ts} idx={scan_idx}"),
+    }
 }
 
-/// Sub-block grid scan `(sbx, sby)` for a TB. Cached.
+/// Sub-block grid scan `(sbx, sby)` for a TB.
 pub(crate) fn sb_scan_for(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize)] {
-    &scan_tables().sb[(log2_ts as usize) * 3 + scan_idx as usize]
+    match (log2_ts, scan_idx) {
+        // sb_side == 1 → single sub-block, scan order is trivial for every idx.
+        (2, _) => &SB_SCAN_1,
+        (3, 0) => &SB_SCAN_2_D,
+        (3, 1) => &SB_SCAN_2_H,
+        (3, 2) => &SB_SCAN_2_V,
+        (4, 0) => &SB_SCAN_4_D,
+        (4, 1) => &SB_SCAN_4_H,
+        (4, 2) => &SB_SCAN_4_V,
+        _ => panic!("unsupported sb scan log2={log2_ts} idx={scan_idx}"),
+    }
 }
 
-struct ScanTables {
-    coeff: Vec<Vec<(usize, usize)>>,
-    sb: Vec<Vec<(usize, usize)>>,
-}
+// ── Compile-time scan tables ────────────────────────────────────────────────
+// Built by `const fn` at compile time so no table is generated or heap-allocated
+// at run time. `const_scan_equiv` (tests) asserts they equal the runtime
+// generator below, which the diagonal tests in turn pin to the canonical tables.
 
-fn scan_tables() -> &'static ScanTables {
-    static T: std::sync::OnceLock<ScanTables> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        // Index = log2_ts*3 + scan_idx, for log2_ts in 0..=4 and scan_idx in 0..=2.
-        let mut coeff = vec![Vec::new(); 5 * 3];
-        let mut sb = vec![Vec::new(); 5 * 3];
-        for log2_ts in 2..=4u32 {
-            for scan_idx in 1..=2u8 {
-                let idx = (log2_ts as usize) * 3 + scan_idx as usize;
-                coeff[idx] = build_coeff_scan(log2_ts, scan_idx);
-            }
-            for scan_idx in 0..=2u8 {
-                sb[(log2_ts as usize) * 3 + scan_idx as usize] = build_sb_scan(log2_ts, scan_idx);
+const fn raw_scan_const(blk: usize, scan_idx: u8) -> ([(usize, usize); 16], usize) {
+    let mut v = [(0usize, 0usize); 16];
+    let mut i = 0;
+    match scan_idx {
+        1 => {
+            let mut y = 0;
+            while y < blk {
+                let mut x = 0;
+                while x < blk {
+                    v[i] = (x, y);
+                    i += 1;
+                    x += 1;
+                }
+                y += 1;
             }
         }
-        ScanTables { coeff, sb }
-    })
+        2 => {
+            let mut x = 0;
+            while x < blk {
+                let mut y = 0;
+                while y < blk {
+                    v[i] = (x, y);
+                    i += 1;
+                    y += 1;
+                }
+                x += 1;
+            }
+        }
+        _ => {
+            let b = blk as i32;
+            let mut x = 0i32;
+            let mut y = 0i32;
+            loop {
+                while y >= 0 {
+                    if x < b && y < b {
+                        v[i] = (x as usize, y as usize);
+                        i += 1;
+                    }
+                    y -= 1;
+                    x += 1;
+                }
+                y = x;
+                x = 0;
+                if i >= blk * blk {
+                    break;
+                }
+            }
+        }
+    }
+    (v, blk * blk)
 }
 
+const fn build_coeff_scan_const<const NN: usize>(
+    log2_ts: u32,
+    scan_idx: u8,
+) -> [(usize, usize); NN] {
+    let n = 1usize << log2_ts; // NN == n*n
+    let mut out = [(0usize, 0usize); NN];
+    if n <= 4 {
+        let (raw, len) = raw_scan_const(n, scan_idx);
+        let mut i = 0;
+        while i < len {
+            out[i] = (raw[i].1, raw[i].0);
+            i += 1;
+        }
+        return out;
+    }
+    let sb_side = n / 4;
+    let (sb, sb_len) = raw_scan_const(sb_side, scan_idx);
+    let (inner, inner_len) = raw_scan_const(4, scan_idx);
+    let mut o = 0;
+    let mut s = 0;
+    while s < sb_len {
+        let (sbx, sby) = (sb[s].0, sb[s].1);
+        let mut k = 0;
+        while k < inner_len {
+            let (ix, iy) = (inner[k].0, inner[k].1);
+            out[o] = (sby * 4 + iy, sbx * 4 + ix);
+            o += 1;
+            k += 1;
+        }
+        s += 1;
+    }
+    out
+}
+
+const fn build_sb_scan_const<const NN: usize>(log2_ts: u32, scan_idx: u8) -> [(usize, usize); NN] {
+    let sb_side = (1usize << log2_ts) / 4; // NN == sb_side*sb_side (>=1)
+    let (raw, _len) = raw_scan_const(sb_side, scan_idx); // sb_side >= 1 for log2_ts >= 2
+    let mut out = [(0usize, 0usize); NN];
+    let mut i = 0;
+    while i < NN {
+        out[i] = raw[i];
+        i += 1;
+    }
+    out
+}
+
+const COEFF_SCAN_4_H: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 1);
+const COEFF_SCAN_4_V: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 2);
+const COEFF_SCAN_8_H: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 1);
+const COEFF_SCAN_8_V: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 2);
+const COEFF_SCAN_16_H: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 1);
+const COEFF_SCAN_16_V: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 2);
+
+const SB_SCAN_1: [(usize, usize); 1] = build_sb_scan_const::<1>(2, 0);
+const SB_SCAN_2_D: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 0);
+const SB_SCAN_2_H: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 1);
+const SB_SCAN_2_V: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 2);
+const SB_SCAN_4_D: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 0);
+const SB_SCAN_4_H: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 1);
+const SB_SCAN_4_V: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 2);
+
+#[cfg(test)]
 fn build_coeff_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
     let n = 1usize << log2_ts;
     if n <= 4 {
-        return raw_scan(n, scan_idx).into_iter().map(|(x, y)| (y, x)).collect();
+        return raw_scan(n, scan_idx)
+            .into_iter()
+            .map(|(x, y)| (y, x))
+            .collect();
     }
     let sb_side = n / 4;
     let sb = raw_scan(sb_side, scan_idx);
@@ -218,6 +336,7 @@ fn build_coeff_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
     out
 }
 
+#[cfg(test)]
 fn build_sb_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
     let sb_side = (1usize << log2_ts) / 4;
     if sb_side <= 1 {
@@ -236,6 +355,24 @@ mod scan_tests {
         assert_eq!(&build_coeff_scan(2, 0)[..], &DIAG_SCAN_4X4[..], "4x4 diag");
         assert_eq!(&build_coeff_scan(3, 0)[..], &ZIGZAG[..], "8x8 diag");
         assert_eq!(&build_coeff_scan(4, 0)[..], &ZIGZAG_16X16[..], "16x16 diag");
+    }
+    #[test]
+    fn const_tables_match_runtime_generator() {
+        // Production uses the const tables; this pins them to the runtime generator
+        // (which the diagonal test above pins to the canonical HEVC tables).
+        assert_eq!(&COEFF_SCAN_4_H[..], &build_coeff_scan(2, 1)[..]);
+        assert_eq!(&COEFF_SCAN_4_V[..], &build_coeff_scan(2, 2)[..]);
+        assert_eq!(&COEFF_SCAN_8_H[..], &build_coeff_scan(3, 1)[..]);
+        assert_eq!(&COEFF_SCAN_8_V[..], &build_coeff_scan(3, 2)[..]);
+        assert_eq!(&COEFF_SCAN_16_H[..], &build_coeff_scan(4, 1)[..]);
+        assert_eq!(&COEFF_SCAN_16_V[..], &build_coeff_scan(4, 2)[..]);
+        assert_eq!(&SB_SCAN_1[..], &build_sb_scan(2, 0)[..]);
+        assert_eq!(&SB_SCAN_2_D[..], &build_sb_scan(3, 0)[..]);
+        assert_eq!(&SB_SCAN_2_H[..], &build_sb_scan(3, 1)[..]);
+        assert_eq!(&SB_SCAN_2_V[..], &build_sb_scan(3, 2)[..]);
+        assert_eq!(&SB_SCAN_4_D[..], &build_sb_scan(4, 0)[..]);
+        assert_eq!(&SB_SCAN_4_H[..], &build_sb_scan(4, 1)[..]);
+        assert_eq!(&SB_SCAN_4_V[..], &build_sb_scan(4, 2)[..]);
     }
     #[test]
     fn scan_idx_selection() {

@@ -44,11 +44,16 @@ pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 256
     let bottom_left = left[n] as i32;
     let log2 = n.trailing_zeros();
 
-    for row in 0..n {
-        for col in 0..n {
-            let h = (n - 1 - col) as i32 * left[row] as i32 + (col + 1) as i32 * top_right;
-            let v = (n - 1 - row) as i32 * above[col] as i32 + (row + 1) as i32 * bottom_left;
-            pred[row * n + col] = ((h + v + n as i32) >> (log2 + 1)) as u16;
+    for (row, &left) in left[..n].iter().enumerate() {
+        let lr = left as i32;
+        let v_w = (n - 1 - row) as i32;
+        let v_b = (row + 1) as i32 * bottom_left;
+        let arow = &above[..n];
+        let prow = &mut pred[row * n..row * n + n];
+        for (col, (prow, &arow)) in prow[..n].iter_mut().zip(arow.iter()).enumerate() {
+            let h = (n - 1 - col) as i32 * lr + (col + 1) as i32 * top_right;
+            let v = v_w * arow as i32 + v_b;
+            *prow = ((h + v + n as i32) >> (log2 + 1)) as u16;
         }
     }
     pred
@@ -76,12 +81,12 @@ pub(crate) fn should_filter_refs(mode: u8, n: usize) -> bool {
 }
 
 /// intraPredAngle for angular modes 2..=34 (HEVC Table 8-5), indexed by mode.
-const INTRA_PRED_ANGLE: [i32; 35] = [
+static INTRA_PRED_ANGLE: [i32; 35] = [
     0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,
     -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
 ];
 /// invAngle for modes 11..=25 (HEVC Table 8-6), indexed by mode (0 elsewhere).
-const INV_ANGLE: [i32; 35] = [
+static INV_ANGLE: [i32; 35] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
     -482, -630, -910, -1638, -4096, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
@@ -142,7 +147,11 @@ pub(crate) fn predict_angular(
     // For vertical modes (>=18) the main reference is the above row; for
     // horizontal modes (<18) it is the left column (block predicted transposed).
     let vertical = mode >= 18;
-    let (main, side): (&[u16], &[u16]) = if vertical { (above, left) } else { (left, above) };
+    let (main, side): (&[u16], &[u16]) = if vertical {
+        (above, left)
+    } else {
+        (left, above)
+    };
 
     // r[OFF + i] = ref[i]; OFF lets i go negative down to -n.
     const OFF: usize = 32;
@@ -227,36 +236,6 @@ pub(crate) fn predict_chroma_tb(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn predict_mode(
-    mode: u8,
-    corner: u16,
-    above: &[u16],
-    left: &[u16],
-    n: usize,
-    luma: bool,
-    max_val: i32,
-) -> [u16; 256] {
-    if luma && should_filter_refs(mode, n) {
-        let (fa, fl) = filter_references(corner, above, left, n);
-        // libde265 filters the references as one array centred on the corner, so
-        // the corner is smoothed too: pF[0] = (above[0] + 2·corner + left[0] + 2)>>2.
-        let cf = ((above[0] as i32 + 2 * corner as i32 + left[0] as i32 + 2) >> 2) as u16;
-        match mode {
-            PLANAR => predict_planar(&fa, &fl, n),
-            DC => predict_dc(&fa, &fl, n, true),
-            _ => predict_angular(cf, &fa, &fl, n, mode, true, max_val),
-        }
-    } else {
-        match mode {
-            PLANAR => predict_planar(above, left, n),
-            DC => predict_dc(above, left, n, luma),
-            _ => predict_angular(corner, above, left, n, mode, luma, max_val),
-        }
-    }
-}
-
-
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
 /// then bottom-left (length n+1). Returns filtered (above', left') in the same
 /// layout that `predict_planar` consumes (length n+1 each). Endpoints that have
@@ -283,14 +262,18 @@ pub(crate) fn filter_references(
     if ext >= 1 {
         fa[0] = ((corner as i32 + 2 * above[0] as i32 + above[1] as i32 + 2) >> 2) as u16;
     }
-    for x in 1..ext {
+    // Filter interior samples 1..=2n-2. The farthest real reference sample, index
+    // 2n-1 (HEVC pF[nTbS*2-1][-1]), is left UNFILTERED — it is the only sample the
+    // extreme angular modes 2 and 34 read, and filtering it desyncs the encoder's
+    // reconstruction from a conformant decoder. (It keeps its raw value from the
+    // copy above.)
+    for x in 1..ext - 1 {
         fa[x] = ((above[x - 1] as i32 + 2 * above[x] as i32 + above[x + 1] as i32 + 2) >> 2) as u16;
     }
-    // index ext (=2n) left unfiltered (extreme endpoint).
     if ext >= 1 {
         fl[0] = ((corner as i32 + 2 * left[0] as i32 + left[1] as i32 + 2) >> 2) as u16;
     }
-    for y in 1..ext {
+    for y in 1..ext - 1 {
         fl[y] = ((left[y - 1] as i32 + 2 * left[y] as i32 + left[y + 1] as i32 + 2) >> 2) as u16;
     }
     (fa, fl)

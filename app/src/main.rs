@@ -41,7 +41,7 @@ fn main() {
         &arr,
         img.width(),
         img.height(),
-        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv444),
+        &EncodeConfig::default().with_chroma(ChromaFormat::Yuv420),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

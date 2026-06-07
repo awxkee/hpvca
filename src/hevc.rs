@@ -570,6 +570,16 @@ fn build_idr_slice(
     }
     // QP is carried fully in the PPS init_qp_minus26, so slice_qp_delta = 0.
     hdr.write_se(0); // slice_qp_delta
+    // slice_loop_filter_across_slices_enabled_flag — REQUIRED here by HEVC §7.3.6.1:
+    // it is present whenever pps_loop_filter_across_slices_enabled_flag (set in our
+    // PPS) is 1 and (slice_sao_luma_flag || slice_sao_chroma_flag || deblocking not
+    // disabled) — and slice_sao_luma_flag is always 1 here, so it is always present.
+    // Omitting it leaves the slice header one bit short: a strict decoder consumes
+    // the byte_alignment() '1' bit as this flag, then reads the following padding
+    // '0' as alignment_bit_equal_to_one and rejects the slice (the
+    // "alignment_bit_equal_to_one=0 / undecodable NALU 20" seen in recent ffmpeg).
+    // Value 1 matches x265 and is a no-op for a single-slice picture.
+    hdr.write_bit(true); // slice_loop_filter_across_slices_enabled_flag = 1
     hdr.rbsp_trailing_bits();
     let header_bytes = hdr.finish();
 
@@ -687,7 +697,11 @@ fn build_idr_slice(
                     let l2_ch_cc = l2_lu_c / sub_w;
 
                     // Choose 16×16 vs four 8×8 by RD cost J = SSE + λ·bits. Trials
-                    // run on cloned coder/context state; only the winner is committed.
+                    // run on cloned coder/context state. The winner's clone already
+                    // holds the correct bitstream + context, so we adopt it directly
+                    // instead of re-encoding the CU a second time on the real coder
+                    // (snapshotting trial A's reconstruction so it can be restored if
+                    // the 16×16 trial wins, since trial B overwrites the region).
                     let mut chose_16 = false;
                     if rd16 {
                         let base_bits = cab.flushed_bits();
@@ -698,9 +712,11 @@ fn build_idr_slice(
                         let mut ia = ictx.clone();
                         pa.encode_bin(0, &mut ca.split_cu_flag[split_ctx]);
                         code_one_cu(
-                            &mut pa,
-                            &mut ca,
-                            &mut ia,
+                            Entropy {
+                                enc: &mut pa,
+                                ctx: &mut ca,
+                                ictx: &mut ia,
+                            },
                             yuv,
                             &mut rec_y,
                             &mut rec_cb,
@@ -726,6 +742,28 @@ fn build_idr_slice(
                         );
                         let bits_a = pa.flushed_bits().saturating_sub(base_bits) as f64;
 
+                        // Snapshot trial A's reconstruction + mode_map for the region
+                        // (16×16 luma, 8×8 chroma, 2×2 mode-map blocks).
+                        let mut sa_y = [0u16; 256];
+                        let mut sa_cb = [0u16; 64];
+                        let mut sa_cr = [0u16; 64];
+                        let mut sa_mode = [0u8; 4];
+                        for r in 0..16 {
+                            let o = (l2_lu_r + r) * w + l2_lu_c;
+                            sa_y[r * 16..r * 16 + 16].copy_from_slice(&rec_y[o..o + 16]);
+                        }
+                        for r in 0..8 {
+                            let o = (l2_ch_rr + r) * cw + l2_ch_cc;
+                            sa_cb[r * 8..r * 8 + 8].copy_from_slice(&rec_cb[o..o + 8]);
+                            sa_cr[r * 8..r * 8 + 8].copy_from_slice(&rec_cr[o..o + 8]);
+                        }
+                        for br in 0..2 {
+                            for bc in 0..2 {
+                                sa_mode[br * 2 + bc] = mode_map
+                                    [((l2_lu_r / 8) + br) * blk_stride + (l2_lu_c / 8) + bc];
+                            }
+                        }
+
                         // Trial B — four 8×8 CUs.
                         let mut pb = cab.clone();
                         let mut cb2 = ctx.clone();
@@ -733,9 +771,11 @@ fn build_idr_slice(
                         pb.encode_bin(1, &mut cb2.split_cu_flag[split_ctx]);
                         for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                             code_one_cu(
-                                &mut pb,
-                                &mut cb2,
-                                &mut ib,
+                                Entropy {
+                                    enc: &mut pb,
+                                    ctx: &mut cb2,
+                                    ictx: &mut ib,
+                                },
                                 yuv,
                                 &mut rec_y,
                                 &mut rec_cb,
@@ -763,41 +803,54 @@ fn build_idr_slice(
                         let bits_b = pb.flushed_bits().saturating_sub(base_bits) as f64;
 
                         chose_16 = d_a + lambda * bits_a <= d_b + lambda * bits_b;
-                    }
-
-                    // Commit the winner into the real bitstream + reconstruction.
-                    if chose_16 {
-                        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
-                        code_one_cu(
-                            &mut cab,
-                            &mut ctx,
-                            &mut ictx,
-                            yuv,
-                            &mut rec_y,
-                            &mut rec_cb,
-                            &mut rec_cr,
-                            l2_lu_r,
-                            l2_lu_c,
-                            16,
-                            strides8,
-                            qp,
-                            &mut mode_map,
-                            blk_stride,
-                        );
-                        for br in 0..2 {
-                            for bc in 0..2 {
-                                cu_depth[((l2_lu_r / cu_size_y) + br) * bx
-                                    + (l2_lu_c / cu_size_y)
-                                    + bc] = 2;
+                        if chose_16 {
+                            // Restore trial A's reconstruction + mode_map (trial B
+                            // overwrote the region) and adopt trial A's coder state.
+                            for r in 0..16 {
+                                let o = (l2_lu_r + r) * w + l2_lu_c;
+                                rec_y[o..o + 16].copy_from_slice(&sa_y[r * 16..r * 16 + 16]);
                             }
+                            for r in 0..8 {
+                                let o = (l2_ch_rr + r) * cw + l2_ch_cc;
+                                rec_cb[o..o + 8].copy_from_slice(&sa_cb[r * 8..r * 8 + 8]);
+                                rec_cr[o..o + 8].copy_from_slice(&sa_cr[r * 8..r * 8 + 8]);
+                            }
+                            for br in 0..2 {
+                                for bc in 0..2 {
+                                    mode_map
+                                        [((l2_lu_r / 8) + br) * blk_stride + (l2_lu_c / 8) + bc] =
+                                        sa_mode[br * 2 + bc];
+                                    cu_depth[((l2_lu_r / cu_size_y) + br) * bx
+                                        + (l2_lu_c / cu_size_y)
+                                        + bc] = 2;
+                                }
+                            }
+                            cab = pa;
+                            ctx = ca;
+                            ictx = ia;
+                        } else {
+                            // Trial B's reconstruction + mode_map already in place.
+                            for br in 0..2 {
+                                for bc in 0..2 {
+                                    cu_depth[((l2_lu_r / cu_size_y) + br) * bx
+                                        + (l2_lu_c / cu_size_y)
+                                        + bc] = 3;
+                                }
+                            }
+                            cab = pb;
+                            ctx = cb2;
+                            ictx = ib;
                         }
                     } else {
+                        // 4:2:2 / 4:4:4: always four 8×8 CUs (no 16×16 trial).
                         cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
                         for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                             code_one_cu(
-                                &mut cab,
-                                &mut ctx,
-                                &mut ictx,
+                                Entropy {
+                                    enc: &mut cab,
+                                    ctx: &mut ctx,
+                                    ictx: &mut ictx,
+                                },
                                 yuv,
                                 &mut rec_y,
                                 &mut rec_cb,
@@ -819,6 +872,7 @@ fn build_idr_slice(
                             }
                         }
                     }
+                    let _ = chose_16;
                 }
             }
 
@@ -897,9 +951,12 @@ fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     for by in (0..n).step_by(4) {
         for bx in (0..n).step_by(4) {
             for r in 0..4 {
+                let row = (by + r) * n + bx;
+                let o = &orig[row..row + 4];
+                let p = &pred[row..row + 4];
+                let dr = &mut d[r * 4..r * 4 + 4];
                 for c in 0..4 {
-                    let i = (by + r) * n + (bx + c);
-                    d[r * 4 + c] = orig[i] as i32 - pred[i] as i32;
+                    dr[c] = o[c] as i32 - p[c] as i32;
                 }
             }
             // rows
@@ -1035,6 +1092,18 @@ struct CuGeometry {
     cw_stride: usize,
     src_cw: usize,
     src_ch: usize,
+    /// Stride (in 8×8 blocks) of the per-CU luma `mode_map` used for MPM.
+    blk_stride: usize,
+}
+
+/// The three entropy-coding state objects, threaded together so the per-CU
+/// coding functions take one argument instead of three. Holds mutable borrows
+/// so callers keep ownership (the RD trials clone the underlying objects and
+/// build a fresh bundle per trial).
+struct Entropy<'a> {
+    enc: &'a mut CabacEncoder,
+    ctx: &'a mut ContextSet,
+    ictx: &'a mut IntraModeContexts,
 }
 
 struct CuSrcPlanes<'a> {
@@ -1060,17 +1129,15 @@ struct CuParams {
 }
 
 fn encode_cu(
-    enc: &mut CabacEncoder,
-    ctx: &mut ContextSet,
-    ictx: &mut IntraModeContexts,
+    ent: Entropy<'_>,
     src: &CuSrcPlanes<'_>,
     rec: &mut CuRecPlanes<'_>,
     geo: &CuGeometry,
     par: &CuParams,
     mode_map: &mut [u8],
-    blk_stride: usize,
 ) {
     // destructure so the rest of the body is unchanged
+    let Entropy { enc, ctx, ictx } = ent;
     let CuGeometry {
         lu_row,
         lu_col,
@@ -1081,6 +1148,7 @@ fn encode_cu(
         cw_stride,
         src_cw,
         src_ch,
+        blk_stride,
     } = *geo;
     let CuSrcPlanes {
         y: src_y,
@@ -1162,8 +1230,25 @@ fn encode_cu(
     let lambda_mode = lambda.sqrt();
     let mut best_mode = PLANAR;
     let mut best_cost = f64::INFINITY;
+    // The smoothed references depend only on the block, not the mode, so compute
+    // them once and reuse across all filtering modes instead of recomputing
+    // the filter for each of the ~28 modes that smooth.
+    let (fa, fl) = intra::filter_references(yc0, &ya, &yl, lu);
+    let cf = ((ya[0] as i32 + 2 * yc0 as i32 + yl[0] as i32 + 2) >> 2) as u16;
     for mode in 0u8..35 {
-        let pred = intra::predict_mode(mode, yc0, &ya, &yl, lu, true, max_val as i32);
+        let pred = if intra::should_filter_refs(mode, lu) {
+            match mode {
+                PLANAR => intra::predict_planar(&fa, &fl, lu),
+                DC => intra::predict_dc(&fa, &fl, lu, true),
+                _ => intra::predict_angular(cf, &fa, &fl, lu, mode, true, max_val as i32),
+            }
+        } else {
+            match mode {
+                PLANAR => intra::predict_planar(&ya, &yl, lu),
+                DC => intra::predict_dc(&ya, &yl, lu, true),
+                _ => intra::predict_angular(yc0, &ya, &yl, lu, mode, true, max_val as i32),
+            }
+        };
         let satd = satd_block(&y_orig_rmd, &pred, lu) as f64;
         let mode_bits = if let Some(i) = mpm.iter().position(|&m| m == mode) {
             (1 + i + 1) as f64 // prev_flag=1 + mpm_idx unary
@@ -1177,7 +1262,19 @@ fn encode_cu(
         }
     }
     let luma_mode = best_mode;
-    let y_pred = intra::predict_mode(luma_mode, yc0, &ya, &yl, lu, true, max_val as i32);
+    let y_pred = if intra::should_filter_refs(luma_mode, lu) {
+        match luma_mode {
+            PLANAR => intra::predict_planar(&fa, &fl, lu),
+            DC => intra::predict_dc(&fa, &fl, lu, true),
+            _ => intra::predict_angular(cf, &fa, &fl, lu, luma_mode, true, max_val as i32),
+        }
+    } else {
+        match luma_mode {
+            PLANAR => intra::predict_planar(&ya, &yl, lu),
+            DC => intra::predict_dc(&ya, &yl, lu, true),
+            _ => intra::predict_angular(yc0, &ya, &yl, lu, luma_mode, true, max_val as i32),
+        }
+    };
 
     // ── part_mode ──────────────────────────────────────────────────────────
     // Present only when the CU equals the SPS minimum luma CB (8×8); we always
@@ -1463,9 +1560,7 @@ fn encode_cu(
 /// Shared by the RD trial and commit paths.
 #[allow(clippy::too_many_arguments)]
 fn code_one_cu(
-    cab: &mut CabacEncoder,
-    ctx: &mut ContextSet,
-    ictx: &mut IntraModeContexts,
+    ent: Entropy<'_>,
     yuv: &Yuv,
     rec_y: &mut [u16],
     rec_cb: &mut [u16],
@@ -1491,6 +1586,7 @@ fn code_one_cu(
         cw_stride: cw,
         src_cw,
         src_ch,
+        blk_stride,
     };
     let src = CuSrcPlanes {
         y: &yuv.y,
@@ -1509,7 +1605,7 @@ fn code_one_cu(
         bit_depth: yuv.bit_depth,
         lu,
     };
-    encode_cu(cab, ctx, ictx, &src, &mut rec, &geo, &par, mode_map, blk_stride);
+    encode_cu(ent, &src, &mut rec, &geo, &par, mode_map);
 }
 
 /// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and
