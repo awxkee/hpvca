@@ -407,29 +407,53 @@ fn substitute_refs(
     (corner, above, left)
 }
 
+/// Geometry inputs for chroma reference-sample gathering. Bundles the block
+/// position, plane extents, subsampling factors and the current luma-block
+/// coordinates that drive the decode-order availability test, so the gather
+/// function takes two plane slices + this struct instead of 14 loose scalars.
+#[derive(Clone, Copy)]
+pub(crate) struct ChromaRefGeometry {
+    pub(crate) stride: usize,
+    pub(crate) block_row: usize,
+    pub(crate) block_col: usize,
+    pub(crate) chroma_h: usize,
+    pub(crate) n: usize,
+    pub(crate) sub_w: usize,
+    pub(crate) sub_h: usize,
+    pub(crate) luma_w: usize,
+    pub(crate) luma_h: usize,
+    pub(crate) luma_ctus_x: usize,
+    pub(crate) cur_luma_row: usize,
+    pub(crate) cur_luma_col: usize,
+    pub(crate) neutral: u16,
+}
+
 /// Gather chroma reference samples for **both** the Cb and Cr planes in one
 /// pass. The availability of each reference position depends only on geometry
 /// (the luma decode order), not on the plane data, so the per-sample Morton
 /// `decode_order` work — the dominant cost — is done once and shared, instead of
 /// being recomputed identically for Cb and then Cr.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn get_reference_samples_chroma_pair(
     plane_cb: &[u16],
     plane_cr: &[u16],
-    stride: usize,
-    block_row: usize,
-    block_col: usize,
-    chroma_h: usize,
-    n: usize,
-    sub_w: usize,
-    sub_h: usize,
-    luma_w: usize,
-    luma_h: usize,
-    luma_ctus_x: usize,
-    cur_luma_row: usize,
-    cur_luma_col: usize,
-    neutral: u16,
+    geo: ChromaRefGeometry,
 ) -> ((u16, [u16; 33], [u16; 33]), (u16, [u16; 33], [u16; 33])) {
+    let ChromaRefGeometry {
+        stride,
+        block_row,
+        block_col,
+        chroma_h,
+        n,
+        sub_w,
+        sub_h,
+        luma_w,
+        luma_h,
+        luma_ctus_x,
+        cur_luma_row,
+        cur_luma_col,
+        neutral,
+    } = geo;
     let width = stride;
     let ext = 2 * n;
     const MAXE: usize = 33;
@@ -518,18 +542,35 @@ pub(crate) fn get_reference_samples_chroma_pair(
     (cb, cr)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Geometry inputs for luma reference-sample gathering: block position, plane
+/// extents, block/CTU sizes, and the unavailable-sample fill value. Lets the
+/// gather function take one plane slice + this struct instead of 9 scalars.
+#[derive(Clone, Copy)]
+pub(crate) struct LumaRefGeometry {
+    pub(crate) stride: usize,
+    pub(crate) block_row: usize,
+    pub(crate) block_col: usize,
+    pub(crate) height: usize,
+    pub(crate) n: usize,
+    pub(crate) ctu: usize,
+    pub(crate) ctus_x: usize,
+    pub(crate) neutral: u16,
+}
+
 pub(crate) fn get_reference_samples(
     plane: &[u16],
-    stride: usize,
-    block_row: usize,
-    block_col: usize,
-    height: usize,
-    n: usize,
-    ctu: usize,
-    ctus_x: usize,
-    neutral: u16,
+    geo: LumaRefGeometry,
 ) -> (u16, [u16; 33], [u16; 33]) {
+    let LumaRefGeometry {
+        stride,
+        block_row,
+        block_col,
+        height,
+        n,
+        ctu,
+        ctus_x,
+        neutral,
+    } = geo;
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
     // ext <= 16 (n <= 8); reference rows live entirely on the stack.
@@ -617,14 +658,14 @@ pub(crate) fn get_reference_samples(
     (corner, above, left)
 }
 
-/// Subtract prediction from original to obtain the residual block.
-///
-/// Returns `orig[i] - pred[i]` as f32 (level-shifted by -128 already handled
-/// at caller level, so we work in pixel domain here).
-pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> [f32; 256] {
-    let mut res = [0f32; 256];
+/// Integer residual `orig[i] - pred[i]` as `i32`, written directly into a stack
+/// buffer. The HEVC forward transform is integer-domain, so the previous
+/// f32 residual + per-block `Vec<i32>` round-trip was pure overhead — this
+/// avoids both the float conversion and the heap allocation.
+pub(crate) fn compute_residual_i32(orig: &[u16], pred: &[u16], n: usize) -> [i32; 256] {
+    let mut res = [0i32; 256];
     for (r, (&o, &p)) in res[..n * n].iter_mut().zip(orig.iter().zip(pred.iter())) {
-        *r = o as f32 - p as f32;
+        *r = o as i32 - p as i32;
     }
     res
 }
@@ -768,7 +809,7 @@ mod tests {
     fn residual_zero_when_perfect() {
         let pixels = vec![128u16; 64];
         let pred = vec![128u16; 64];
-        let res = compute_residual(&pixels, &pred, 8);
-        assert!(res.iter().all(|&r| r == 0.0));
+        let res = compute_residual_i32(&pixels, &pred, 8);
+        assert!(res.iter().all(|&r| r == 0));
     }
 }

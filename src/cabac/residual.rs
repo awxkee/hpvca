@@ -102,8 +102,9 @@ pub(crate) fn encode_residual(
     // coded_sub_block_neighbors[idx] holds the 2-bit prev_csbf code for each
     // sub-block: bit0 (=1) means the sub-block to the RIGHT is coded, bit1 (=2)
     // means the sub-block BELOW is coded. Filled in as we walk (last → DC), exactly
-    // as libde265/zune do.
-    let mut csbf_neighbors = vec![0u8; num_sb];
+    // as libde265/zune do. num_sb <= 16 (16×16 TU), so this stays on the stack.
+    let mut csbf_storage = [0u8; 16];
+    let csbf_neighbors = &mut csbf_storage[..num_sb];
 
     // Helper: TU-position (col,row) for an absolute scan position.
     let pos_of = |abs_pos: usize| -> (usize, usize) {
@@ -163,7 +164,10 @@ pub(crate) fn encode_residual(
             15
         };
 
-        let mut sig_positions: Vec<usize> = Vec::new();
+        // A sub-block holds at most 16 coefficients, so the significant-position
+        // list lives on the stack instead of a per-sub-block heap allocation.
+        let mut sig_positions = [0usize; 16];
+        let mut sig_len = 0usize;
         let mut any_sig_in_sb = false;
 
         // For the last sub-block, the top position is the known last coeff.
@@ -178,7 +182,8 @@ pub(crate) fn encode_residual(
 
             // Last coefficient of the whole TU: known significant, not coded here.
             if sb == last_sb && k == scan_top {
-                sig_positions.push(abs_pos);
+                sig_positions[sig_len] = abs_pos;
+                sig_len += 1;
                 any_sig_in_sb = true;
                 continue;
             }
@@ -187,7 +192,8 @@ pub(crate) fn encode_residual(
             // coded (infer_dc) and nothing else in it was significant, k==0 is
             // inferred significant and its flag is NOT coded.
             if k == 0 && infer_dc && !any_sig_in_sb {
-                sig_positions.push(abs_pos);
+                sig_positions[sig_len] = abs_pos;
+                sig_len += 1;
                 any_sig_in_sb = true;
                 continue;
             }
@@ -198,20 +204,21 @@ pub(crate) fn encode_residual(
             let is_sig = (coeffs[abs_pos] != 0) as u8;
             enc.encode_bin(is_sig, &mut ctx.sig_coeff_flag[ci]);
             if is_sig != 0 {
-                sig_positions.push(abs_pos);
+                sig_positions[sig_len] = abs_pos;
+                sig_len += 1;
                 any_sig_in_sb = true;
             }
         }
 
-        if sig_positions.is_empty() {
+        if sig_len == 0 {
             continue;
         }
-        // sig_positions are in high→low scan order already.
+        // sig_positions[..sig_len] are in high→low scan order already.
         encode_coeff_levels(
             enc,
             ctx,
             coeffs,
-            &sig_positions,
+            &sig_positions[..sig_len],
             sb,
             is_luma,
             &mut level_state,
@@ -417,9 +424,10 @@ fn encode_coeff_levels(
 
     // greater1 flags for up to the first 8 coefficients.
     let last_g1 = n.min(8);
-    let mut greater1_flags = vec![false; n];
+    // n <= 16 (one sub-block), so these live on the stack.
+    let mut greater1_flags = [false; 16];
     let mut first_g1_one: Option<usize> = None;
-    let mut has_max_base = vec![true; n]; // coeff_has_max_base_level
+    let mut has_max_base = [true; 16]; // coeff_has_max_base_level
 
     for c in 0..last_g1 {
         let abs_val = coeffs[sig_pos[c]].unsigned_abs() as i32;

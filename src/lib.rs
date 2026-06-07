@@ -490,9 +490,11 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         &nalu_stream,
         yuv.display_w,
         yuv.display_h,
-        yuv.bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::ImageMeta {
+            bit_depth: yuv.bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -575,9 +577,11 @@ fn encode_rgba_with_alpha_wide(
         &alpha_stream,
         width,
         height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -650,9 +654,11 @@ fn encode_gray_alpha_wide(
         &alpha_stream,
         width,
         height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -663,9 +669,11 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         &nalu_stream,
         yuv.display_w,
         yuv.display_h,
-        yuv.bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::ImageMeta {
+            bit_depth: yuv.bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -717,15 +725,19 @@ fn encode_rgb_tiled(
     }
     isobmff::wrap_hevc_grid(
         &tile_streams,
-        cols,
-        rows,
-        enc_tw,
-        enc_th,
-        width,
-        height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: enc_tw,
+            tile_h: enc_th,
+            full_w: width,
+            full_h: height,
+        },
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -758,15 +770,19 @@ fn encode_gray_tiled(
     }
     isobmff::wrap_hevc_grid(
         &tile_streams,
-        cols,
-        rows,
-        TILE_SIZE,
-        TILE_SIZE,
-        width,
-        height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: TILE_SIZE,
+            tile_h: TILE_SIZE,
+            full_w: width,
+            full_h: height,
+        },
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -828,15 +844,19 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     }
     isobmff::wrap_hevc_grid(
         &tile_streams,
-        cols,
-        rows,
-        enc_tw,
-        enc_th,
-        yuv.display_w,
-        yuv.display_h,
-        yuv.bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: enc_tw,
+            tile_h: enc_th,
+            full_w: yuv.display_w,
+            full_h: yuv.display_h,
+        },
+        isobmff::ImageMeta {
+            bit_depth: yuv.bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -902,15 +922,19 @@ fn encode_rgba_alpha_tiled(
     isobmff::wrap_hevc_grid_with_alpha(
         &color_streams,
         &alpha_streams,
-        cols,
-        rows,
-        enc_tw,
-        enc_th,
-        width,
-        height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: enc_tw,
+            tile_h: enc_th,
+            full_w: width,
+            full_h: height,
+        },
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 
@@ -979,15 +1003,19 @@ fn encode_gray_alpha_tiled(
     isobmff::wrap_hevc_grid_with_alpha(
         &luma_streams,
         &alpha_streams,
-        cols,
-        rows,
-        TILE_SIZE,
-        TILE_SIZE,
-        width,
-        height,
-        bit_depth,
-        &cfg.color,
-        &cfg.metadata,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: TILE_SIZE,
+            tile_h: TILE_SIZE,
+            full_w: width,
+            full_h: height,
+        },
+        isobmff::ImageMeta {
+            bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
     )
 }
 

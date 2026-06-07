@@ -691,31 +691,45 @@ fn build_idr_slice(
                         && cu_depth[((l2_lu_r - 1) / cu_size_y) * bx + l2_lu_c / cu_size_y] > 2;
                     let split_ctx = cond_l as usize + cond_a as usize;
 
-                    let strides8 = (w, src_yw, src_yh, cw, src_cw, src_ch, sub_w, sub_h);
-                    let sse_strides = (w, src_yw, src_yh, cw, src_cw, src_ch);
+                    let strides8 = PlaneStrides {
+                        w,
+                        src_yw,
+                        src_yh,
+                        cw,
+                        src_cw,
+                        src_ch,
+                        sub_w,
+                        sub_h,
+                    };
                     let l2_ch_rr = l2_lu_r / sub_h;
                     let l2_ch_cc = l2_lu_c / sub_w;
 
-                    // Choose 16×16 vs four 8×8 by RD cost J = SSE + λ·bits. Trials
-                    // run on cloned coder/context state. The winner's clone already
-                    // holds the correct bitstream + context, so we adopt it directly
-                    // instead of re-encoding the CU a second time on the real coder
-                    // (snapshotting trial A's reconstruction so it can be restored if
-                    // the 16×16 trial wins, since trial B overwrites the region).
+                    // Choose 16×16 vs four 8×8 by RD cost J = SSE + λ·bits. Both
+                    // trials run in place on the real coder using cheap snapshots
+                    // (scalar state + output length) rather than cloning the whole
+                    // CABAC output buffer. Trial A's appended output bytes are saved
+                    // so the region can be restored if the 16×16 trial wins (trial B
+                    // rolls back to the pre-trial state and overwrites the region).
                     let mut chose_16 = false;
                     if rd16 {
+                        // RD trials run in place on the real coder. The CABAC
+                        // output buffer only grows by appending, so each trial is
+                        // bounded by a cheap snapshot (scalar state + buffer length)
+                        // and rolled back by truncating — no output-buffer clone.
+                        // The context sets are small fixed stack arrays, so cloning
+                        // them per trial costs no heap traffic.
                         let base_bits = cab.flushed_bits();
+                        let base_snap = cab.snapshot();
+                        let base_ctx = ctx.clone();
+                        let base_ictx = ictx.clone();
 
-                        // Trial A — single 16×16 CU.
-                        let mut pa = cab.clone();
-                        let mut ca = ctx.clone();
-                        let mut ia = ictx.clone();
-                        pa.encode_bin(0, &mut ca.split_cu_flag[split_ctx]);
+                        // Trial A — single 16×16 CU (encoded in place).
+                        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
                         code_one_cu(
                             Entropy {
-                                enc: &mut pa,
-                                ctx: &mut ca,
-                                ictx: &mut ia,
+                                enc: &mut cab,
+                                ctx: &mut ctx,
+                                ictx: &mut ictx,
                             },
                             yuv,
                             &mut rec_y,
@@ -730,17 +744,22 @@ fn build_idr_slice(
                             blk_stride,
                         );
                         let d_a = region_sse(
-                            yuv,
-                            &rec_y,
-                            &rec_cb,
-                            &rec_cr,
-                            l2_lu_r,
-                            l2_lu_c,
-                            l2_ch_rr,
-                            l2_ch_cc,
-                            sse_strides,
+                            yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
+                            strides8,
                         );
-                        let bits_a = pa.flushed_bits().saturating_sub(base_bits) as f64;
+                        let bits_a = cab.flushed_bits().saturating_sub(base_bits) as f64;
+
+                        // Snapshot trial A's coder + context so the winner can be
+                        // restored after trial B overwrites them. Trial B is encoded
+                        // by rolling the coder back to `base_snap` and re-running in
+                        // place, which truncates away the output bytes trial A
+                        // appended. Those bytes cannot be recovered by a later
+                        // truncate (trial B may be shorter), so save trial A's
+                        // output tail (one CU's worth) to splice back if A wins.
+                        let a_snap = cab.snapshot();
+                        let a_ctx = ctx.clone();
+                        let a_ictx = ictx.clone();
+                        let a_tail: Vec<u8> = cab.output[base_snap.output_len()..].to_vec();
 
                         // Snapshot trial A's reconstruction + mode_map for the region
                         // (16×16 luma, 8×8 chroma, 2×2 mode-map blocks).
@@ -764,17 +783,18 @@ fn build_idr_slice(
                             }
                         }
 
-                        // Trial B — four 8×8 CUs.
-                        let mut pb = cab.clone();
-                        let mut cb2 = ctx.clone();
-                        let mut ib = ictx.clone();
-                        pb.encode_bin(1, &mut cb2.split_cu_flag[split_ctx]);
+                        // Trial B — four 8×8 CUs. Roll the coder + contexts back to
+                        // the pre-trial state and re-encode in place.
+                        cab.restore(&base_snap);
+                        ctx = base_ctx;
+                        ictx = base_ictx;
+                        cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
                         for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                             code_one_cu(
                                 Entropy {
-                                    enc: &mut pb,
-                                    ctx: &mut cb2,
-                                    ictx: &mut ib,
+                                    enc: &mut cab,
+                                    ctx: &mut ctx,
+                                    ictx: &mut ictx,
                                 },
                                 yuv,
                                 &mut rec_y,
@@ -790,17 +810,10 @@ fn build_idr_slice(
                             );
                         }
                         let d_b = region_sse(
-                            yuv,
-                            &rec_y,
-                            &rec_cb,
-                            &rec_cr,
-                            l2_lu_r,
-                            l2_lu_c,
-                            l2_ch_rr,
-                            l2_ch_cc,
-                            sse_strides,
+                            yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
+                            strides8,
                         );
-                        let bits_b = pb.flushed_bits().saturating_sub(base_bits) as f64;
+                        let bits_b = cab.flushed_bits().saturating_sub(base_bits) as f64;
 
                         chose_16 = d_a + lambda * bits_a <= d_b + lambda * bits_b;
                         if chose_16 {
@@ -825,11 +838,12 @@ fn build_idr_slice(
                                         + bc] = 2;
                                 }
                             }
-                            cab = pa;
-                            ctx = ca;
-                            ictx = ia;
+                            cab.reinstate_tail(&base_snap, &a_tail);
+                            cab.restore(&a_snap);
+                            ctx = a_ctx;
+                            ictx = a_ictx;
                         } else {
-                            // Trial B's reconstruction + mode_map already in place.
+                            // Trial B's reconstruction + mode_map + coder already in place.
                             for br in 0..2 {
                                 for bc in 0..2 {
                                     cu_depth[((l2_lu_r / cu_size_y) + br) * bx
@@ -837,9 +851,6 @@ fn build_idr_slice(
                                         + bc] = 3;
                                 }
                             }
-                            cab = pb;
-                            ctx = cb2;
-                            ictx = ib;
                         }
                     } else {
                         // 4:2:2 / 4:4:4: always four 8×8 CUs (no 16×16 trial).
@@ -1128,6 +1139,22 @@ struct CuParams {
     lu: usize,
 }
 
+/// Coded and source plane dimensions for a frame, shared by the per-CU coding
+/// and RD-distortion routines. `w`/`cw` are the 64-aligned coded luma/chroma
+/// strides; `src_*` are the true (pre-padding) source plane extents used for
+/// edge clamping; `sub_w`/`sub_h` are the chroma subsampling factors.
+#[derive(Clone, Copy)]
+struct PlaneStrides {
+    w: usize,
+    src_yw: usize,
+    src_yh: usize,
+    cw: usize,
+    src_cw: usize,
+    src_ch: usize,
+    sub_w: usize,
+    sub_h: usize,
+}
+
 fn encode_cu(
     ent: Entropy<'_>,
     src: &CuSrcPlanes<'_>,
@@ -1213,14 +1240,16 @@ fn encode_cu(
 
     let (yc0, ya, yl) = intra::get_reference_samples(
         rec_y,
-        yw_stride,
-        lu_row,
-        lu_col,
-        coded_yh,
-        lu,
-        64,
-        yw_stride / 64,
-        neutral,
+        intra::LumaRefGeometry {
+            stride: yw_stride,
+            block_row: lu_row,
+            block_col: lu_col,
+            height: coded_yh,
+            n: lu,
+            ctu: 64,
+            ctus_x: yw_stride / 64,
+            neutral,
+        },
     );
 
     // Rough mode decision: rank all 35 modes by SATD(orig − pred) + λ_m·mode_bits
@@ -1380,19 +1409,21 @@ fn encode_cu(
         let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
             rec_cb,
             rec_cr,
-            cw_stride,
-            sub_ch_row,
-            ch_col,
-            coded_ch_h,
-            ctb,
-            sub_w,
-            sub_h,
-            yw_stride,
-            coded_yh,
-            luma_ctus_x,
-            lu_row,
-            lu_col,
-            neutral,
+            intra::ChromaRefGeometry {
+                stride: cw_stride,
+                block_row: sub_ch_row,
+                block_col: ch_col,
+                chroma_h: coded_ch_h,
+                n: ctb,
+                sub_w,
+                sub_h,
+                luma_w: yw_stride,
+                luma_h: coded_yh,
+                luma_ctus_x,
+                cur_luma_row: lu_row,
+                cur_luma_col: lu_col,
+                neutral,
+            },
         );
         // When chroma references are smoothed (4:4:4, 8×8), libde265 filters the
         // corner too (pF[0] = (above[0]+2·corner+left[0]+2)>>2), so pass the
@@ -1490,9 +1521,8 @@ fn encode_cu(
         16 => extract_block_n::<16>(src_y, src_yw, src_yh, lu_row, lu_col),
         _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
     };
-    let y_res = intra::compute_residual(&y_orig, &y_pred, lu);
-    let y_res_i: Vec<i32> = y_res[..lu * lu].iter().map(|&v| v as i32).collect();
-    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, lu, bit_depth.bits());
+    let y_res = intra::compute_residual_i32(&y_orig, &y_pred, lu);
+    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res[..lu * lu], lu, bit_depth.bits());
     let y_level = crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()); // row-major levels
     // Reorder row-major levels into the mode-dependent scan for residual_coding.
     // 8×8 luma uses a vertical/horizontal scan for modes 6..=14 / 22..=30 (else
@@ -1568,12 +1598,21 @@ fn code_one_cu(
     lu_row: usize,
     lu_col: usize,
     lu: usize,
-    strides: (usize, usize, usize, usize, usize, usize, usize, usize),
+    strides: PlaneStrides,
     qp: u8,
     mode_map: &mut [u8],
     blk_stride: usize,
 ) {
-    let (w, src_yw, src_yh, cw, src_cw, src_ch, sub_w, sub_h) = strides;
+    let PlaneStrides {
+        w,
+        src_yw,
+        src_yh,
+        cw,
+        src_cw,
+        src_ch,
+        sub_w,
+        sub_h,
+    } = strides;
     let ch_row = lu_row / sub_h;
     let ch_col = lu_col / sub_w;
     let geo = CuGeometry {
@@ -1610,7 +1649,9 @@ fn code_one_cu(
 
 /// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and
 /// reconstruction over one 16×16-luma CU region, with the encoder's edge
-/// clamping for padded regions.
+/// clamping for padded regions. Differences are integer-valued samples, so the
+/// sum of squares is computed exactly in `i64` (returned as `f64` for the
+/// caller's Lagrangian, which mixes it with λ·bits).
 #[allow(clippy::too_many_arguments)]
 fn region_sse(
     yuv: &Yuv,
@@ -1621,32 +1662,43 @@ fn region_sse(
     lu_col: usize,
     ch_row: usize,
     ch_col: usize,
-    strides: (usize, usize, usize, usize, usize, usize),
+    strides: PlaneStrides,
 ) -> f64 {
-    let (w, src_yw, src_yh, cw, src_cw, src_ch) = strides;
-    let mut sse = 0f64;
+    let PlaneStrides {
+        w,
+        src_yw,
+        src_yh,
+        cw,
+        src_cw,
+        src_ch,
+        ..
+    } = strides;
+    let mut sse: i64 = 0;
     for r in 0..16 {
         let sy = (lu_row + r).min(src_yh - 1);
         for c in 0..16 {
             let sx = (lu_col + c).min(src_yw - 1);
-            let s = yuv.y[sy * src_yw + sx] as f64;
-            let d = rec_y[(lu_row + r) * w + (lu_col + c)] as f64;
-            sse += (s - d) * (s - d);
+            let s = yuv.y[sy * src_yw + sx] as i64;
+            let d = rec_y[(lu_row + r) * w + (lu_col + c)] as i64;
+            let e = s - d;
+            sse += e * e;
         }
     }
     for r in 0..8 {
         let sy = (ch_row + r).min(src_ch - 1);
         for c in 0..8 {
             let sx = (ch_col + c).min(src_cw - 1);
-            let sb = yuv.cb[sy * src_cw + sx] as f64;
-            let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as f64;
-            sse += (sb - db) * (sb - db);
-            let sr = yuv.cr[sy * src_cw + sx] as f64;
-            let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as f64;
-            sse += (sr - dr) * (sr - dr);
+            let sb = yuv.cb[sy * src_cw + sx] as i64;
+            let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as i64;
+            let eb = sb - db;
+            sse += eb * eb;
+            let sr = yuv.cr[sy * src_cw + sx] as i64;
+            let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as i64;
+            let er = sr - dr;
+            sse += er * er;
         }
     }
-    sse
+    sse as f64
 }
 
 /// Extract an N×N block from a plane (compile-time N, so the copy is specialized

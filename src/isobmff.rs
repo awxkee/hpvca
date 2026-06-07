@@ -28,6 +28,29 @@
  */
 use crate::{error::EncodeError, hevc::NaluStream};
 
+/// Output-side image metadata common to every `wrap_hevc_*` entry point: the
+/// sample bit depth plus the colour and image-metadata blocks written into the
+/// `meta` box. Bundled so the wrappers take this instead of three loose params.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageMeta<'a> {
+    pub(crate) bit_depth: crate::fmt::BitDepth,
+    pub(crate) color_meta: &'a crate::color::ColorMetadata,
+    pub(crate) metadata: &'a crate::metadata::Metadata,
+}
+
+/// Geometry of a HEIF tile grid: the `cols`×`rows` tile layout, the common
+/// per-tile coded size `(tile_w, tile_h)`, and the grid's visible size
+/// `(full_w, full_h)` written to `ispe`.
+#[derive(Clone, Copy)]
+pub(crate) struct GridDims {
+    pub(crate) cols: u32,
+    pub(crate) rows: u32,
+    pub(crate) tile_w: u32,
+    pub(crate) tile_h: u32,
+    pub(crate) full_w: u32,
+    pub(crate) full_h: u32,
+}
+
 fn epb(nalu: &[u8]) -> Vec<u8> {
     if nalu.len() <= 2 {
         return nalu.to_vec();
@@ -124,10 +147,13 @@ pub(crate) fn wrap_hevc_image_with_alpha(
     alpha: &NaluStream,
     width: u32,
     height: u32,
-    bit_depth: crate::fmt::BitDepth,
-    color_meta: &crate::color::ColorMetadata,
-    metadata: &crate::metadata::Metadata,
+    img: ImageMeta<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
+    let ImageMeta {
+        bit_depth,
+        color_meta,
+        metadata,
+    } = img;
     let color_sample = color.to_length_prefixed_slices();
     let alpha_sample = alpha.to_length_prefixed_slices();
     let color_hvcc = build_hvcc(color, bit_depth.bits())?;
@@ -348,10 +374,13 @@ pub(crate) fn wrap_hevc_image(
     stream: &NaluStream,
     width: u32,
     height: u32,
-    bit_depth: crate::fmt::BitDepth,
-    color_meta: &crate::color::ColorMetadata,
-    metadata: &crate::metadata::Metadata,
+    img: ImageMeta<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
+    let ImageMeta {
+        bit_depth,
+        color_meta,
+        metadata,
+    } = img;
     let hevc_sample = stream.to_length_prefixed_slices();
     let hvcc_data = build_hvcc(stream, bit_depth.bits())?;
     let chroma_idc = sps_chroma_format_idc(stream).unwrap_or(1);
@@ -668,19 +697,24 @@ fn build_hvcc(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError
 /// All tiles must be encoded at exactly `tile_w × tile_h` luma samples (edge
 /// tiles are padded before encoding so every tile shares the same SPS/hvcC).
 /// The grid's `ispe` carries the true visible dimensions `(full_w, full_h)`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn wrap_hevc_grid(
     tiles: &[NaluStream],
-    cols: u32,
-    rows: u32,
-    tile_w: u32,
-    tile_h: u32,
-    full_w: u32,
-    full_h: u32,
-    bit_depth: crate::fmt::BitDepth,
-    color_meta: &crate::color::ColorMetadata,
-    metadata: &crate::metadata::Metadata,
+    dims: GridDims,
+    img: ImageMeta<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
+    let GridDims {
+        cols,
+        rows,
+        tile_w,
+        tile_h,
+        full_w,
+        full_h,
+    } = dims;
+    let ImageMeta {
+        bit_depth,
+        color_meta,
+        metadata,
+    } = img;
     assert_eq!(
         tiles.len(),
         (cols * rows) as usize,
@@ -1044,20 +1078,25 @@ pub(crate) fn wrap_hevc_grid(
 ///
 /// Both grids share the same tile/image dimensions and use `construction_method=1`
 /// (inline `idat`) for their grid descriptors; tile samples are in `mdat`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn wrap_hevc_grid_with_alpha(
     color_tiles: &[NaluStream],
     alpha_tiles: &[NaluStream],
-    cols: u32,
-    rows: u32,
-    tile_w: u32,
-    tile_h: u32,
-    full_w: u32,
-    full_h: u32,
-    bit_depth: crate::fmt::BitDepth,
-    color_meta: &crate::color::ColorMetadata,
-    metadata: &crate::metadata::Metadata,
+    dims: GridDims,
+    img: ImageMeta<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
+    let GridDims {
+        cols,
+        rows,
+        tile_w,
+        tile_h,
+        full_w,
+        full_h,
+    } = dims;
+    let ImageMeta {
+        bit_depth,
+        color_meta,
+        metadata,
+    } = img;
     assert_eq!(color_tiles.len(), (cols * rows) as usize);
     assert_eq!(alpha_tiles.len(), (cols * rows) as usize);
 
@@ -1536,9 +1575,11 @@ mod tests {
             &make_test_stream(),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         assert_eq!(&b[4..8], b"ftyp");
@@ -1551,9 +1592,11 @@ mod tests {
             &make_stream(crate::fmt::ChromaFormat::Yuv422, crate::fmt::BitDepth::Ten),
             16,
             16,
-            crate::fmt::BitDepth::Ten,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Ten,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         assert_eq!(&b[8..12], b"heix", "4:2:2 must use heix brand");
@@ -1568,9 +1611,11 @@ mod tests {
             ),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         assert_eq!(&b[8..12], b"heix", "4:4:4 must use heix brand");
@@ -1582,9 +1627,11 @@ mod tests {
             &make_test_stream(),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         // windows().position() returns the start of the fourcc bytes directly.
@@ -1601,9 +1648,11 @@ mod tests {
             &make_test_stream(),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         let ftyp_size = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
@@ -1622,9 +1671,11 @@ mod tests {
             &make_test_stream(),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         let mut pos = 0usize;
@@ -1654,9 +1705,11 @@ mod tests {
             &make_test_stream(),
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         let ipco_start = b.windows(4).position(|w| w == b"ipco").unwrap() + 4;
@@ -1678,9 +1731,11 @@ mod tests {
             &alpha,
             16,
             16,
-            crate::fmt::BitDepth::Eight,
-            &crate::color::ColorMetadata::default(),
-            &crate::metadata::Metadata::default(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
         )
         .unwrap();
         let s = b.as_slice();

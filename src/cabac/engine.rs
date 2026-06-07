@@ -256,13 +256,62 @@ impl CabacEncoder {
         self.emit_bit(two & 1);
     }
 
-    /// Finish encoding and return the byte-aligned output buffer.
-    /// Coded length in bits if the stream were terminated here (clones + flushes
-    /// a copy). RDO differences two of these for a CU's true marginal coded cost.
+    /// Coded length in bits if the stream were terminated here. RDO differences
+    /// two of these for a CU's true marginal coded cost.
     pub(crate) fn flushed_bits(&self) -> u64 {
-        let mut probe = self.clone();
-        probe.encode_terminate(1); // resolves `low` + outstanding into output/bit_buffer
-        (probe.output.len() as u64) * 8 + probe.bit_count as u64
+        // A bit-sink that mirrors put_bit/renorm control flow but only counts.
+        struct BitCounter {
+            low: u32,
+            m_range: u32,
+            bits_outstanding: u32,
+            first_bit: bool,
+            count: u64,
+        }
+        impl BitCounter {
+            #[inline]
+            fn put_bit(&mut self) {
+                // first put_bit is suppressed (H.264/HEVC convention); every
+                // subsequent one emits 1 real bit plus all outstanding carry bits.
+                if self.first_bit {
+                    self.first_bit = false;
+                } else {
+                    self.count += 1;
+                }
+                self.count += self.bits_outstanding as u64;
+                self.bits_outstanding = 0;
+            }
+            #[inline]
+            fn renorm(&mut self) {
+                while self.m_range < 256 {
+                    if self.low < 256 {
+                        self.put_bit();
+                    } else if self.low >= 512 {
+                        self.low -= 512;
+                        self.put_bit();
+                    } else {
+                        self.low -= 256;
+                        self.bits_outstanding += 1;
+                    }
+                    self.m_range <<= 1;
+                    self.low <<= 1;
+                }
+            }
+        }
+        let mut s = BitCounter {
+            low: self.low,
+            m_range: self.m_range,
+            bits_outstanding: self.bits_outstanding,
+            first_bit: self.first_bit,
+            count: (self.output.len() as u64) * 8 + self.bit_count as u64,
+        };
+        // encode_terminate(1): range -= 2; low += range; flush()
+        s.m_range -= 2;
+        s.low += s.m_range;
+        // flush(): range = 2; renorm(); put_bit(low>>9 & 1); then 2 emit_bits.
+        s.m_range = 2;
+        s.renorm();
+        s.put_bit();
+        s.count + 2
     }
 
     pub(crate) fn finish(mut self) -> Vec<u8> {
@@ -274,6 +323,64 @@ impl CabacEncoder {
             self.bit_count = 0;
         }
         self.output
+    }
+
+    /// Capture the encoder's resumable state for a speculative RD trial.
+    #[inline]
+    pub(crate) fn snapshot(&self) -> CabacSnapshot {
+        CabacSnapshot {
+            low: self.low,
+            m_range: self.m_range,
+            bits_outstanding: self.bits_outstanding,
+            first_bit: self.first_bit,
+            bit_buffer: self.bit_buffer,
+            bit_count: self.bit_count,
+            output_len: self.output.len(),
+        }
+    }
+
+    /// Roll the encoder back to a previously captured [`CabacSnapshot`].
+    #[inline]
+    pub(crate) fn restore(&mut self, s: &CabacSnapshot) {
+        self.low = s.low;
+        self.m_range = s.m_range;
+        self.bits_outstanding = s.bits_outstanding;
+        self.first_bit = s.first_bit;
+        self.bit_buffer = s.bit_buffer;
+        self.bit_count = s.bit_count;
+        self.output.truncate(s.output_len);
+    }
+
+    /// Reinstate the output bytes an earlier trial appended past `from`, after a
+    /// later trial truncated them. `tail` is the slice the earlier trial wrote
+    /// beyond `from.output_len`; this resets the output to that prefix + tail.
+    /// The caller follows with [`restore`] to put back the matching scalar state.
+    #[inline]
+    pub(crate) fn reinstate_tail(&mut self, from: &CabacSnapshot, tail: &[u8]) {
+        self.output.truncate(from.output_len);
+        self.output.extend_from_slice(tail);
+    }
+}
+
+/// Resumable snapshot of a [`CabacEncoder`] (scalar state + output length).
+/// Cheap to take and apply — used to run RD trials in place without cloning the
+/// growing output buffer.
+#[derive(Clone, Copy)]
+pub(crate) struct CabacSnapshot {
+    low: u32,
+    m_range: u32,
+    bits_outstanding: u32,
+    first_bit: bool,
+    bit_buffer: u8,
+    bit_count: u8,
+    output_len: usize,
+}
+
+impl CabacSnapshot {
+    /// Output byte length captured at snapshot time.
+    #[inline]
+    pub(crate) fn output_len(&self) -> usize {
+        self.output_len
     }
 }
 
