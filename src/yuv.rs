@@ -217,18 +217,33 @@ pub(crate) fn rgb_to_yuv(
     let maxv = bit_depth.max_val() as i32;
     let neutral = bit_depth.neutral() as i32;
 
-    // ── Monochrome ────────────────────────────────────────────────────────
     if chroma.is_monochrome() {
         let channels = rgb.len() / (w * h);
         let y_plane: Vec<u16> = if channels == 1 {
             rgb.to_vec()
-        } else {
-            rgb.chunks_exact(channels)
+        } else if channels == 4 {
+            rgb.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|px| {
                     let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
                     rgb_to_y(r, g, b).clamp(0, maxv) as u16
                 })
                 .collect()
+        } else if channels == 3 {
+            rgb.as_chunks::<3>()
+                .0
+                .iter()
+                .map(|px| {
+                    let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                    rgb_to_y(r, g, b).clamp(0, maxv) as u16
+                })
+                .collect()
+        } else {
+            unimplemented!(
+                "Amount of channels {} in 'rgb_to_yuv' is not supported",
+                channels
+            )
         };
         return Yuv {
             y: y_plane,
@@ -253,27 +268,24 @@ pub(crate) fn rgb_to_yuv(
     let mut cb_plane = vec![0u16; cw * ch];
     let mut cr_plane = vec![0u16; cw * ch];
 
-    // ── Inner helpers (capture maxv, neutral by value) ────────────────────
-
-    // Write luma for every pixel in one source row.
-    // Write chroma (horizontal average of pixel pairs) when cb/cr are Some.
-    // Handles odd-width rows via chunks_exact remainder — no bounds issues.
     let process_row = |src: &[u16],
                        y_dst: &mut [u16],
                        cb_dst: Option<&mut [u16]>,
                        cr_dst: Option<&mut [u16]>| {
         // Luma — every pixel.
-        for (y_out, px) in y_dst.iter_mut().zip(src.chunks_exact(3)) {
+        for (y_out, px) in y_dst.iter_mut().zip(src.as_chunks::<3>().0.iter()) {
             let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
             *y_out = rgb_to_y(r, g, b).clamp(0, maxv) as u16;
         }
 
         // Chroma — only when this row contributes a chroma row.
         if let (Some(cb_out), Some(cr_out)) = (cb_dst, cr_dst) {
-            let pairs = src.chunks_exact(6);
-            let remainder = pairs.remainder(); // 0 or 3 samples (odd width)
+            let pairs = src.as_chunks::<6>();
+            let remainder = pairs.1; // 0 or 3 samples (odd width)
 
-            for ((cb_out, cr_out), pair) in cb_out.iter_mut().zip(cr_out.iter_mut()).zip(pairs) {
+            for ((cb_out, cr_out), pair) in
+                cb_out.iter_mut().zip(cr_out.iter_mut()).zip(pairs.0.iter())
+            {
                 let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
                 let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
                 // Horizontal average of two adjacent pixels (Q0).
@@ -302,10 +314,11 @@ pub(crate) fn rgb_to_yuv(
     };
 
     let blend_chroma_row = |src: &[u16], cb_row: &mut [u16], cr_row: &mut [u16]| {
-        let pairs = src.chunks_exact(6);
-        let remainder = pairs.remainder();
+        let pairs = src.as_chunks::<6>();
+        let remainder = pairs.1;
 
-        for ((cb_out, cr_out), pair) in cb_row.iter_mut().zip(cr_row.iter_mut()).zip(pairs) {
+        for ((cb_out, cr_out), pair) in cb_row.iter_mut().zip(cr_row.iter_mut()).zip(pairs.0.iter())
+        {
             let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
             let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
             let cb1 = ((rgb_to_cb(r0, g0, b0, neutral) + rgb_to_cb(r1, g1, b1, neutral) + 1) >> 1)
@@ -348,7 +361,7 @@ pub(crate) fn rgb_to_yuv(
                     .iter_mut()
                     .zip(cb_row.iter_mut())
                     .zip(cr_row.iter_mut())
-                    .zip(src.chunks_exact(3))
+                    .zip(src.as_chunks::<3>().0.iter())
                 {
                     let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
                     *y_out = rgb_to_y(r, g, b).clamp(0, maxv) as u16;

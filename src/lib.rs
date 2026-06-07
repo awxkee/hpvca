@@ -176,7 +176,9 @@ pub fn encode_rgba(
     cfg.validate()?;
     validate_buf_u8(rgba, width, height, 4)?;
     let wide: Vec<u16> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0] as u16, px[1] as u16, px[2] as u16])
         .collect();
     encode_rgb_wide(&wide, width, height, BitDepth::Eight, cfg)
@@ -234,7 +236,9 @@ pub fn encode_rgba10(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     encode_rgb_wide(&rgb, width, height, BitDepth::Ten, cfg)
@@ -286,7 +290,9 @@ pub fn encode_rgba12(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     encode_rgb_wide(&rgb, width, height, BitDepth::Twelve, cfg)
@@ -337,7 +343,12 @@ pub fn encode_gray_alpha(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u8(ya, width, height, 2)?;
-    let wide: Vec<u16> = ya.chunks_exact(2).map(|px| px[0] as u16).collect();
+    let wide: Vec<u16> = ya
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| px[0] as u16)
+        .collect();
     encode_gray_wide(&wide, width, height, BitDepth::Eight, cfg)
 }
 
@@ -386,7 +397,7 @@ pub fn encode_gray_alpha10(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u16(ya, width, height, 2)?;
-    let luma: Vec<u16> = ya.chunks_exact(2).map(|px| px[0]).collect();
+    let luma: Vec<u16> = ya.as_chunks::<2>().0.iter().map(|px| px[0]).collect();
     encode_gray_wide(&luma, width, height, BitDepth::Ten, cfg)
 }
 
@@ -435,7 +446,7 @@ pub fn encode_gray_alpha12(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u16(ya, width, height, 2)?;
-    let luma: Vec<u16> = ya.chunks_exact(2).map(|px| px[0]).collect();
+    let luma: Vec<u16> = ya.as_chunks::<2>().0.iter().map(|px| px[0]).collect();
     encode_gray_wide(&luma, width, height, BitDepth::Twelve, cfg)
 }
 
@@ -504,7 +515,7 @@ fn encode_rgb_wide(
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
     let mut yuv = if enc_w != width || enc_h != height {
-        let padded = pad_buf(rgb, width, height, enc_w, enc_h, 3);
+        let padded = pad_buf::<3>(rgb, width, height, enc_w, enc_h);
         yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
     } else {
         yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
@@ -540,7 +551,9 @@ fn encode_rgba_with_alpha_wide(
         let sr = dst_row_idx.min(h - 1);
         let src_row = &rgba[sr * w * 4..(sr * w + w) * 4];
         for (dst_col_idx, (col_px, alp_px)) in col_row
-            .chunks_exact_mut(3)
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
             .zip(alp_row.iter_mut())
             .enumerate()
         {
@@ -583,7 +596,7 @@ fn encode_gray_wide(
     // Greyscale is always Monochrome regardless of cfg.chroma.
     let (enc_w, enc_h) = encoded_dims(width, height, ChromaFormat::Monochrome);
     let luma = if enc_w != width || enc_h != height {
-        pad_buf(gray, width, height, enc_w, enc_h, 1)
+        pad_buf::<1>(gray, width, height, enc_w, enc_h)
     } else {
         gray.to_vec()
     };
@@ -1086,11 +1099,11 @@ fn encoded_dims(width: u32, height: u32, chroma: ChromaFormat) -> (u32, u32) {
 
 /// Replicate-pad a planar buffer from `(w, h)` to `(nw, nh)`.
 /// `channels` is the number of interleaved u16 samples per pixel.
-fn pad_buf(src: &[u16], w: u32, h: u32, nw: u32, nh: u32, channels: usize) -> Vec<u16> {
+fn pad_buf<const N: usize>(src: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u16> {
     let (w, h, nw, nh) = (w as usize, h as usize, nw as usize, nh as usize);
-    let src_stride = w * channels;
-    let dst_stride = nw * channels;
-    let mut out = vec![0u16; nw * nh * channels];
+    let src_stride = w * N;
+    let dst_stride = nw * N;
+    let mut out = vec![0u16; nw * nh * N];
 
     for (dst_row_idx, dst_row) in out.chunks_exact_mut(dst_stride).enumerate() {
         let sr = dst_row_idx.min(h - 1);
@@ -1098,8 +1111,8 @@ fn pad_buf(src: &[u16], w: u32, h: u32, nw: u32, nh: u32, channels: usize) -> Ve
         let (real, pad) = dst_row.split_at_mut(src_stride);
         real.copy_from_slice(src_row);
         if !pad.is_empty() {
-            let last_px = &src_row[src_row.len() - channels..];
-            for px in pad.chunks_exact_mut(channels) {
+            let last_px = &src_row[src_row.len() - N..];
+            for px in pad.as_chunks_mut::<N>().0.iter_mut() {
                 px.copy_from_slice(last_px);
             }
         }
@@ -1436,18 +1449,18 @@ mod tests {
     #[test]
     fn pad_replicates_column() {
         let src = vec![10u16, 20, 30];
-        assert_eq!(pad_buf(&src, 1, 1, 2, 1, 3), vec![10, 20, 30, 10, 20, 30]);
+        assert_eq!(pad_buf::<3>(&src, 1, 1, 2, 1), vec![10, 20, 30, 10, 20, 30]);
     }
 
     #[test]
     fn pad_replicates_row() {
         let src = vec![10u16, 20, 30];
-        assert_eq!(pad_buf(&src, 1, 1, 1, 2, 3), vec![10, 20, 30, 10, 20, 30]);
+        assert_eq!(pad_buf::<3>(&src, 1, 1, 1, 2), vec![10, 20, 30, 10, 20, 30]);
     }
 
     #[test]
     fn pad_noop_when_aligned() {
         let src: Vec<u16> = (0..12).collect();
-        assert_eq!(pad_buf(&src, 2, 2, 2, 2, 3), src);
+        assert_eq!(pad_buf::<3>(&src, 2, 2, 2, 2), src);
     }
 }

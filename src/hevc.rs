@@ -160,7 +160,7 @@ fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
 pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
     let ps = (w as u64) * (h as u64);
     // (MaxLumaPs, level_idc)
-    const TABLE: &[(u64, u8)] = &[
+    static TABLE: &[(u64, u8)] = &[
         (36864, 30),
         (122880, 60),
         (245760, 63),
@@ -184,7 +184,7 @@ fn write_profile_tier_level(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
 ) {
-    // Select profile based on chroma and bit depth (matching Apple / x265 behaviour):
+    // Select profile based on chroma and bit depth (matching Apple / x265 behavior):
     //   4:2:0 / mono 8-bit  → profile 3 (Main Still Picture), compat 0x70000000
     //   4:2:0 / mono 10-bit → profile 2 (Main10),            compat 0x20000000
     //   4:2:2 / 4:4:4 / 12-bit → profile 4 (RExt),          compat 0x08000000
@@ -432,11 +432,6 @@ fn write_vui(bw: &mut BitWriter) {
     bw.write_bit(true);
     bw.write_bits(5, 3); // video_format = 5 (unspecified)
     bw.write_bit(true); // video_full_range_flag = 1 (full range 0-255)
-    // libheif uses full range. Our YUV conversion
-    // produces studio-swing Y [16-235], but VideoToolbox
-    // on macOS ignores limited-range signals and clips to
-    // black. Signalling full range matches libheif and
-    // makes the image display correctly on Apple devices.
     bw.write_bit(true); // colour_description_present_flag
     bw.write_bits(1, 8); // colour_primaries         = 1 (BT.709) — matches libheif
     bw.write_bits(13, 8); // transfer_characteristics = 13 (sRGB / IEC 61966-2-1)
@@ -759,11 +754,15 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
     let mut out = vec![128u16; dst_w * dst_h];
     for r in 0..dst_h {
         let sr = r.min(src_h - 1);
-        for c in 0..dst_w {
-            let sc = c.min(src_w - 1);
-            out[r * dst_w + c] = src[sr * src_w + sc];
-        }
+        let src_row = &src[sr * src_w..sr * src_w + src_w];
+        let dst_row = &mut out[r * dst_w..r * dst_w + dst_w];
+
+        dst_row[..src_w].copy_from_slice(src_row);
+
+        let edge = src_row[src_w - 1];
+        dst_row[src_w..].fill(edge);
     }
+
     out
 }
 

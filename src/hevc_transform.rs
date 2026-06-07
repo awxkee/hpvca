@@ -79,7 +79,7 @@ fn fwd_transform_n<const N: usize>(
     // sums stay well inside i32 for every supported bit depth.
     let mut tmp = [0i32; 64]; // N*N <= 64
     // pass 1 (rows of res): tmp[j*N+i] = (Σ_k T[i][k]·res[j*N+k]) >> shift1
-    for (j, res_row) in res.chunks_exact(N).enumerate().take(N) {
+    for (j, res_row) in res.as_chunks::<N>().0.iter().enumerate().take(N) {
         for (i, trow) in t.iter().enumerate() {
             let mut s = 0i32;
             for k in 0..N {
