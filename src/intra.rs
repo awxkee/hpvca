@@ -54,8 +54,209 @@ pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 256
     pred
 }
 
-///
-/// Inputs use the layout: `corner` = above-left sample, `above[0..=n]` =
+/// Whether the [1 2 1] reference-smoothing filter applies for this mode/size
+/// (HEVC §8.4.4.2.3, luma). DC and 4×4 never filter; otherwise it depends on the
+/// mode's angular distance from pure horizontal (10) / vertical (26).
+pub(crate) fn should_filter_refs(mode: u8, n: usize) -> bool {
+    if mode == DC || n == 4 {
+        return false;
+    }
+    // PLANAR (mode 0) is treated as distance 10 (= min(|0-26|,|0-10|)).
+    let dist = if mode == PLANAR {
+        10
+    } else {
+        (mode as i32 - 26).abs().min((mode as i32 - 10).abs())
+    };
+    let thresh = match n {
+        8 => 7,
+        16 => 1,
+        _ => 0, // 32
+    };
+    dist > thresh
+}
+
+/// intraPredAngle for angular modes 2..=34 (HEVC Table 8-5), indexed by mode.
+const INTRA_PRED_ANGLE: [i32; 35] = [
+    0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,
+    -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+];
+/// invAngle for modes 11..=25 (HEVC Table 8-6), indexed by mode (0 elsewhere).
+const INV_ANGLE: [i32; 35] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
+    -482, -630, -910, -1638, -4096, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+pub(crate) const PLANAR: u8 = 0;
+pub(crate) const DC: u8 = 1;
+
+/// Predict an N×N block with DC mode (HEVC §8.4.4.2.5). `filter_boundary`
+/// applies the luma edge smoothing of the top row / left column / corner
+/// (skipped for chroma and for n == 32).
+pub(crate) fn predict_dc(
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    filter_boundary: bool,
+) -> [u16; 256] {
+    let mut sum = 0i32;
+    for i in 0..n {
+        sum += above[i] as i32 + left[i] as i32;
+    }
+    let log2 = n.trailing_zeros();
+    let dc = ((sum + n as i32) >> (log2 + 1)) as i32;
+    let mut pred = [0u16; 256];
+    for v in pred[..n * n].iter_mut() {
+        *v = dc as u16;
+    }
+    if filter_boundary && n < 32 {
+        // Corner, first row and first column get a 3:1 / 2:1:1 blend with the refs.
+        pred[0] = ((left[0] as i32 + 2 * dc + above[0] as i32 + 2) >> 2) as u16;
+        for x in 1..n {
+            pred[x] = ((above[x] as i32 + 3 * dc + 2) >> 2) as u16;
+        }
+        for y in 1..n {
+            pred[y * n] = ((left[y] as i32 + 3 * dc + 2) >> 2) as u16;
+        }
+    }
+    pred
+}
+
+/// Predict an N×N block with an angular mode (2..=34, HEVC §8.4.4.2.6).
+/// `corner` = p[-1][-1]; `above`/`left` hold p[x][-1] / p[-1][y] for x,y = 0..2n-1.
+/// `filter_boundary` applies the pure-vertical (26) / horizontal (10) luma edge
+/// filter (skipped for chroma and n == 32).
+pub(crate) fn predict_angular(
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    mode: u8,
+    filter_boundary: bool,
+    max_val: i32,
+) -> [u16; 256] {
+    let angle = INTRA_PRED_ANGLE[mode as usize];
+    let mut pred = [0u16; 256];
+
+    // Build the main reference array `ref[i]`, i in 0..=2n, indexed from a base
+    // offset so negative projections (angle < 0) are representable.
+    // For vertical modes (>=18) the main reference is the above row; for
+    // horizontal modes (<18) it is the left column (block predicted transposed).
+    let vertical = mode >= 18;
+    let (main, side): (&[u16], &[u16]) = if vertical { (above, left) } else { (left, above) };
+
+    // r[OFF + i] = ref[i]; OFF lets i go negative down to -n.
+    const OFF: usize = 32;
+    let mut r = [0i32; OFF + 64 + 1];
+    r[OFF] = corner as i32; // ref[0] = p[-1][-1]
+    for i in 1..=2 * n {
+        r[OFF + i] = main[i - 1] as i32; // ref[i] = main[i-1]
+    }
+    if angle < 0 {
+        let inv = INV_ANGLE[mode as usize];
+        let last = (n as i32 * angle) >> 5; // most-negative index needed
+        let mut x = -1;
+        while x >= last {
+            let idx = (x * inv + 128) >> 8; // project onto the side array
+            // ref[x] = p[-1][-1 + idx]: corner if idx==0, else side[idx-1].
+            r[(OFF as i32 + x) as usize] = if idx <= 0 {
+                corner as i32
+            } else {
+                side[(idx - 1) as usize] as i32
+            };
+            x -= 1;
+        }
+    }
+
+    // Primary axis = rows for vertical modes, columns for horizontal modes. For
+    // horizontal modes HEVC swaps the roles of x and y: iIdx/iFact derive from
+    // the primary index, the reference index uses the secondary index.
+    for p_outer in 0..n {
+        let pos = (p_outer as i32 + 1) * angle;
+        let i_idx = pos >> 5;
+        let i_fact = pos & 31;
+        for p_inner in 0..n {
+            let base = OFF as i32 + p_inner as i32 + i_idx + 1;
+            let a = r[base as usize];
+            let b = r[(base + 1) as usize];
+            let val = (((32 - i_fact) * a + i_fact * b + 16) >> 5) as u16;
+            if vertical {
+                pred[p_outer * n + p_inner] = val; // [row y][col x]
+            } else {
+                pred[p_inner * n + p_outer] = val; // [row y][col x], transposed
+            }
+        }
+    }
+
+    if filter_boundary && n < 32 {
+        let max = max_val;
+        if mode == 26 {
+            // pure vertical: first column blended with the left reference
+            for y in 0..n {
+                let v = above[0] as i32 + ((left[y] as i32 - corner as i32) >> 1);
+                pred[y * n] = v.clamp(0, max) as u16;
+            }
+        } else if mode == 10 {
+            // pure horizontal: first row blended with the above reference
+            for x in 0..n {
+                let v = left[0] as i32 + ((above[x] as i32 - corner as i32) >> 1);
+                pred[x] = v.clamp(0, max) as u16;
+            }
+        }
+    }
+    pred
+}
+
+/// Predict an N×N block for any luma mode (0=PLANAR, 1=DC, 2..=34 angular),
+/// given raw (unfiltered) references. Applies mode-dependent reference smoothing
+/// internally. `boundary_filter` enables the DC/H/V luma edge filters.
+/// Predict a chroma TB with `mode`, from references already prepared by the
+/// caller (4:4:4 pre-filters them; 4:2:0/4:2:2 do not). Chroma never applies the
+/// DC/H/V boundary edge filter (cIdx > 0).
+pub(crate) fn predict_chroma_tb(
+    mode: u8,
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    max_val: i32,
+) -> [u16; 256] {
+    match mode {
+        PLANAR => predict_planar(above, left, n),
+        DC => predict_dc(above, left, n, false),
+        _ => predict_angular(corner, above, left, n, mode, false, max_val),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_mode(
+    mode: u8,
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    luma: bool,
+    max_val: i32,
+) -> [u16; 256] {
+    if luma && should_filter_refs(mode, n) {
+        let (fa, fl) = filter_references(corner, above, left, n);
+        // libde265 filters the references as one array centred on the corner, so
+        // the corner is smoothed too: pF[0] = (above[0] + 2·corner + left[0] + 2)>>2.
+        let cf = ((above[0] as i32 + 2 * corner as i32 + left[0] as i32 + 2) >> 2) as u16;
+        match mode {
+            PLANAR => predict_planar(&fa, &fl, n),
+            DC => predict_dc(&fa, &fl, n, true),
+            _ => predict_angular(cf, &fa, &fl, n, mode, true, max_val),
+        }
+    } else {
+        match mode {
+            PLANAR => predict_planar(above, left, n),
+            DC => predict_dc(above, left, n, luma),
+            _ => predict_angular(corner, above, left, n, mode, luma, max_val),
+        }
+    }
+}
+
+
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
 /// then bottom-left (length n+1). Returns filtered (above', left') in the same
 /// layout that `predict_planar` consumes (length n+1 each). Endpoints that have
@@ -464,6 +665,108 @@ pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[test]
+    fn angular_mode18_negative_diagonal() {
+        // Mode 18 (angle −32, vertical): predSamples[x][y] = ref[x−y], where the
+        // negative half of ref is the left column projected via invAngle.
+        let mut above = [0u16; 33];
+        let mut left = [0u16; 33];
+        for i in 0..8 {
+            above[i] = (10 * (i + 1)) as u16; // 10,20,30,40,...
+            left[i] = (50 + 10 * i) as u16; // 50,60,70,80,...
+        }
+        let corner = 5;
+        let p = predict_angular(corner, &above, &left, 4, 18, false, 255);
+        let expect = [
+            5, 10, 20, 30, // y=0: ref[x]   = corner, above[0..2]
+            50, 5, 10, 20, // y=1: ref[x-1] = left[0], corner, above[0..1]
+            60, 50, 5, 10, // y=2
+            70, 60, 50, 5, // y=3
+        ];
+        assert_eq!(&p[..16], &expect, "mode-18 negative diagonal");
+    }
+
+    #[test]
+    fn dc_of_flat_is_flat() {
+        let above = [100u16; 33];
+        let left = [100u16; 33];
+        let p = predict_dc(&above, &left, 8, false);
+        assert!(p[..64].iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn dc_value_is_average() {
+        let mut above = [0u16; 33];
+        let mut left = [0u16; 33];
+        for i in 0..8 {
+            above[i] = 80;
+            left[i] = 120;
+        }
+        // DC = (8*80 + 8*120 + 8) >> 4 = (640+960+8)>>4 = 1608>>4 = 100
+        let p = predict_dc(&above, &left, 8, false);
+        assert_eq!(p[63], 100); // interior (unfiltered) sample
+    }
+
+    #[test]
+    fn vertical_mode_copies_above_row() {
+        // Mode 26 (pure vertical), no boundary filter → every row equals the above row.
+        let mut above = [0u16; 33];
+        let left = [50u16; 33];
+        for i in 0..8 {
+            above[i] = (10 * i) as u16;
+        }
+        let p = predict_angular(50, &above, &left, 8, 26, false, 255);
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(p[r * 8 + c], above[c], "row {r} col {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_mode_copies_left_col() {
+        // Mode 10 (pure horizontal), no boundary filter → every col equals left col.
+        let above = [50u16; 33];
+        let mut left = [0u16; 33];
+        for i in 0..8 {
+            left[i] = (10 * i) as u16;
+        }
+        let p = predict_angular(50, &above, &left, 8, 10, false, 255);
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(p[r * 8 + c], left[r], "row {r} col {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn angular_45_diagonal_shifts() {
+        // Mode 34 has angle +32 (exact 45°): predSamples[y][x] = ref[x+y+2] = above[x+y+1].
+        let mut above = [0u16; 33];
+        let left = [0u16; 33];
+        for i in 0..16 {
+            above[i] = (i + 1) as u16;
+        }
+        let p = predict_angular(0, &above, &left, 8, 34, false, 255);
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(p[y * 8 + x], above[x + y + 1], "y{y} x{x}");
+            }
+        }
+    }
+
+    #[test]
+    fn ref_filter_decision() {
+        assert!(!should_filter_refs(DC, 8)); // DC never
+        assert!(!should_filter_refs(0, 4)); // 4x4 never
+        assert!(should_filter_refs(PLANAR, 8)); // planar at 8 filters
+        assert!(!should_filter_refs(26, 8)); // pure vertical never (dist 0)
+        assert!(!should_filter_refs(10, 16)); // pure horizontal never
+        assert!(should_filter_refs(2, 8)); // far diagonal at 8 filters
+        assert!(should_filter_refs(18, 16)); // 45° diagonal at 16 filters (dist 8 > 1)
+    }
 
     #[test]
     fn planar_corners() {

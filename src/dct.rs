@@ -87,3 +87,164 @@ pub(crate) static ZIGZAG_16X16: [(usize, usize); 256] = [
     (12,12),(13,12),(12,13),(14,12),(13,13),(12,14),(15,12),(14,13),
     (13,14),(12,15),(15,13),(14,14),(13,15),(15,14),(14,15),(15,15),
 ];
+
+// ── Mode-dependent coefficient scans (HEVC §6.5.3/6.5.4/6.5.5) ──────────────
+// For 4×4 and 8×8-luma intra TBs the scan order depends on the prediction mode:
+// modes 6..=14 use the vertical scan, 22..=30 the horizontal scan, all others
+// (and every larger TB) the up-right diagonal scan. Encoder and decoder must
+// agree, so this selection is conformance-critical.
+
+/// scanIdx (0 = diagonal, 1 = horizontal, 2 = vertical) for an intra TB.
+///
+/// Mode-dependent for 4×4 (any component), 8×8 luma, and — in 4:4:4 — 8×8 chroma
+/// (HEVC `get_intra_scan_idx`: `log2==2 || (log2==3 && (cIdx==0 || 4:4:4))`).
+pub(crate) fn scan_idx_for(mode: u8, log2_ts: u32, is_luma: bool, is_444: bool) -> u8 {
+    let mode_dependent = log2_ts == 2 || (log2_ts == 3 && (is_luma || is_444));
+    if !mode_dependent {
+        return 0;
+    }
+    if (6..=14).contains(&mode) {
+        2 // vertical
+    } else if (22..=30).contains(&mode) {
+        1 // horizontal
+    } else {
+        0 // diagonal
+    }
+}
+
+/// Raw scan order over a `blk`×`blk` array, returning `(x, y)` = `(col, row)`.
+fn raw_scan(blk: usize, scan_idx: u8) -> Vec<(usize, usize)> {
+    let mut v = Vec::with_capacity(blk * blk);
+    match scan_idx {
+        1 => {
+            // horizontal: row-major
+            for y in 0..blk {
+                for x in 0..blk {
+                    v.push((x, y));
+                }
+            }
+        }
+        2 => {
+            // vertical: column-major
+            for x in 0..blk {
+                for y in 0..blk {
+                    v.push((x, y));
+                }
+            }
+        }
+        _ => {
+            // up-right diagonal (HEVC 6.5.3)
+            let b = blk as i32;
+            let (mut x, mut y) = (0i32, 0i32);
+            loop {
+                while y >= 0 {
+                    if x < b && y < b {
+                        v.push((x as usize, y as usize));
+                    }
+                    y -= 1;
+                    x += 1;
+                }
+                y = x;
+                x = 0;
+                if v.len() >= blk * blk {
+                    break;
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Coefficient scan for a TB as `(row, col)`, organised as a grid of 4×4
+/// sub-blocks (each sub-block and the sub-block grid scanned in `scan_idx`
+/// order) so that `coeffs[sb*16 + k]` indexing stays consistent. The diagonal
+/// case returns the canonical static tables directly; horizontal/vertical are
+/// generated once and cached.
+pub(crate) fn coeff_scan(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize)] {
+    if scan_idx == 0 {
+        return match log2_ts {
+            2 => &DIAG_SCAN_4X4,
+            3 => &ZIGZAG,
+            4 => &ZIGZAG_16X16,
+            _ => panic!("unsupported transform size log2={log2_ts}"),
+        };
+    }
+    &scan_tables().coeff[(log2_ts as usize) * 3 + scan_idx as usize]
+}
+
+/// Sub-block grid scan `(sbx, sby)` for a TB. Cached.
+pub(crate) fn sb_scan_for(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize)] {
+    &scan_tables().sb[(log2_ts as usize) * 3 + scan_idx as usize]
+}
+
+struct ScanTables {
+    coeff: Vec<Vec<(usize, usize)>>,
+    sb: Vec<Vec<(usize, usize)>>,
+}
+
+fn scan_tables() -> &'static ScanTables {
+    static T: std::sync::OnceLock<ScanTables> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        // Index = log2_ts*3 + scan_idx, for log2_ts in 0..=4 and scan_idx in 0..=2.
+        let mut coeff = vec![Vec::new(); 5 * 3];
+        let mut sb = vec![Vec::new(); 5 * 3];
+        for log2_ts in 2..=4u32 {
+            for scan_idx in 1..=2u8 {
+                let idx = (log2_ts as usize) * 3 + scan_idx as usize;
+                coeff[idx] = build_coeff_scan(log2_ts, scan_idx);
+            }
+            for scan_idx in 0..=2u8 {
+                sb[(log2_ts as usize) * 3 + scan_idx as usize] = build_sb_scan(log2_ts, scan_idx);
+            }
+        }
+        ScanTables { coeff, sb }
+    })
+}
+
+fn build_coeff_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
+    let n = 1usize << log2_ts;
+    if n <= 4 {
+        return raw_scan(n, scan_idx).into_iter().map(|(x, y)| (y, x)).collect();
+    }
+    let sb_side = n / 4;
+    let sb = raw_scan(sb_side, scan_idx);
+    let inner = raw_scan(4, scan_idx);
+    let mut out = Vec::with_capacity(n * n);
+    for &(sbx, sby) in &sb {
+        for &(ix, iy) in &inner {
+            out.push((sby * 4 + iy, sbx * 4 + ix));
+        }
+    }
+    out
+}
+
+fn build_sb_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
+    let sb_side = (1usize << log2_ts) / 4;
+    if sb_side <= 1 {
+        return vec![(0, 0)];
+    }
+    raw_scan(sb_side, scan_idx)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    #[test]
+    fn diagonal_matches_static_tables() {
+        // The generator (used for the horizontal/vertical scans) must reproduce
+        // the canonical diagonal tables exactly when given scan_idx 0.
+        assert_eq!(&build_coeff_scan(2, 0)[..], &DIAG_SCAN_4X4[..], "4x4 diag");
+        assert_eq!(&build_coeff_scan(3, 0)[..], &ZIGZAG[..], "8x8 diag");
+        assert_eq!(&build_coeff_scan(4, 0)[..], &ZIGZAG_16X16[..], "16x16 diag");
+    }
+    #[test]
+    fn scan_idx_selection() {
+        assert_eq!(scan_idx_for(0, 3, true, false), 0); // PLANAR diag
+        assert_eq!(scan_idx_for(6, 3, true, false), 2); // mode 6 vertical (8x8 luma)
+        assert_eq!(scan_idx_for(26, 3, true, false), 1); // mode 26 horizontal
+        assert_eq!(scan_idx_for(6, 4, true, false), 0); // 16x16 always diagonal
+        assert_eq!(scan_idx_for(26, 2, false, false), 1); // 4x4 chroma mode-dependent
+        assert_eq!(scan_idx_for(6, 3, false, false), 0); // 8x8 chroma non-444: diagonal
+        assert_eq!(scan_idx_for(6, 3, false, true), 2); // 8x8 chroma 4:4:4: mode-dependent
+    }
+}

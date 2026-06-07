@@ -585,6 +585,9 @@ fn build_idr_slice(
     // Per-8×8-block quadtree depth (2 = covered by a 16×16 CU, 3 = an 8×8 CU);
     // drives the 16-level split_cu_flag context (depends on neighbour depths).
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
+    // Per-8×8-block luma intra mode (for neighbour MPM derivation).
+    let blk_stride = w / 8;
+    let mut mode_map = vec![0u8; (w / 8) * (h / 8)];
 
     // Padded reconstruction buffers (prediction uses coded dimensions). Monochrome
     // has no chroma planes.
@@ -707,6 +710,8 @@ fn build_idr_slice(
                             16,
                             strides8,
                             qp,
+                            &mut mode_map,
+                            blk_stride,
                         );
                         let d_a = region_sse(
                             yuv,
@@ -740,6 +745,8 @@ fn build_idr_slice(
                                 8,
                                 strides8,
                                 qp,
+                                &mut mode_map,
+                                blk_stride,
                             );
                         }
                         let d_b = region_sse(
@@ -774,6 +781,8 @@ fn build_idr_slice(
                             16,
                             strides8,
                             qp,
+                            &mut mode_map,
+                            blk_stride,
                         );
                         for br in 0..2 {
                             for bc in 0..2 {
@@ -798,6 +807,8 @@ fn build_idr_slice(
                                 8,
                                 strides8,
                                 qp,
+                                &mut mode_map,
+                                blk_stride,
                             );
                         }
                         for br in 0..2 {
@@ -877,6 +888,59 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
 #[allow(clippy::too_many_arguments)]
 /// Build the 3-entry MPM candidate list from left (A) and above (B) modes,
 /// per HEVC §8.4.2 (fillIntraPredModeCandidates).
+/// Sum of absolute 4×4 Hadamard-transformed differences over an N×N block —
+/// the standard fast distortion proxy for intra mode decision (correlates with
+/// post-transform coded cost far better than raw SAD).
+fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
+    let mut total = 0u32;
+    let mut d = [0i32; 16];
+    for by in (0..n).step_by(4) {
+        for bx in (0..n).step_by(4) {
+            for r in 0..4 {
+                for c in 0..4 {
+                    let i = (by + r) * n + (bx + c);
+                    d[r * 4 + c] = orig[i] as i32 - pred[i] as i32;
+                }
+            }
+            // rows
+            for r in 0..4 {
+                let o = r * 4;
+                let a0 = d[o] + d[o + 2];
+                let a1 = d[o + 1] + d[o + 3];
+                let a2 = d[o] - d[o + 2];
+                let a3 = d[o + 1] - d[o + 3];
+                d[o] = a0 + a1;
+                d[o + 1] = a0 - a1;
+                d[o + 2] = a2 + a3;
+                d[o + 3] = a2 - a3;
+            }
+            // cols
+            for c in 0..4 {
+                let a0 = d[c] + d[8 + c];
+                let a1 = d[4 + c] + d[12 + c];
+                let a2 = d[c] - d[8 + c];
+                let a3 = d[4 + c] - d[12 + c];
+                d[c] = a0 + a1;
+                d[4 + c] = a0 - a1;
+                d[8 + c] = a2 + a3;
+                d[12 + c] = a2 - a3;
+            }
+            let mut s = 0u32;
+            for &v in d.iter() {
+                s += v.unsigned_abs();
+            }
+            total += (s + 1) / 2;
+        }
+    }
+    total
+}
+
+/// HEVC Table 8-3: luma→chroma intra mode mapping for 4:2:2 (DM_CHROMA).
+const MODE_422_MAP: [u8; 35] = [
+    0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25,
+    26, 27, 27, 28, 28, 29, 29, 30, 31,
+];
+
 fn mpm_list(cand_a: u8, cand_b: u8) -> [u8; 3] {
     const PLANAR: u8 = 0;
     const DC: u8 = 1;
@@ -1003,6 +1067,8 @@ fn encode_cu(
     rec: &mut CuRecPlanes<'_>,
     geo: &CuGeometry,
     par: &CuParams,
+    mode_map: &mut [u8],
+    blk_stride: usize,
 ) {
     // destructure so the rest of the body is unchanged
     let CuGeometry {
@@ -1051,12 +1117,32 @@ fn encode_cu(
         0
     };
 
-    // ── Luma intra prediction ───────────────────────────────────────────────
-    // Always use PLANAR. With PLANAR everywhere, every block's neighbours are
-    // PLANAR (or unavailable→treated as DC), so the spec MPM derivation always
-    // yields candidate list [PLANAR, DC, VERTICAL] with PLANAR at index 0. That
-    // makes mpm_idx = 0 correct for every block, independent of position — no
-    // neighbour-mode tracking needed and no risk of an MPM-index/scan mismatch.
+    // ── Luma intra prediction + mode decision ────────────────────────────────
+    const PLANAR: u8 = 0;
+    const DC: u8 = 1;
+    // MPM candidates from neighbour modes (HEVC §8.4.2): candA = left, candB =
+    // above (DC if unavailable or in a different CTB row). Modes come from the
+    // per-block mode map written by previously coded CUs.
+    let ctb = 64usize;
+    let avail_left =
+        lu_col > 0 && is_block_decoded(lu_row, lu_col - 1, lu_row, lu_col, ctb, yw_stride);
+    let above_in_same_ctb = lu_row > 0 && ((lu_row - 1) >= (lu_row / ctb) * ctb);
+    let avail_above = lu_row > 0
+        && above_in_same_ctb
+        && is_block_decoded(lu_row - 1, lu_col, lu_row, lu_col, ctb, yw_stride);
+    let mode_at = |r: usize, c: usize| mode_map[(r / 8) * blk_stride + c / 8];
+    let cand_a = if avail_left {
+        mode_at(lu_row, lu_col - 1)
+    } else {
+        DC
+    };
+    let cand_b = if avail_above {
+        mode_at(lu_row - 1, lu_col)
+    } else {
+        DC
+    };
+    let mpm = mpm_list(cand_a, cand_b);
+
     let (yc0, ya, yl) = intra::get_reference_samples(
         rec_y,
         yw_stride,
@@ -1068,44 +1154,41 @@ fn encode_cu(
         yw_stride / 64,
         neutral,
     );
-    // Luma 8×8 PLANAR uses the smoothed ([1 2 1]/4) reference (HEVC §8.4.4.2.3).
-    let (yaf, ylf) = intra::filter_references(yc0, &ya, &yl, lu);
-    let y_pred = intra::predict_planar(&yaf, &ylf, lu);
+
+    // Rough mode decision: rank all 35 modes by SATD(orig − pred) + λ_m·mode_bits
+    // and keep the cheapest. λ_m ≈ √λ matches the SATD (≈√SSE) domain.
+    let y_orig_rmd = extract_block_dyn(src_y, src_yw, src_yh, lu_row, lu_col, lu);
+    let lambda = 0.57_f64 * 2f64.powf((qp_slice as f64 - 12.0) / 3.0);
+    let lambda_mode = lambda.sqrt();
+    let mut best_mode = PLANAR;
+    let mut best_cost = f64::INFINITY;
+    for mode in 0u8..35 {
+        let pred = intra::predict_mode(mode, yc0, &ya, &yl, lu, true, max_val as i32);
+        let satd = satd_block(&y_orig_rmd, &pred, lu) as f64;
+        let mode_bits = if let Some(i) = mpm.iter().position(|&m| m == mode) {
+            (1 + i + 1) as f64 // prev_flag=1 + mpm_idx unary
+        } else {
+            6.0 // prev_flag=0 + 5-bit rem
+        };
+        let cost = satd + lambda_mode * mode_bits;
+        if cost < best_cost {
+            best_cost = cost;
+            best_mode = mode;
+        }
+    }
+    let luma_mode = best_mode;
+    let y_pred = intra::predict_mode(luma_mode, yc0, &ya, &yl, lu, true, max_val as i32);
 
     // ── part_mode ──────────────────────────────────────────────────────────
-    // part_mode is present only when the CU equals the SPS minimum luma CB size
-    // (log2_min=3 → 8×8). For a larger CU (16×16) it is absent and PART_2Nx2N is
-    // inferred. We always use PART_2Nx2N → single context bin = 1 when present.
+    // Present only when the CU equals the SPS minimum luma CB (8×8); we always
+    // use PART_2Nx2N → single context bin = 1 when present.
     if lu == 8 {
         enc.encode_bin(1, &mut ictx.part_mode);
     }
     let _ = &ictx.part_mode;
 
-    // ── Luma intra pred mode syntax (prev_intra_luma_pred_flag + mpm_idx) ──
-    // Every block uses PLANAR (mode 0). The MPM candidate list depends on the
-    // neighbour-derived candidates A (left) and B (above) per HEVC §8.4.2, so
-    // PLANAR is not always at mpm_idx 0 — we must locate it in the real list.
-    //
-    // candA: DC if left neighbour unavailable, else its mode (PLANAR here).
-    // candB: DC if above unavailable OR above lies in a different CTB row, else
-    //        its mode (PLANAR here).
-    let ctb = 64usize;
-    let avail_left =
-        lu_col > 0 && is_block_decoded(lu_row, lu_col - 1, lu_row, lu_col, ctb, yw_stride);
-    let above_in_same_ctb = lu_row > 0 && ((lu_row - 1) >= (lu_row / ctb) * ctb);
-    let avail_above = lu_row > 0
-        && above_in_same_ctb
-        && is_block_decoded(lu_row - 1, lu_col, lu_row, lu_col, ctb, yw_stride);
-    // All decoded neighbours are PLANAR (0); unavailable/cross-CTB → DC (1).
-    const PLANAR: u8 = 0;
-    const DC: u8 = 1;
-    let cand_a = if avail_left { PLANAR } else { DC };
-    let cand_b = if avail_above { PLANAR } else { DC };
-    let mpm = mpm_list(cand_a, cand_b);
-    let planar_idx = mpm.iter().position(|&m| m == PLANAR);
-
-    if let Some(idx) = planar_idx {
-        // PLANAR is in the MPM list: prev_flag=1, then mpm_idx (truncated unary, cMax 2).
+    // ── Luma intra pred mode syntax ──────────────────────────────────────────
+    if let Some(idx) = mpm.iter().position(|&m| m == luma_mode) {
         enc.encode_bin(1, &mut ictx.prev_intra_luma_pred_flag);
         // mpm_idx TR(cMax=2) bypass: 0→"0", 1→"10", 2→"11".
         match idx {
@@ -1122,25 +1205,36 @@ fn encode_cu(
             }
         }
     } else {
-        // PLANAR not an MPM (cannot happen here since one cand is always DC and
-        // the list always contains PLANAR), fall back to rem_intra coding.
         enc.encode_bin(0, &mut ictx.prev_intra_luma_pred_flag);
-        // rem_intra_luma_pred_mode: 5-bit FL of PLANAR after removing MPMs.
-        let mut sorted = mpm;
-        sorted.sort_unstable();
-        let mut rem = PLANAR as i32;
-        for &m in sorted.iter() {
-            if (m as i32) <= rem {
-                rem += 1;
+        // rem_intra_luma_pred_mode (5-bit FL). The decoder reconstructs the mode
+        // by adding 1 for each sorted MPM <= the running value, so the inverse is
+        // rem = luma_mode − (number of MPM candidates strictly less than it).
+        let mut rem = luma_mode as i32;
+        for &m in mpm.iter() {
+            if (m as i32) < luma_mode as i32 {
+                rem -= 1;
             }
         }
         for i in (0..5).rev() {
             enc.encode_bypass(((rem >> i) & 1) as u8);
         }
     }
+
+    // Record this CU's luma mode for neighbours' MPM derivation.
+    for br in 0..(lu / 8) {
+        for bc in 0..(lu / 8) {
+            mode_map[((lu_row / 8) + br) * blk_stride + (lu_col / 8) + bc] = luma_mode;
+        }
+    }
+
+    // Chroma mode = luma mode (DM_CHROMA), with the 4:2:2 remap (HEVC Table 8-3).
+    let chroma_mode = if chroma.sub_w() == 2 && chroma.sub_h() == 1 {
+        MODE_422_MAP[luma_mode as usize]
+    } else {
+        luma_mode
+    };
+
     // ── Chroma intra pred mode (DM_CHROMA → single '0' bin) ──────────────
-    // Present only when ChromaArrayType != 0 (HEVC §7.3.8.5). DM_CHROMA means chroma
-    // uses the luma mode = PLANAR, so we predict chroma with PLANAR.
     if !chroma.is_monochrome() {
         enc.encode_bin(0, &mut ictx.intra_chroma_pred_mode);
     }
@@ -1159,12 +1253,12 @@ fn encode_cu(
     // LU=16 in 4:2:0 it gives an 8×8 chroma TB.
     let ctb = lu / sub_w; // chroma TB side (4, or 8 for 16×16-luma 4:2:0)
     let log2_ctb = ctb.trailing_zeros(); // 2 or 3
-    // Diagonal scan for this chroma TB size (4×4 or 8×8).
-    let chroma_scan: &[(usize, usize)] = if ctb == 4 {
-        &dct::DIAG_SCAN_4X4
-    } else {
-        &dct::ZIGZAG
-    };
+    // Mode-dependent scan for chroma TBs: 4×4 chroma uses vertical/horizontal for
+    // chroma modes 6..=14 / 22..=30 (else diagonal); 8×8 chroma (4:4:4) is always
+    // diagonal. Must match the scan_idx passed to encode_residual for chroma.
+    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
+    let chroma_tb_scan_idx = dct::scan_idx_for(chroma_mode, log2_ctb, false, is_444);
+    let chroma_scan: &[(usize, usize)] = dct::coeff_scan(log2_ctb, chroma_tb_scan_idx);
 
     #[derive(Clone, Copy)]
     struct ChromaTb {
@@ -1183,11 +1277,9 @@ fn encode_cu(
     }; 2];
     for (t, tbs) in tbs[..n_chroma_tb].iter_mut().enumerate() {
         let sub_ch_row = ch_row + t * ctb;
-        // Predict this chroma TB (PLANAR, DM_CHROMA). Availability follows the luma
-        // decode order; a lower stacked TB sees the reconstructed upper TB.
-        // For 4:4:4 (ChromaArrayType==3) the 8×8 chroma reference is smoothed with the
-        // [1 2 1]/4 filter exactly like luma (HEVC §8.4.4.2.3); 4×4 chroma is not.
-        let filt = ctb > 4; // true only for 4:4:4 8×8 chroma
+        // Predict this chroma TB (DM_CHROMA → chroma_mode). 4:4:4 (8×8) smooths
+        // references like luma when the mode calls for it; 4:2:0/4:2:2 (4×4) do not.
+        let filt = ctb > 4 && intra::should_filter_refs(chroma_mode, ctb);
         let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
             rec_cb,
             rec_cr,
@@ -1205,18 +1297,31 @@ fn encode_cu(
             lu_col,
             neutral,
         );
+        // When chroma references are smoothed (4:4:4, 8×8), libde265 filters the
+        // corner too (pF[0] = (above[0]+2·corner+left[0]+2)>>2), so pass the
+        // filtered corner — matching the luma path.
         let (baf, blf) = if filt {
             intra::filter_references(bc0, &ba, &bl, ctb)
         } else {
             (ba, bl)
         };
-        let cb_pred = intra::predict_planar(&baf, &blf, ctb);
+        let bcf = if filt {
+            ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16
+        } else {
+            bc0
+        };
+        let cb_pred = intra::predict_chroma_tb(chroma_mode, bcf, &baf, &blf, ctb, max_val as i32);
         let (raf, rlf) = if filt {
             intra::filter_references(rc0, &ra, &rl, ctb)
         } else {
             (ra, rl)
         };
-        let cr_pred = intra::predict_planar(&raf, &rlf, ctb);
+        let rcf = if filt {
+            ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16
+        } else {
+            rc0
+        };
+        let cr_pred = intra::predict_chroma_tb(chroma_mode, rcf, &raf, &rlf, ctb, max_val as i32);
         let b_orig = extract_block_dyn(src_cb, src_cw, src_ch, sub_ch_row, ch_col, ctb);
         let r_orig = extract_block_dyn(src_cr, src_cw, src_ch, sub_ch_row, ch_col, ctb);
         let n_ch = ctb * ctb;
@@ -1292,13 +1397,12 @@ fn encode_cu(
     let y_res_i: Vec<i32> = y_res[..lu * lu].iter().map(|&v| v as i32).collect();
     let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, lu, bit_depth.bits());
     let y_level = crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()); // row-major levels
-    // Reorder row-major levels into HEVC diagonal scan order for residual_coding.
-    // 16×16 uses the sub-block-major ZIGZAG_16X16; 8×8 uses ZIGZAG.
-    let (luma_scan, luma_log2_ts): (&[(usize, usize)], u32) = if lu == 16 {
-        (&dct::ZIGZAG_16X16[..], 4)
-    } else {
-        (&dct::ZIGZAG[..], 3)
-    };
+    // Reorder row-major levels into the mode-dependent scan for residual_coding.
+    // 8×8 luma uses a vertical/horizontal scan for modes 6..=14 / 22..=30 (else
+    // diagonal); 16×16 is always diagonal (HEVC §6.5).
+    let luma_log2_ts: u32 = if lu == 16 { 4 } else { 3 };
+    let luma_scan_idx = dct::scan_idx_for(luma_mode, luma_log2_ts, true, false);
+    let luma_scan = dct::coeff_scan(luma_log2_ts, luma_scan_idx);
     let y_zigzag: Vec<i16> = luma_scan
         .iter()
         .map(|&(r, c)| y_level[r * lu + c])
@@ -1324,16 +1428,17 @@ fn encode_cu(
     // Order: luma, then all Cb chroma TBs, then all Cr chroma TBs (component-major).
     // Chroma TB size is log2_ctb (2 for 4:2:0/4:2:2, 3 for 4:4:4).
     if y_nz {
-        encode_residual(enc, ctx, &y_zigzag, luma_log2_ts, true);
+        encode_residual(enc, ctx, &y_zigzag, luma_log2_ts, true, luma_scan_idx);
     }
+    let chroma_scan_idx = chroma_tb_scan_idx;
     for t in &tbs[..n_chroma_tb] {
         if t.cb_nz {
-            encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false);
+            encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false, chroma_scan_idx);
         }
     }
     for t in &tbs[..n_chroma_tb] {
         if t.cr_nz {
-            encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false);
+            encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false, chroma_scan_idx);
         }
     }
 
@@ -1370,6 +1475,8 @@ fn code_one_cu(
     lu: usize,
     strides: (usize, usize, usize, usize, usize, usize, usize, usize),
     qp: u8,
+    mode_map: &mut [u8],
+    blk_stride: usize,
 ) {
     let (w, src_yw, src_yh, cw, src_cw, src_ch, sub_w, sub_h) = strides;
     let ch_row = lu_row / sub_h;
@@ -1402,7 +1509,7 @@ fn code_one_cu(
         bit_depth: yuv.bit_depth,
         lu,
     };
-    encode_cu(cab, ctx, ictx, &src, &mut rec, &geo, &par);
+    encode_cu(cab, ctx, ictx, &src, &mut rec, &geo, &par, mode_map, blk_stride);
 }
 
 /// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and

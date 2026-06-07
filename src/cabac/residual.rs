@@ -67,9 +67,14 @@ pub(crate) fn encode_residual(
     coeffs: &[i16],
     log2_ts: u32,
     is_luma: bool,
+    scan_idx: u8,
 ) {
     let n_coeffs = (1usize << log2_ts) * (1usize << log2_ts);
     debug_assert!(coeffs.len() >= n_coeffs);
+
+    // Mode-dependent scan (diagonal/horizontal/vertical). `coeffs` is already in
+    // this scan order; `scan[p]` maps a scan position back to (row, col).
+    let scan = crate::dct::coeff_scan(log2_ts, scan_idx);
 
     let last_scan_pos = match coeffs[..n_coeffs].iter().rposition(|&c| c != 0) {
         Some(p) => p,
@@ -77,20 +82,22 @@ pub(crate) fn encode_residual(
     };
 
     // (row, col) of the last significant coefficient in the TU.
-    let (last_row, last_col) = ZIGZAG_LOOKUP(last_scan_pos, log2_ts);
-    encode_last_sig(enc, ctx, last_col as u32, last_row as u32, log2_ts, is_luma);
+    let (last_row, last_col) = scan[last_scan_pos];
+    // For the vertical scan the last-position coordinates are transmitted swapped
+    // (HEVC §7.3.8.11). encode_last_sig takes (x, y) = (col, row).
+    if scan_idx == 2 {
+        encode_last_sig(enc, ctx, last_row as u32, last_col as u32, log2_ts, is_luma);
+    } else {
+        encode_last_sig(enc, ctx, last_col as u32, last_row as u32, log2_ts, is_luma);
+    }
 
     let tu_side = 1usize << log2_ts; // 8 or 4
     let sb_side = (tu_side / 4).max(1); // sub-blocks per side (2 or 1)
     let num_sb = sb_side * sb_side; // 4 or 1
     let last_sb = last_scan_pos / 16;
 
-    // Sub-block diagonal scan over the sb_side×sb_side grid (matches coeff layout).
-    let sb_scan: &[(usize, usize)] = match sb_side {
-        4 => &SB_DIAG_4X4,
-        2 => &SB_DIAG_2X2,
-        _ => &SB_DIAG_1X1,
-    };
+    // Sub-block scan over the sb_side×sb_side grid (same scanIdx as coefficients).
+    let sb_scan = crate::dct::sb_scan_for(log2_ts, scan_idx);
 
     // coded_sub_block_neighbors[idx] holds the 2-bit prev_csbf code for each
     // sub-block: bit0 (=1) means the sub-block to the RIGHT is coded, bit1 (=2)
@@ -100,7 +107,7 @@ pub(crate) fn encode_residual(
 
     // Helper: TU-position (col,row) for an absolute scan position.
     let pos_of = |abs_pos: usize| -> (usize, usize) {
-        let (r, c) = ZIGZAG_LOOKUP(abs_pos, log2_ts);
+        let (r, c) = scan[abs_pos];
         (c, r) // (xc, yc)
     };
 
@@ -186,7 +193,7 @@ pub(crate) fn encode_residual(
             }
 
             let (xc, yc) = pos_of(abs_pos);
-            let ci = sig_coeff_ctx(xc, yc, prev_csbf, log2_ts, 0 /*diag*/, is_luma)
+            let ci = sig_coeff_ctx(xc, yc, prev_csbf, log2_ts, scan_idx, is_luma)
                 .min(ctx.sig_coeff_flag.len() - 1);
             let is_sig = (coeffs[abs_pos] != 0) as u8;
             enc.encode_bin(is_sig, &mut ctx.sig_coeff_flag[ci]);
@@ -209,29 +216,6 @@ pub(crate) fn encode_residual(
             is_luma,
             &mut level_state,
         );
-    }
-}
-
-/// Sub-block diagonal scan for a 2×2 grid of 4×4 sub-blocks (an 8×8 TU).
-/// Index = sub-block number used in coeffs[sb*16+..]; value = (sbx, sby).
-static SB_DIAG_2X2: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-/// Sub-block diagonal scan for a 4×4 grid of 4×4 sub-blocks (a 16×16 TU), `(sbx, sby)`.
-#[rustfmt::skip]
-static SB_DIAG_4X4: [(usize, usize); 16] = [
-    (0,0),(0,1),(1,0),(0,2),(1,1),(2,0),(0,3),(1,2),
-    (2,1),(3,0),(1,3),(2,2),(3,1),(2,3),(3,2),(3,3),
-];
-/// Trivial 1×1 grid (a 4×4 TU).
-const SB_DIAG_1X1: [(usize, usize); 1] = [(0, 0)];
-
-/// Look up (row, col) for a scan position, given the TU size.
-#[allow(non_snake_case)]
-fn ZIGZAG_LOOKUP(scan_pos: usize, log2_ts: u32) -> (usize, usize) {
-    match log2_ts {
-        2 => crate::dct::DIAG_SCAN_4X4[scan_pos],
-        3 => crate::dct::ZIGZAG[scan_pos],
-        4 => crate::dct::ZIGZAG_16X16[scan_pos],
-        _ => panic!("unsupported transform size log2={log2_ts}"),
     }
 }
 
@@ -559,7 +543,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 8)], 64);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -570,7 +554,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 5)], 16);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 2, false);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 2, false, 0);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -581,7 +565,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 12), (1, -3), (2, 1), (8, 5)], 64);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -592,7 +576,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = vec![0i16; 64];
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(out.len() < 4); // only the terminate flush
