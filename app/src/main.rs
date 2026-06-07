@@ -33,11 +33,11 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/aak.jpg").unwrap().to_rgba16();
-    let arr = img.iter().map(|&x| x >> 6).collect::<Vec<_>>();
+    let img = image::open("./assets/aak.jpg").unwrap().to_rgb8();
+    let arr = img.to_vec(); //.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
-    let data = hpvca::encode_rgba10_with_alpha(
+    let data = hpvca::encode_rgb(
         &arr,
         img.width(),
         img.height(),

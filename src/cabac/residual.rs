@@ -86,10 +86,10 @@ pub(crate) fn encode_residual(
     let last_sb = last_scan_pos / 16;
 
     // Sub-block diagonal scan over the sb_side×sb_side grid (matches coeff layout).
-    let sb_scan: &[(usize, usize)] = if sb_side == 2 {
-        &SB_DIAG_2X2
-    } else {
-        &SB_DIAG_1X1
+    let sb_scan: &[(usize, usize)] = match sb_side {
+        4 => &SB_DIAG_4X4,
+        2 => &SB_DIAG_2X2,
+        _ => &SB_DIAG_1X1,
     };
 
     // coded_sub_block_neighbors[idx] holds the 2-bit prev_csbf code for each
@@ -215,16 +215,23 @@ pub(crate) fn encode_residual(
 /// Sub-block diagonal scan for a 2×2 grid of 4×4 sub-blocks (an 8×8 TU).
 /// Index = sub-block number used in coeffs[sb*16+..]; value = (sbx, sby).
 static SB_DIAG_2X2: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+/// Sub-block diagonal scan for a 4×4 grid of 4×4 sub-blocks (a 16×16 TU), `(sbx, sby)`.
+#[rustfmt::skip]
+static SB_DIAG_4X4: [(usize, usize); 16] = [
+    (0,0),(0,1),(1,0),(0,2),(1,1),(2,0),(0,3),(1,2),
+    (2,1),(3,0),(1,3),(2,2),(3,1),(2,3),(3,2),(3,3),
+];
 /// Trivial 1×1 grid (a 4×4 TU).
 const SB_DIAG_1X1: [(usize, usize); 1] = [(0, 0)];
 
 /// Look up (row, col) for a scan position, given the TU size.
 #[allow(non_snake_case)]
 fn ZIGZAG_LOOKUP(scan_pos: usize, log2_ts: u32) -> (usize, usize) {
-    if log2_ts == 2 {
-        crate::dct::DIAG_SCAN_4X4[scan_pos]
-    } else {
-        crate::dct::ZIGZAG[scan_pos]
+    match log2_ts {
+        2 => crate::dct::DIAG_SCAN_4X4[scan_pos],
+        3 => crate::dct::ZIGZAG[scan_pos],
+        4 => crate::dct::ZIGZAG_16X16[scan_pos],
+        _ => panic!("unsupported transform size log2={log2_ts}"),
     }
 }
 

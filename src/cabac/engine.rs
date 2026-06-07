@@ -117,6 +117,7 @@ impl CtxModel {
 /// the H.264/HEVC reference software. This produces a bitstream exactly
 /// compatible with the HEVC arithmetic decoder (verified by an independent
 /// decoder over tens of thousands of random symbol sequences).
+#[derive(Clone)]
 pub(crate) struct CabacEncoder {
     low: u32,              // 10-bit working low register
     m_range: u32,          // current range [256, 510]
@@ -256,6 +257,14 @@ impl CabacEncoder {
     }
 
     /// Finish encoding and return the byte-aligned output buffer.
+    /// Coded length in bits if the stream were terminated here (clones + flushes
+    /// a copy). RDO differences two of these for a CU's true marginal coded cost.
+    pub(crate) fn flushed_bits(&self) -> u64 {
+        let mut probe = self.clone();
+        probe.encode_terminate(1); // resolves `low` + outstanding into output/bit_buffer
+        (probe.output.len() as u64) * 8 + probe.bit_count as u64
+    }
+
     pub(crate) fn finish(mut self) -> Vec<u8> {
         // Byte-align: pad the partial byte with zeros.
         if self.bit_count > 0 {

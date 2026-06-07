@@ -31,6 +31,7 @@ use super::engine::CtxModel;
 
 /// All context models for I-slice residual coding, keyed by ffmpeg's
 /// init_values[0] (I-slice column).
+#[derive(Clone)]
 pub(crate) struct ContextSet {
     #[allow(unused)]
     pub(crate) qp: u8,
@@ -145,6 +146,7 @@ impl ContextSet {
 /// Intra-mode contexts (prev_intra_luma_pred_flag, intra_chroma_pred_mode).
 /// I-slice (initType=0) init values from libde265:
 ///   part_mode = 184, prev_intra_luma_pred_flag = 184, intra_chroma_pred_mode = 63
+#[derive(Clone)]
 pub(crate) struct IntraModeContexts {
     pub(crate) part_mode: CtxModel,
     pub(crate) prev_intra_luma_pred_flag: CtxModel,

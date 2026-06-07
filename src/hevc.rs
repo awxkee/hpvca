@@ -539,6 +539,9 @@ fn build_idr_slice(
     // by sub_w horizontally and sub_h vertically (4:2:0 → /2,/2; 4:2:2 → /2,/1).
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
+    // Per 16×16 node, choose between one 16×16 CU and four 8×8 CUs by RD cost.
+    // Offered for 4:2:0 only (the validated chroma TB → 8×8 path).
+    let rd16 = yuv.chroma == crate::fmt::ChromaFormat::Yuv420;
     let w = ((width + 63) & !63) as usize;
     let h = ((height + 63) & !63) as usize;
     let cw = w / sub_w;
@@ -577,6 +580,11 @@ fn build_idr_slice(
     let mut cab = CabacEncoder::new();
     let mut ctx = ContextSet::init_islice(qp);
     let mut ictx = IntraModeContexts::init_islice(qp);
+    // HM-style intra Lagrange multiplier for J = SSE + λ·R (R in bits).
+    let lambda = 0.57_f64 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    // Per-8×8-block quadtree depth (2 = covered by a 16×16 CU, 3 = an 8×8 CU);
+    // drives the 16-level split_cu_flag context (depends on neighbour depths).
+    let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
 
     // Padded reconstruction buffers (prediction uses coded dimensions). Monochrome
     // has no chroma planes.
@@ -660,50 +668,145 @@ fn build_idr_slice(
                     } else {
                         0
                     };
-                    cab.encode_bin(1, &mut ctx.split_cu_flag[cl2 + ca2]);
+                    let _ = (cl2, ca2, l2_ch_r, l2_ch_c, cu_size_c); // superseded by RD + depth ctx
+                    // split_cu_flag ctxInc = (left CU deeper than this depth-2 node)
+                    // + (above CU deeper), read from the per-block depth map.
+                    let bx = w / cu_size_y;
+                    let cond_l = l2_lu_c > 0
+                        && cu_depth[(l2_lu_r / cu_size_y) * bx + (l2_lu_c - 1) / cu_size_y] > 2;
+                    let cond_a = l2_lu_r > 0
+                        && cu_depth[((l2_lu_r - 1) / cu_size_y) * bx + l2_lu_c / cu_size_y] > 2;
+                    let split_ctx = cond_l as usize + cond_a as usize;
 
-                    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                        let lu_row = l2_lu_r + dy * cu_size_y;
-                        let lu_col = l2_lu_c + dx * cu_size_y;
-                        // Chroma coordinates derive from luma via the subsampling
-                        // factors: column always /sub_w (=2); row /sub_h (4:2:0 → /2,
-                        // 4:2:2 → /1, i.e. full-height chroma).
-                        let ch_row = lu_row / sub_h;
-                        let ch_col = lu_col / sub_w;
-                        let _ = (l2_ch_r, l2_ch_c, cu_size_c); // superseded by derivation
+                    let strides8 = (w, src_yw, src_yh, cw, src_cw, src_ch, sub_w, sub_h);
+                    let sse_strides = (w, src_yw, src_yh, cw, src_cw, src_ch);
+                    let l2_ch_rr = l2_lu_r / sub_h;
+                    let l2_ch_cc = l2_lu_c / sub_w;
 
-                        let geo = CuGeometry {
-                            lu_row,
-                            lu_col,
-                            ch_row,
-                            ch_col,
-                            yw_stride: w,
-                            src_yh,
-                            cw_stride: cw,
-                            src_cw,
-                            src_ch,
-                        };
+                    // Choose 16×16 vs four 8×8 by RD cost J = SSE + λ·bits. Trials
+                    // run on cloned coder/context state; only the winner is committed.
+                    let mut chose_16 = false;
+                    if rd16 {
+                        let base_bits = cab.flushed_bits();
 
-                        let src = CuSrcPlanes {
-                            y: &yuv.y,
-                            cb: &yuv.cb,
-                            cr: &yuv.cr,
-                            src_yw,
-                        };
-
-                        let mut rec = CuRecPlanes {
-                            y: &mut rec_y,
-                            cb: &mut rec_cb,
-                            cr: &mut rec_cr,
-                        };
-
-                        let par = CuParams {
+                        // Trial A — single 16×16 CU.
+                        let mut pa = cab.clone();
+                        let mut ca = ctx.clone();
+                        let mut ia = ictx.clone();
+                        pa.encode_bin(0, &mut ca.split_cu_flag[split_ctx]);
+                        code_one_cu(
+                            &mut pa,
+                            &mut ca,
+                            &mut ia,
+                            yuv,
+                            &mut rec_y,
+                            &mut rec_cb,
+                            &mut rec_cr,
+                            l2_lu_r,
+                            l2_lu_c,
+                            16,
+                            strides8,
                             qp,
-                            chroma: yuv.chroma,
-                            bit_depth: yuv.bit_depth,
-                        };
+                        );
+                        let d_a = region_sse(
+                            yuv,
+                            &rec_y,
+                            &rec_cb,
+                            &rec_cr,
+                            l2_lu_r,
+                            l2_lu_c,
+                            l2_ch_rr,
+                            l2_ch_cc,
+                            sse_strides,
+                        );
+                        let bits_a = pa.flushed_bits().saturating_sub(base_bits) as f64;
 
-                        encode_cu(&mut cab, &mut ctx, &mut ictx, &src, &mut rec, &geo, &par);
+                        // Trial B — four 8×8 CUs.
+                        let mut pb = cab.clone();
+                        let mut cb2 = ctx.clone();
+                        let mut ib = ictx.clone();
+                        pb.encode_bin(1, &mut cb2.split_cu_flag[split_ctx]);
+                        for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                            code_one_cu(
+                                &mut pb,
+                                &mut cb2,
+                                &mut ib,
+                                yuv,
+                                &mut rec_y,
+                                &mut rec_cb,
+                                &mut rec_cr,
+                                l2_lu_r + dy * cu_size_y,
+                                l2_lu_c + dx * cu_size_y,
+                                8,
+                                strides8,
+                                qp,
+                            );
+                        }
+                        let d_b = region_sse(
+                            yuv,
+                            &rec_y,
+                            &rec_cb,
+                            &rec_cr,
+                            l2_lu_r,
+                            l2_lu_c,
+                            l2_ch_rr,
+                            l2_ch_cc,
+                            sse_strides,
+                        );
+                        let bits_b = pb.flushed_bits().saturating_sub(base_bits) as f64;
+
+                        chose_16 = d_a + lambda * bits_a <= d_b + lambda * bits_b;
+                    }
+
+                    // Commit the winner into the real bitstream + reconstruction.
+                    if chose_16 {
+                        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
+                        code_one_cu(
+                            &mut cab,
+                            &mut ctx,
+                            &mut ictx,
+                            yuv,
+                            &mut rec_y,
+                            &mut rec_cb,
+                            &mut rec_cr,
+                            l2_lu_r,
+                            l2_lu_c,
+                            16,
+                            strides8,
+                            qp,
+                        );
+                        for br in 0..2 {
+                            for bc in 0..2 {
+                                cu_depth[((l2_lu_r / cu_size_y) + br) * bx
+                                    + (l2_lu_c / cu_size_y)
+                                    + bc] = 2;
+                            }
+                        }
+                    } else {
+                        cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
+                        for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                            code_one_cu(
+                                &mut cab,
+                                &mut ctx,
+                                &mut ictx,
+                                yuv,
+                                &mut rec_y,
+                                &mut rec_cb,
+                                &mut rec_cr,
+                                l2_lu_r + dy * cu_size_y,
+                                l2_lu_c + dx * cu_size_y,
+                                8,
+                                strides8,
+                                qp,
+                            );
+                        }
+                        for br in 0..2 {
+                            for bc in 0..2 {
+                                cu_depth[((l2_lu_r / cu_size_y) + br) * bx
+                                    + (l2_lu_c / cu_size_y)
+                                    + bc] = 3;
+                            }
+                        }
                     }
                 }
             }
@@ -887,6 +990,9 @@ struct CuParams {
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+    /// Luma CU/TU size: 8 (the min CB) or 16. Drives part_mode presence, the
+    /// luma scan/transform size, and the chroma TB size.
+    lu: usize,
 }
 
 fn encode_cu(
@@ -925,8 +1031,8 @@ fn encode_cu(
         qp,
         chroma,
         bit_depth,
+        lu,
     } = *par;
-    const LU: usize = 8; // luma block size
     let neutral: u16 = bit_depth.neutral(); // 128 (8-bit) / 512 (10-bit)
     let max_val: u16 = bit_depth.max_val(); // 255 / 1023
     // HEVC §8.6.1: the decoder dequantizes at Qp' = Qp + QpBdOffset, where
@@ -957,19 +1063,22 @@ fn encode_cu(
         lu_row,
         lu_col,
         coded_yh,
-        LU,
+        lu,
         64,
         yw_stride / 64,
         neutral,
     );
     // Luma 8×8 PLANAR uses the smoothed ([1 2 1]/4) reference (HEVC §8.4.4.2.3).
-    let (yaf, ylf) = intra::filter_references(yc0, &ya, &yl, LU);
-    let y_pred = intra::predict_planar(&yaf, &ylf, LU);
+    let (yaf, ylf) = intra::filter_references(yc0, &ya, &yl, lu);
+    let y_pred = intra::predict_planar(&yaf, &ylf, lu);
 
     // ── part_mode ──────────────────────────────────────────────────────────
-    // Our 8×8 CU equals the SPS minimum luma CB size (log2_min=3), so the spec
-    // requires part_mode here. We always use PART_2Nx2N → single context bin = 1.
-    enc.encode_bin(1, &mut ictx.part_mode);
+    // part_mode is present only when the CU equals the SPS minimum luma CB size
+    // (log2_min=3 → 8×8). For a larger CU (16×16) it is absent and PART_2Nx2N is
+    // inferred. We always use PART_2Nx2N → single context bin = 1 when present.
+    if lu == 8 {
+        enc.encode_bin(1, &mut ictx.part_mode);
+    }
     let _ = &ictx.part_mode;
 
     // ── Luma intra pred mode syntax (prev_intra_luma_pred_flag + mpm_idx) ──
@@ -1045,7 +1154,10 @@ fn encode_cu(
     let sub_w = chroma.sub_w();
     let sub_h = chroma.sub_h();
     let luma_ctus_x = yw_stride / 64;
-    let ctb = chroma.chroma_tb_size(); // 4 or 8
+    // Chroma TB size derives from the luma CU size and subsampling: LU/sub_w.
+    // For LU=8 this reproduces chroma_tb_size() (4:2:0/4:2:2→4, 4:4:4→8); for
+    // LU=16 in 4:2:0 it gives an 8×8 chroma TB.
+    let ctb = lu / sub_w; // chroma TB side (4, or 8 for 16×16-luma 4:2:0)
     let log2_ctb = ctb.trailing_zeros(); // 2 or 3
     // Diagonal scan for this chroma TB size (4×4 or 8×8).
     let chroma_scan: &[(usize, usize)] = if ctb == 4 {
@@ -1170,16 +1282,26 @@ fn encode_cu(
         };
     }
 
-    // ── HEVC integer transform + quantize: luma 8×8 ───────────────────────
-    let y_orig = extract_block_n::<LU>(src_y, src_yw, src_yh, lu_row, lu_col);
-    let y_res = intra::compute_residual(&y_orig, &y_pred, LU);
-    let y_res_i: Vec<i32> = y_res.iter().map(|&v| v as i32).collect();
-    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, LU, bit_depth.bits());
-    let y_level = crate::hevc_transform::quantize(&y_tcoeff, LU, qp, bit_depth.bits()); // row-major levels
+    // ── HEVC integer transform + quantize: luma LU×LU ─────────────────────
+    // Const-generic extractor so the copy is specialized for each size.
+    let y_orig = match lu {
+        16 => extract_block_n::<16>(src_y, src_yw, src_yh, lu_row, lu_col),
+        _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
+    };
+    let y_res = intra::compute_residual(&y_orig, &y_pred, lu);
+    let y_res_i: Vec<i32> = y_res[..lu * lu].iter().map(|&v| v as i32).collect();
+    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res_i, lu, bit_depth.bits());
+    let y_level = crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()); // row-major levels
     // Reorder row-major levels into HEVC diagonal scan order for residual_coding.
-    let y_zigzag: Vec<i16> = dct::ZIGZAG
+    // 16×16 uses the sub-block-major ZIGZAG_16X16; 8×8 uses ZIGZAG.
+    let (luma_scan, luma_log2_ts): (&[(usize, usize)], u32) = if lu == 16 {
+        (&dct::ZIGZAG_16X16[..], 4)
+    } else {
+        (&dct::ZIGZAG[..], 3)
+    };
+    let y_zigzag: Vec<i16> = luma_scan
         .iter()
-        .map(|&(r, c)| y_level[r * LU + c])
+        .map(|&(r, c)| y_level[r * lu + c])
         .collect();
     let y_nz = y_zigzag.iter().any(|&x| x != 0);
 
@@ -1202,7 +1324,7 @@ fn encode_cu(
     // Order: luma, then all Cb chroma TBs, then all Cr chroma TBs (component-major).
     // Chroma TB size is log2_ctb (2 for 4:2:0/4:2:2, 3 for 4:4:4).
     if y_nz {
-        encode_residual(enc, ctx, &y_zigzag, 3, true);
+        encode_residual(enc, ctx, &y_zigzag, luma_log2_ts, true);
     }
     for t in &tbs[..n_chroma_tb] {
         if t.cb_nz {
@@ -1216,14 +1338,14 @@ fn encode_cu(
     }
 
     // ── Reconstruct luma (integer dequant + inverse transform) ─────────────
-    let y_dq = crate::hevc_transform::dequantize(&y_level, LU, qp, bit_depth.bits());
-    let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, LU, bit_depth.bits());
-    let y_rec = intra::reconstruct(&y_pred, &y_res_rec, LU, max_val);
-    for r in 0..LU {
-        for c in 0..LU {
+    let y_dq = crate::hevc_transform::dequantize(&y_level, lu, qp, bit_depth.bits());
+    let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, lu, bit_depth.bits());
+    let y_rec = intra::reconstruct(&y_pred, &y_res_rec, lu, max_val);
+    for r in 0..lu {
+        for c in 0..lu {
             let (row, col) = (lu_row + r, lu_col + c);
             if row < coded_yh && col < yw_stride {
-                rec_y[row * yw_stride + col] = y_rec[r * LU + c];
+                rec_y[row * yw_stride + col] = y_rec[r * lu + c];
             }
         }
     }
@@ -1231,15 +1353,109 @@ fn encode_cu(
     // above (so each stacked sub-TB could serve as the next one's intra reference).
 }
 
-/// Extract an N×N block from a plane (compile-time N via const generic).
+/// Encode one intra CU (luma side `lu` = 8 or 16) at (lu_row,lu_col) into the
+/// bitstream and reconstruction planes; chroma coords derive via subsampling.
+/// Shared by the RD trial and commit paths.
+#[allow(clippy::too_many_arguments)]
+fn code_one_cu(
+    cab: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    yuv: &Yuv,
+    rec_y: &mut [u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    lu_row: usize,
+    lu_col: usize,
+    lu: usize,
+    strides: (usize, usize, usize, usize, usize, usize, usize, usize),
+    qp: u8,
+) {
+    let (w, src_yw, src_yh, cw, src_cw, src_ch, sub_w, sub_h) = strides;
+    let ch_row = lu_row / sub_h;
+    let ch_col = lu_col / sub_w;
+    let geo = CuGeometry {
+        lu_row,
+        lu_col,
+        ch_row,
+        ch_col,
+        yw_stride: w,
+        src_yh,
+        cw_stride: cw,
+        src_cw,
+        src_ch,
+    };
+    let src = CuSrcPlanes {
+        y: &yuv.y,
+        cb: &yuv.cb,
+        cr: &yuv.cr,
+        src_yw,
+    };
+    let mut rec = CuRecPlanes {
+        y: rec_y,
+        cb: rec_cb,
+        cr: rec_cr,
+    };
+    let par = CuParams {
+        qp,
+        chroma: yuv.chroma,
+        bit_depth: yuv.bit_depth,
+        lu,
+    };
+    encode_cu(cab, ctx, ictx, &src, &mut rec, &geo, &par);
+}
+
+/// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and
+/// reconstruction over one 16×16-luma CU region, with the encoder's edge
+/// clamping for padded regions.
+#[allow(clippy::too_many_arguments)]
+fn region_sse(
+    yuv: &Yuv,
+    rec_y: &[u16],
+    rec_cb: &[u16],
+    rec_cr: &[u16],
+    lu_row: usize,
+    lu_col: usize,
+    ch_row: usize,
+    ch_col: usize,
+    strides: (usize, usize, usize, usize, usize, usize),
+) -> f64 {
+    let (w, src_yw, src_yh, cw, src_cw, src_ch) = strides;
+    let mut sse = 0f64;
+    for r in 0..16 {
+        let sy = (lu_row + r).min(src_yh - 1);
+        for c in 0..16 {
+            let sx = (lu_col + c).min(src_yw - 1);
+            let s = yuv.y[sy * src_yw + sx] as f64;
+            let d = rec_y[(lu_row + r) * w + (lu_col + c)] as f64;
+            sse += (s - d) * (s - d);
+        }
+    }
+    for r in 0..8 {
+        let sy = (ch_row + r).min(src_ch - 1);
+        for c in 0..8 {
+            let sx = (ch_col + c).min(src_cw - 1);
+            let sb = yuv.cb[sy * src_cw + sx] as f64;
+            let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as f64;
+            sse += (sb - db) * (sb - db);
+            let sr = yuv.cr[sy * src_cw + sx] as f64;
+            let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as f64;
+            sse += (sr - dr) * (sr - dr);
+        }
+    }
+    sse
+}
+
+/// Extract an N×N block from a plane (compile-time N, so the copy is specialized
+/// per size). Returns a fixed 256-entry buffer (N up to 16); first N×N written.
 fn extract_block_n<const N: usize>(
     plane: &[u16],
     src_w: usize,
     src_h: usize,
     row: usize,
     col: usize,
-) -> [u16; 64] {
-    let mut out = [128u16; 64];
+) -> [u16; 256] {
+    let mut out = [128u16; 256];
     for r in 0..N {
         for c in 0..N {
             out[r * N + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
@@ -1257,8 +1473,8 @@ fn extract_block_dyn(
     row: usize,
     col: usize,
     n: usize,
-) -> [u16; 64] {
-    let mut out = [128u16; 64];
+) -> [u16; 256] {
+    let mut out = [128u16; 256];
     for r in 0..n {
         for c in 0..n {
             out[r * n + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];

@@ -49,16 +49,41 @@ static T8: [[i32; 8]; 8] = [
     [18, -50, 75, -89, 89, -75, 50, -18],
 ];
 
+/// 16×16 HEVC transform matrix (spec Table 8-6).
+#[rustfmt::skip]
+static T16: [[i32; 16]; 16] = [
+    [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
+    [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90],
+    [89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89],
+    [87, 57, 9, -43, -80, -90, -70, -25, 25, 70, 90, 80, 43, -9, -57, -87],
+    [83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83],
+    [80, 9, -70, -87, -25, 57, 90, 43, -43, -90, -57, 25, 87, 70, -9, -80],
+    [75, -18, -89, -50, 50, 89, 18, -75, -75, 18, 89, 50, -50, -89, -18, 75],
+    [70, -43, -87, 9, 90, 25, -80, -57, 57, 80, -25, -90, -9, 87, 43, -70],
+    [64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64],
+    [57, -80, -25, 90, -9, -87, 43, 70, -70, -43, 87, 9, -90, 25, 80, -57],
+    [50, -89, 18, 75, -75, -18, 89, -50, -50, 89, -18, -75, 75, 18, -89, 50],
+    [43, -90, 57, 25, -87, 70, 9, -80, 80, -9, -70, 87, -25, -57, 90, -43],
+    [36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36],
+    [25, -70, 90, -80, 43, 9, -57, 87, -87, 57, -9, -43, 80, -90, 70, -25],
+    [18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18],
+    [9, -25, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 25, -9],
+];
+
 static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
+
+/// Largest supported transform: 16×16 → 256 coefficients per fixed buffer.
+const MAX_TB: usize = 256;
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 /// Forward integer transform of an N×N residual block (N = 4 or 8).
 /// Returns a fixed 64-entry buffer; only the first `n*n` entries are written.
-pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; 64] {
-    let mut out = [0i32; 64];
+pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+    let mut out = [0i32; MAX_TB];
     match n {
         4 => fwd_transform_n::<4>(res, &T4, bit_depth, &mut out),
         8 => fwd_transform_n::<8>(res, &T8, bit_depth, &mut out),
+        16 => fwd_transform_n::<16>(res, &T16, bit_depth, &mut out),
         _ => panic!("unsupported transform size {n}"),
     }
     out
@@ -69,7 +94,7 @@ fn fwd_transform_n<const N: usize>(
     res: &[i32],
     t: &[[i32; N]; N],
     bit_depth: u8,
-    out: &mut [i32; 64],
+    out: &mut [i32; MAX_TB],
 ) {
     let log2n = N.trailing_zeros() as i32;
     let bd = bit_depth as i32;
@@ -77,7 +102,7 @@ fn fwd_transform_n<const N: usize>(
     let add1 = if shift1 > 0 { 1i32 << (shift1 - 1) } else { 0 };
     // i32 throughout: products (|coeff|≤90 · |residual|≤4095) and the ≤N-term
     // sums stay well inside i32 for every supported bit depth.
-    let mut tmp = [0i32; 64]; // N*N <= 64
+    let mut tmp = [0i32; MAX_TB]; // N*N <= 256
     // pass 1 (rows of res): tmp[j*N+i] = (Σ_k T[i][k]·res[j*N+k]) >> shift1
     for (j, res_row) in res.as_chunks::<N>().0.iter().enumerate().take(N) {
         for (i, trow) in t.iter().enumerate() {
@@ -107,13 +132,13 @@ fn fwd_transform_n<const N: usize>(
 }
 
 /// Forward quantization: coeff → level. Returns a fixed 64-entry buffer.
-pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; 64] {
-    let log2n = if n == 8 { 3 } else { 2 } as i64;
+pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; MAX_TB] {
+    let log2n = n.trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let offset = 171i64 << (q_bits - 9); // intra
-    let mut out = [0i16; 64];
+    let mut out = [0i16; MAX_TB];
     for (o, &c) in out[..n * n].iter_mut().zip(coeff) {
         // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
         // overflows i32; keep this one multiply in i64.
@@ -126,15 +151,15 @@ pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; 
 }
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3). Fixed 64-entry buffer.
-pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; 64] {
-    let log2n = if n == 8 { 3 } else { 2 } as i64;
+pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
+    let log2n = (n.trailing_zeros()) as i64;
     let bd = bit_depth as i64;
     let bd_shift = bd + log2n - 5;
     let add = 1i64 << (bd_shift - 1);
     let scale = DEQUANT_SCALE[(qp % 6) as usize];
     let per = 1i64 << ((qp as i64) / 6);
     let factor = scale * per * 16;
-    let mut out = [0i32; 64];
+    let mut out = [0i32; MAX_TB];
     for (o, &l) in out[..n * n].iter_mut().zip(level) {
         *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
     }
@@ -142,11 +167,12 @@ pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32
 }
 
 /// Inverse integer transform (spec 8.6.4.2). Returns residual in a fixed buffer.
-pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; 64] {
-    let mut out = [0i32; 64];
+pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+    let mut out = [0i32; MAX_TB];
     match n {
         4 => inv_transform_n::<4>(coeff, &T4, bit_depth, &mut out),
         8 => inv_transform_n::<8>(coeff, &T8, bit_depth, &mut out),
+        16 => inv_transform_n::<16>(coeff, &T16, bit_depth, &mut out),
         _ => panic!("unsupported transform size {n}"),
     }
     out
@@ -157,7 +183,7 @@ fn inv_transform_n<const N: usize>(
     coeff: &[i32],
     t: &[[i32; N]; N],
     bit_depth: u8,
-    out: &mut [i32; 64],
+    out: &mut [i32; MAX_TB],
 ) {
     let bd = bit_depth as i32;
     let shift1 = 7i32;
@@ -168,7 +194,7 @@ fn inv_transform_n<const N: usize>(
     // i32 accumulation is exact (dequant clamps to ±32768); basis rows are read
     // contiguously and zero coefficients are skipped — residual blocks are
     // mostly zero, so the skip removes the bulk of the work.
-    let mut tmp = [0i32; 64];
+    let mut tmp = [0i32; MAX_TB];
     let mut acc = [0i32; N];
 
     // Stage 1 (columns): tmp[m*N+c] = clip( Σ_k T[k][m]·coeff[k*N+c] ) >> 7
@@ -206,5 +232,116 @@ fn inv_transform_n<const N: usize>(
         for m in 0..N {
             out[r * N + m] = (acc[m] + add2) >> shift2;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HEVC basis rows are *approximately* orthonormal: they're integer
+    /// approximations, so norms cluster tightly around the ideal N·64² and
+    /// off-diagonal correlations are small (tens–low hundreds), not zero. A
+    /// structurally wrong row (e.g. permuted magnitudes) produces an
+    /// off-diagonal dot orders of magnitude larger, which this catches.
+    fn check_orthogonal<const N: usize>(t: &[[i32; N]; N]) {
+        let ideal = (N as i64) * 64 * 64;
+        for (i, row) in t.iter().enumerate() {
+            let ni: i64 = row.iter().map(|&v| (v as i64) * (v as i64)).sum();
+            assert!(
+                (ni - ideal).abs() <= ideal / 500,
+                "row {i} norm {ni} too far from ideal {ideal}"
+            );
+            for j in (i + 1)..N {
+                let dot: i64 = (0..N).map(|k| (t[i][k] as i64) * (t[j][k] as i64)).sum();
+                assert!(
+                    dot.abs() < ideal / 50,
+                    "rows {i},{j} insufficiently orthogonal: dot={dot} (limit {})",
+                    ideal / 50
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t16_is_orthogonal() {
+        check_orthogonal(&T16);
+        check_orthogonal(&T8);
+        check_orthogonal(&T4);
+    }
+
+    /// A flat (constant) residual must transform to a DC-only coefficient block:
+    /// every AC coefficient is exactly zero. Strong structural check of the
+    /// matrix + row/column pass layout for each N.
+    fn flat_is_dc_only(n: usize) {
+        let c = 100i32;
+        let res = vec![c; n * n];
+        let coeff = fwd_transform(&res, n, 8);
+        assert_ne!(coeff[0], 0, "N={n}: DC should be non-zero");
+        for (i, &v) in coeff[..n * n].iter().enumerate().skip(1) {
+            assert_eq!(v, 0, "N={n}: AC coeff {i} should be zero, got {v}");
+        }
+    }
+
+    #[test]
+    fn flat_residual_dc_only() {
+        flat_is_dc_only(4);
+        flat_is_dc_only(8);
+        flat_is_dc_only(16);
+    }
+
+    /// Full pipeline residual → fwd → quant → dequant → inv reconstructs the
+    /// residual within the quantization error. At low QP the error is small;
+    /// a gross T16/scan/buffer bug would blow this far past tolerance.
+    fn roundtrip_bounded(n: usize, qp: u8, max_mean_abs: f64) {
+        // Smooth ramp + a mid-frequency component — exercises many coefficients.
+        let mut res = vec![0i32; n * n];
+        for r in 0..n {
+            for col in 0..n {
+                let v = 8 * (r as i32 + col as i32) + 20 * (((r + col) % 4) as i32) - 60;
+                res[r * n + col] = v;
+            }
+        }
+        let coeff = fwd_transform(&res, n, 8);
+        let level = quantize(&coeff[..n * n], n, qp, 8);
+        let dq = dequantize(&level[..n * n], n, qp, 8);
+        let rec = inv_transform(&dq[..n * n], n, 8);
+        let mean_abs: f64 = (0..n * n)
+            .map(|i| (res[i] - rec[i]).unsigned_abs() as f64)
+            .sum::<f64>()
+            / (n * n) as f64;
+        assert!(
+            mean_abs <= max_mean_abs,
+            "N={n} qp={qp}: mean|err|={mean_abs:.3} exceeds {max_mean_abs}"
+        );
+    }
+
+    #[test]
+    fn pipeline_roundtrip_low_qp() {
+        // Low QP → tight reconstruction for every size, including the new 16×16.
+        for &n in &[4usize, 8, 16] {
+            roundtrip_bounded(n, 4, 3.0);
+        }
+    }
+
+    #[test]
+    fn pipeline_roundtrip_scales_with_qp() {
+        // Error grows with QP but stays bounded; 16×16 must behave like 4/8.
+        for &n in &[4usize, 8, 16] {
+            roundtrip_bounded(n, 22, 12.0);
+        }
+    }
+
+    /// The 16×16 sub-block-major scan must be a permutation of all 256 positions.
+    #[test]
+    fn zigzag16_is_permutation() {
+        let mut seen = [false; 256];
+        for &(r, c) in crate::dct::ZIGZAG_16X16.iter() {
+            assert!(r < 16 && c < 16);
+            let idx = r * 16 + c;
+            assert!(!seen[idx], "duplicate scan position ({r},{c})");
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "scan does not cover all positions");
     }
 }

@@ -38,8 +38,8 @@
 /// `above[0..n]` = row above (above[0] is sample at x=0), `above[n]` = top-right.
 /// `left[0..n]`  = column left, `left[n]` = bottom-left.
 #[inline]
-pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 64] {
-    let mut pred = [0u16; 64];
+pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 256] {
+    let mut pred = [0u16; 256];
     let top_right = above[n] as i32;
     let bottom_left = left[n] as i32;
     let log2 = n.trailing_zeros();
@@ -66,16 +66,16 @@ pub(crate) fn filter_references(
     above: &[u16],
     left: &[u16],
     n: usize,
-) -> ([u16; 17], [u16; 17]) {
+) -> ([u16; 33], [u16; 33]) {
     // `above` and `left` have length 2n+1 (indices 0..2n). The HEVC [1 2 1]/4
     // filter (§8.4.4.2.3) is applied to every interior reference sample; only the
     // two extreme endpoints (corner and the farthest above-right / below-left,
     // index 2n) are left unfiltered. predict_planar reads indices 0..=n, so we
     // need filtered values at 0..=n, which requires unfiltered neighbours up to
     // index n+1 — present because we gathered 2n samples.
-    let mut fa = [0u16; 17];
-    let mut fl = [0u16; 17];
-    let ext = above.len() - 1; // = 2n
+    let mut fa = [0u16; 33];
+    let mut fl = [0u16; 33];
+    let ext = 2 * n; // = 2n; derived from n (not array len) so larger buffers are safe
     fa[..=ext].copy_from_slice(&above[..=ext]);
     fl[..=ext].copy_from_slice(&left[..=ext]);
     // above[0] uses the corner as its previous neighbour.
@@ -92,7 +92,6 @@ pub(crate) fn filter_references(
     for y in 1..ext {
         fl[y] = ((left[y - 1] as i32 + 2 * left[y] as i32 + left[y + 1] as i32 + 2) >> 2) as u16;
     }
-    let _ = n;
     (fa, fl)
 }
 
@@ -174,22 +173,22 @@ pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
 #[allow(clippy::too_many_arguments)]
 fn substitute_refs(
     mut corner: u16,
-    mut above: [u16; 17],
-    mut left: [u16; 17],
+    mut above: [u16; 33],
+    mut left: [u16; 33],
     avail_corner: bool,
-    avail_above: &[bool; 17],
-    avail_left: &[bool; 17],
+    avail_above: &[bool; 33],
+    avail_left: &[bool; 33],
     ext: usize,
     neutral: u16,
-) -> (u16, [u16; 17], [u16; 17]) {
+) -> (u16, [u16; 33], [u16; 33]) {
     let any = avail_corner
         || avail_above[..=ext].iter().any(|&a| a)
         || avail_left[..=ext].iter().any(|&a| a);
     if !any {
-        return (neutral, [neutral; 17], [neutral; 17]);
+        return (neutral, [neutral; 33], [neutral; 33]);
     }
     let total = (ext + 1) + 1 + (ext + 1);
-    const MAXT: usize = 35;
+    const MAXT: usize = 67;
     let mut vals = [0u16; MAXT];
     let mut av = [false; MAXT];
     for i in 0..=ext {
@@ -246,10 +245,10 @@ pub(crate) fn get_reference_samples_chroma_pair(
     cur_luma_row: usize,
     cur_luma_col: usize,
     neutral: u16,
-) -> ((u16, [u16; 17], [u16; 17]), (u16, [u16; 17], [u16; 17])) {
+) -> ((u16, [u16; 33], [u16; 33]), (u16, [u16; 33], [u16; 33])) {
     let width = stride;
     let ext = 2 * n;
-    const MAXE: usize = 17;
+    const MAXE: usize = 33;
     let mut cb_above = [0u16; MAXE];
     let mut cb_left = [0u16; MAXE];
     let mut cr_above = [0u16; MAXE];
@@ -346,11 +345,11 @@ pub(crate) fn get_reference_samples(
     ctu: usize,
     ctus_x: usize,
     neutral: u16,
-) -> (u16, [u16; 17], [u16; 17]) {
+) -> (u16, [u16; 33], [u16; 33]) {
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
     // ext <= 16 (n <= 8); reference rows live entirely on the stack.
-    const MAXE: usize = 17; // ext+1 <= 17
+    const MAXE: usize = 33; // ext+1 <= 33 (n<=16)
     let mut above = [0u16; MAXE]; // above[0..2n] (returned)
     let mut left = [0u16; MAXE]; // left[0..2n]  (returned)
     let mut avail_above = [false; MAXE];
@@ -392,13 +391,13 @@ pub(crate) fn get_reference_samples(
 
     let any = avail_corner || avail_above.iter().any(|&a| a) || avail_left.iter().any(|&a| a);
     if !any {
-        return (neutral, [neutral; 17], [neutral; 17]);
+        return (neutral, [neutral; 33], [neutral; 33]);
     }
 
     // Ordered scan: bottom-most left (left[2n]) up to left[0], corner, above[0..2n].
     // total = 2*(ext+1)+1 <= 35; keep the scratch on the stack.
     let total = (ext + 1) + 1 + (ext + 1);
-    const MAXT: usize = 35;
+    const MAXT: usize = 67;
     let mut vals = [0u16; MAXT];
     let mut av = [false; MAXT];
     for i in 0..=ext {
@@ -438,8 +437,8 @@ pub(crate) fn get_reference_samples(
 ///
 /// Returns `orig[i] - pred[i]` as f32 (level-shifted by -128 already handled
 /// at caller level, so we work in pixel domain here).
-pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> [f32; 64] {
-    let mut res = [0f32; 64];
+pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> [f32; 256] {
+    let mut res = [0f32; 256];
     for (r, (&o, &p)) in res[..n * n].iter_mut().zip(orig.iter().zip(pred.iter())) {
         *r = o as f32 - p as f32;
     }
@@ -450,8 +449,8 @@ pub(crate) fn compute_residual(orig: &[u16], pred: &[u16], n: usize) -> [f32; 64
 /// `max_val` is (1<<bit_depth)-1 (255 for 8-bit, 1023 for 10-bit). The residual
 /// from the inverse transform is integer-valued, so this is exact integer math
 /// (the previous `(p as f32 + r).round()` was a no-op round on integers).
-pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 64] {
-    let mut out = [0u16; 64];
+pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 256] {
+    let mut out = [0u16; 256];
     let mx = max_val as i32;
     for (o, (&p, &r)) in out[..n * n]
         .iter_mut()
