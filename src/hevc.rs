@@ -237,7 +237,6 @@ fn write_profile_tier_level(
     bw.write_bits(level_idc as u32, 8);
 }
 
-
 pub(crate) fn build_vps(
     width: u32,
     height: u32,
@@ -532,7 +531,10 @@ fn build_idr_slice(
     let sub_h = yuv.chroma.sub_h();
     // Per 16×16 node, choose between one 16×16 CU and four 8×8 CUs by RD cost.
     // Offered for 4:2:0 only (the validated chroma TB → 8×8 path).
-    let rd16 = yuv.chroma == crate::fmt::ChromaFormat::Yuv420;
+    let rd16 = matches!(
+        yuv.chroma,
+        crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
+    );
     let w = ((width + 63) & !63) as usize;
     let h = ((height + 63) & !63) as usize;
     let cw = w / sub_w;
@@ -762,10 +764,12 @@ fn build_idr_slice(
                             let o = (l2_lu_r + r) * w + l2_lu_c;
                             sa_y[r * 16..r * 16 + 16].copy_from_slice(&rec_y[o..o + 16]);
                         }
-                        for r in 0..8 {
-                            let o = (l2_ch_rr + r) * cw + l2_ch_cc;
-                            sa_cb[r * 8..r * 8 + 8].copy_from_slice(&rec_cb[o..o + 8]);
-                            sa_cr[r * 8..r * 8 + 8].copy_from_slice(&rec_cr[o..o + 8]);
+                        if !yuv.chroma.is_monochrome() {
+                            for r in 0..8 {
+                                let o = (l2_ch_rr + r) * cw + l2_ch_cc;
+                                sa_cb[r * 8..r * 8 + 8].copy_from_slice(&rec_cb[o..o + 8]);
+                                sa_cr[r * 8..r * 8 + 8].copy_from_slice(&rec_cr[o..o + 8]);
+                            }
                         }
                         for br in 0..2 {
                             for bc in 0..2 {
@@ -814,10 +818,12 @@ fn build_idr_slice(
                                 let o = (l2_lu_r + r) * w + l2_lu_c;
                                 rec_y[o..o + 16].copy_from_slice(&sa_y[r * 16..r * 16 + 16]);
                             }
-                            for r in 0..8 {
-                                let o = (l2_ch_rr + r) * cw + l2_ch_cc;
-                                rec_cb[o..o + 8].copy_from_slice(&sa_cb[r * 8..r * 8 + 8]);
-                                rec_cr[o..o + 8].copy_from_slice(&sa_cr[r * 8..r * 8 + 8]);
+                            if !yuv.chroma.is_monochrome() {
+                                for r in 0..8 {
+                                    let o = (l2_ch_rr + r) * cw + l2_ch_cc;
+                                    rec_cb[o..o + 8].copy_from_slice(&sa_cb[r * 8..r * 8 + 8]);
+                                    rec_cr[o..o + 8].copy_from_slice(&sa_cr[r * 8..r * 8 + 8]);
+                                }
                             }
                             for br in 0..2 {
                                 for bc in 0..2 {
@@ -1675,18 +1681,20 @@ fn region_sse(
             sse += e * e;
         }
     }
-    for r in 0..8 {
-        let sy = (ch_row + r).min(src_ch - 1);
-        for c in 0..8 {
-            let sx = (ch_col + c).min(src_cw - 1);
-            let sb = yuv.cb[sy * src_cw + sx] as i64;
-            let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as i64;
-            let eb = sb - db;
-            sse += eb * eb;
-            let sr = yuv.cr[sy * src_cw + sx] as i64;
-            let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as i64;
-            let er = sr - dr;
-            sse += er * er;
+    if !yuv.chroma.is_monochrome() {
+        for r in 0..8 {
+            let sy = (ch_row + r).min(src_ch - 1);
+            for c in 0..8 {
+                let sx = (ch_col + c).min(src_cw - 1);
+                let sb = yuv.cb[sy * src_cw + sx] as i64;
+                let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as i64;
+                let eb = sb - db;
+                sse += eb * eb;
+                let sr = yuv.cr[sy * src_cw + sx] as i64;
+                let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as i64;
+                let er = sr - dr;
+                sse += er * er;
+            }
         }
     }
     sse as f64
