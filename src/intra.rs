@@ -104,11 +104,11 @@ pub(crate) fn predict_dc(
     filter_boundary: bool,
 ) -> [u16; 256] {
     let mut sum = 0i32;
-    for i in 0..n {
-        sum += above[i] as i32 + left[i] as i32;
+    for (&above, &left) in above[..n].iter().zip(left[..n].iter()) {
+        sum += above as i32 + left as i32;
     }
     let log2 = n.trailing_zeros();
-    let dc = ((sum + n as i32) >> (log2 + 1)) as i32;
+    let dc = (sum + n as i32) >> (log2 + 1);
     let mut pred = [0u16; 256];
     for v in pred[..n * n].iter_mut() {
         *v = dc as u16;
@@ -116,11 +116,11 @@ pub(crate) fn predict_dc(
     if filter_boundary && n < 32 {
         // Corner, first row and first column get a 3:1 / 2:1:1 blend with the refs.
         pred[0] = ((left[0] as i32 + 2 * dc + above[0] as i32 + 2) >> 2) as u16;
-        for x in 1..n {
-            pred[x] = ((above[x] as i32 + 3 * dc + 2) >> 2) as u16;
+        for (pred, &above) in pred[1..n].iter_mut().zip(above[1..n].iter()) {
+            *pred = ((above as i32 + 3 * dc + 2) >> 2) as u16;
         }
-        for y in 1..n {
-            pred[y * n] = ((left[y] as i32 + 3 * dc + 2) >> 2) as u16;
+        for (y, &left) in (1..n).zip(left[1..n].iter()) {
+            pred[y * n] = ((left as i32 + 3 * dc + 2) >> 2) as u16;
         }
     }
     pred
@@ -156,10 +156,11 @@ pub(crate) fn predict_angular(
     // r[OFF + i] = ref[i]; OFF lets i go negative down to -n.
     const OFF: usize = 32;
     let mut r = [0i32; OFF + 64 + 1];
-    r[OFF] = corner as i32; // ref[0] = p[-1][-1]
-    for i in 1..=2 * n {
-        r[OFF + i] = main[i - 1] as i32; // ref[i] = main[i-1]
-    }
+    r[OFF] = corner as i32;
+    r[OFF + 1..=OFF + 2 * n]
+        .iter_mut()
+        .zip(main[..2 * n].iter())
+        .for_each(|(dst, &src)| *dst = src as i32);
     if angle < 0 {
         let inv = INV_ANGLE[mode as usize];
         let last = (n as i32 * angle) >> 5; // most-negative index needed
@@ -206,9 +207,9 @@ pub(crate) fn predict_angular(
             }
         } else if mode == 10 {
             // pure horizontal: first row blended with the above reference
-            for x in 0..n {
-                let v = left[0] as i32 + ((above[x] as i32 - corner as i32) >> 1);
-                pred[x] = v.clamp(0, max) as u16;
+            for (pred, &above) in pred[..n].iter_mut().zip(above[..n].iter()) {
+                let v = left[0] as i32 + ((above as i32 - corner as i32) >> 1);
+                *pred = v.clamp(0, max) as u16;
             }
         }
     }

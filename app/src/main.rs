@@ -33,10 +33,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/aak.jpg")
-        .unwrap()
-        .resize_exact(256, 256, FilterType::Nearest)
-        .to_rgb8();
+    let img = image::open("./assets/aak.jpg").unwrap().to_rgb8();
     let arr = img.to_vec(); //.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();

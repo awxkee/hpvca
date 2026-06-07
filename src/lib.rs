@@ -77,6 +77,12 @@ pub struct EncodeConfig {
     pub color: ColorMetadata,
     /// Optional image metadata (orientation, HDR light level, EXIF).
     pub metadata: Metadata,
+    /// Preferred number of worker threads for encoding large images that are
+    /// split into a grid of tiles. Tiles are independent, so they are encoded in
+    /// parallel; the output is identical regardless of this value. `0` means
+    /// "auto": use the number of hardware threads reported by the platform
+    /// (falling back to 1). Images small enough not to be tiled ignore this.
+    pub threads: usize,
 }
 
 impl Default for EncodeConfig {
@@ -86,6 +92,7 @@ impl Default for EncodeConfig {
             chroma: ChromaFormat::Yuv420,
             color: ColorMetadata::default(), // sRGB ICC profile
             metadata: Metadata::default(),
+            threads: 0, // auto-detect
         }
     }
 }
@@ -138,6 +145,15 @@ impl EncodeConfig {
 
     pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
         self.metadata.exif = Some(exif);
+        self
+    }
+
+    /// Set the preferred worker-thread count for tiled (large-image) encoding.
+    /// `0` selects the platform's hardware-thread count automatically. Has no
+    /// effect on images small enough to encode as a single tile, and never
+    /// changes the encoded output.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
         self
     }
 
@@ -701,6 +717,56 @@ fn build_mono_yuv(
 
 // ── Tiling helpers ────────────────────────────────────────────────────────────
 
+/// Resolve a configured thread preference to a concrete worker count. `0` means
+/// "auto": the number of hardware threads the platform reports, or 1 if it
+/// can't report one.
+fn resolve_threads(preferred: usize) -> usize {
+    if preferred != 0 {
+        preferred
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+}
+
+fn parallel_try_map<T, E, F>(n: usize, threads: usize, f: F) -> Result<Vec<T>, E>
+where
+    T: Send,
+    E: Send,
+    F: Fn(usize) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let nthreads = resolve_threads(threads).clamp(1, n);
+    if nthreads == 1 {
+        // Sequential fast path: no thread spawn, no allocation of slots.
+        return (0..n).map(&f).collect();
+    }
+
+    let mut slots: Vec<Option<Result<T, E>>> = (0..n).map(|_| None).collect();
+    let chunk = n.div_ceil(nthreads); // >= 1 since nthreads <= n
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (ci, slice) in slots.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (j, slot) in slice.iter_mut().enumerate() {
+                    *slot = Some(f(base + j));
+                }
+            });
+        }
+    });
+
+    let mut out = Vec::with_capacity(n);
+    for slot in slots {
+        // Every slot is written exactly once by its owning worker.
+        out.push(slot.expect("scoped workers fill every slot")?);
+    }
+    Ok(out)
+}
+
 /// Encode a large RGB image as a HEIF grid of [`TILE_SIZE`]×[`TILE_SIZE`] tiles.
 fn encode_rgb_tiled(
     rgb: &[u16],
@@ -715,14 +781,14 @@ fn encode_rgb_tiled(
     // encoded_dims returns (512,512) for every subsampling format.
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
 
-    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
-    for row in 0..rows {
-        for col in 0..cols {
-            let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
-            let yuv = yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth);
-            tile_streams.push(hevc::encode_intra(&yuv, enc_tw, enc_th, cfg.quality)?);
-        }
-    }
+    let n = (cols * rows) as usize;
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
+        let yuv = yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth);
+        hevc::encode_intra(&yuv, enc_tw, enc_th, cfg.quality)
+    })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
         isobmff::GridDims {
@@ -752,22 +818,22 @@ fn encode_gray_tiled(
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
 
-    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
-    for row in 0..rows {
-        for col in 0..cols {
-            let luma = extract_plane_tile(
-                gray,
-                width as usize,
-                height as usize,
-                (col * TILE_SIZE) as usize,
-                (row * TILE_SIZE) as usize,
-                TILE_SIZE as usize,
-                TILE_SIZE as usize,
-            );
-            let yuv = build_mono_yuv(luma, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth);
-            tile_streams.push(hevc::encode_intra(&yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?);
-        }
-    }
+    let n = (cols * rows) as usize;
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        let luma = extract_plane_tile(
+            gray,
+            width as usize,
+            height as usize,
+            (col * TILE_SIZE) as usize,
+            (row * TILE_SIZE) as usize,
+            TILE_SIZE as usize,
+            TILE_SIZE as usize,
+        );
+        let yuv = build_mono_yuv(luma, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth);
+        hevc::encode_intra(&yuv, TILE_SIZE, TILE_SIZE, cfg.quality)
+    })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
         isobmff::GridDims {
@@ -802,46 +868,46 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_w = (yuv.width / sw) as usize;
     let c_src_h = (yuv.height / sh) as usize;
 
-    let mut tile_streams = Vec::with_capacity((cols * rows) as usize);
-    for row in 0..rows {
-        for col in 0..cols {
-            let x0 = (col * TILE_SIZE) as usize;
-            let y0 = (row * TILE_SIZE) as usize;
+    let n = (cols * rows) as usize;
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        let x0 = (col * TILE_SIZE) as usize;
+        let y0 = (row * TILE_SIZE) as usize;
 
-            let y_tile = extract_plane_tile(
-                &yuv.y,
-                yuv.width as usize,
-                yuv.height as usize,
-                x0,
-                y0,
-                enc_tw as usize,
-                enc_th as usize,
-            );
-            let (cb_tile, cr_tile) = if yuv.chroma.is_monochrome() {
-                (Vec::new(), Vec::new())
-            } else {
-                let cx0 = x0 / sw as usize;
-                let cy0 = y0 / sh as usize;
-                (
-                    extract_plane_tile(&yuv.cb, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
-                    extract_plane_tile(&yuv.cr, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
-                )
-            };
+        let y_tile = extract_plane_tile(
+            &yuv.y,
+            yuv.width as usize,
+            yuv.height as usize,
+            x0,
+            y0,
+            enc_tw as usize,
+            enc_th as usize,
+        );
+        let (cb_tile, cr_tile) = if yuv.chroma.is_monochrome() {
+            (Vec::new(), Vec::new())
+        } else {
+            let cx0 = x0 / sw as usize;
+            let cy0 = y0 / sh as usize;
+            (
+                extract_plane_tile(&yuv.cb, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+                extract_plane_tile(&yuv.cr, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+            )
+        };
 
-            let tile_yuv = Yuv {
-                y: y_tile,
-                cb: cb_tile,
-                cr: cr_tile,
-                width: enc_tw,
-                height: enc_th,
-                display_w: enc_tw,
-                display_h: enc_th,
-                chroma: yuv.chroma,
-                bit_depth: yuv.bit_depth,
-            };
-            tile_streams.push(hevc::encode_intra(&tile_yuv, enc_tw, enc_th, cfg.quality)?);
-        }
-    }
+        let tile_yuv = Yuv {
+            y: y_tile,
+            cb: cb_tile,
+            cr: cr_tile,
+            width: enc_tw,
+            height: enc_th,
+            display_w: enc_tw,
+            display_h: enc_th,
+            chroma: yuv.chroma,
+            bit_depth: yuv.bit_depth,
+        };
+        hevc::encode_intra(&tile_yuv, enc_tw, enc_th, cfg.quality)
+    })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
         isobmff::GridDims {
@@ -874,49 +940,49 @@ fn encode_rgba_alpha_tiled(
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
-    let mut color_streams = Vec::with_capacity((cols * rows) as usize);
-    let mut alpha_streams = Vec::with_capacity((cols * rows) as usize);
+    let n = (cols * rows) as usize;
+    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        // Extract a TILE_SIZE×TILE_SIZE RGBA tile (4 ch) with edge replication.
+        let tile = extract_rgb_tile(rgba, width, height, col, row, TILE_SIZE, 4);
 
-    for row in 0..rows {
-        for col in 0..cols {
-            // Extract a TILE_SIZE×TILE_SIZE RGBA tile (4 ch) with edge replication.
-            let tile = extract_rgb_tile(rgba, width, height, col, row, TILE_SIZE, 4);
-
-            // Deinterleave RGBA → color (3 ch) + alpha (1 ch).
-            let mut color_buf = vec![0u16; ts2 * 3];
-            let mut alpha_plane = vec![0u16; ts2];
-            for ((px, colors), alpha) in tile
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(color_buf.as_chunks_mut::<3>().0.iter_mut())
-                .zip(alpha_plane.iter_mut())
-            {
-                colors[0] = px[0];
-                colors[1] = px[1];
-                colors[2] = px[2];
-                *alpha = px[3];
-            }
-
-            let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_tw, enc_th, cfg.chroma, bit_depth);
-            color_streams.push(hevc::encode_intra(&color_yuv, enc_tw, enc_th, cfg.quality)?);
-
-            // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
-            let alpha_yuv = build_mono_yuv(
-                alpha_plane,
-                TILE_SIZE,
-                TILE_SIZE,
-                TILE_SIZE,
-                TILE_SIZE,
-                bit_depth,
-            );
-            alpha_streams.push(hevc::encode_intra(
-                &alpha_yuv,
-                TILE_SIZE,
-                TILE_SIZE,
-                cfg.quality,
-            )?);
+        // Deinterleave RGBA → color (3 ch) + alpha (1 ch).
+        let mut color_buf = vec![0u16; ts2 * 3];
+        let mut alpha_plane = vec![0u16; ts2];
+        for ((px, colors), alpha) in tile
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(color_buf.as_chunks_mut::<3>().0.iter_mut())
+            .zip(alpha_plane.iter_mut())
+        {
+            colors[0] = px[0];
+            colors[1] = px[1];
+            colors[2] = px[2];
+            *alpha = px[3];
         }
+
+        let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_tw, enc_th, cfg.chroma, bit_depth);
+        let color = hevc::encode_intra(&color_yuv, enc_tw, enc_th, cfg.quality)?;
+
+        // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
+        let alpha_yuv = build_mono_yuv(
+            alpha_plane,
+            TILE_SIZE,
+            TILE_SIZE,
+            TILE_SIZE,
+            TILE_SIZE,
+            bit_depth,
+        );
+        let alpha = hevc::encode_intra(&alpha_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+        Ok::<_, EncodeError>((color, alpha))
+    })?;
+    let mut color_streams = Vec::with_capacity(n);
+    let mut alpha_streams = Vec::with_capacity(n);
+    for (color, alpha) in pairs {
+        color_streams.push(color);
+        alpha_streams.push(alpha);
     }
 
     isobmff::wrap_hevc_grid_with_alpha(
@@ -951,53 +1017,48 @@ fn encode_gray_alpha_tiled(
     let rows = height.div_ceil(TILE_SIZE);
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
-    let mut luma_streams = Vec::with_capacity((cols * rows) as usize);
-    let mut alpha_streams = Vec::with_capacity((cols * rows) as usize);
+    let n = (cols * rows) as usize;
+    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        // Extract a TILE_SIZE×TILE_SIZE YA tile (2 ch) with edge replication.
+        let tile = extract_rgb_tile(ya, width, height, col, row, TILE_SIZE, 2);
 
-    for row in 0..rows {
-        for col in 0..cols {
-            // Extract a TILE_SIZE×TILE_SIZE YA tile (2 ch) with edge replication.
-            let tile = extract_rgb_tile(ya, width, height, col, row, TILE_SIZE, 2);
-
-            // Deinterleave YA → luma (1 ch) + alpha (1 ch).
-            let mut luma_plane = vec![0u16; ts2];
-            let mut alpha_plane = vec![0u16; ts2];
-            for ((px, luma), alpha) in tile
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(luma_plane.iter_mut())
-                .zip(alpha_plane.iter_mut())
-            {
-                *luma = px[0];
-                *alpha = px[1];
-            }
-
-            let luma_yuv = build_mono_yuv(
-                luma_plane, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth,
-            );
-            luma_streams.push(hevc::encode_intra(
-                &luma_yuv,
-                TILE_SIZE,
-                TILE_SIZE,
-                cfg.quality,
-            )?);
-
-            let alpha_yuv = build_mono_yuv(
-                alpha_plane,
-                TILE_SIZE,
-                TILE_SIZE,
-                TILE_SIZE,
-                TILE_SIZE,
-                bit_depth,
-            );
-            alpha_streams.push(hevc::encode_intra(
-                &alpha_yuv,
-                TILE_SIZE,
-                TILE_SIZE,
-                cfg.quality,
-            )?);
+        // Deinterleave YA → luma (1 ch) + alpha (1 ch).
+        let mut luma_plane = vec![0u16; ts2];
+        let mut alpha_plane = vec![0u16; ts2];
+        for ((px, luma), alpha) in tile
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(luma_plane.iter_mut())
+            .zip(alpha_plane.iter_mut())
+        {
+            *luma = px[0];
+            *alpha = px[1];
         }
+
+        let luma_yuv = build_mono_yuv(
+            luma_plane, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth,
+        );
+        let luma = hevc::encode_intra(&luma_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+
+        let alpha_yuv = build_mono_yuv(
+            alpha_plane,
+            TILE_SIZE,
+            TILE_SIZE,
+            TILE_SIZE,
+            TILE_SIZE,
+            bit_depth,
+        );
+        let alpha = hevc::encode_intra(&alpha_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+        Ok::<_, EncodeError>((luma, alpha))
+    })?;
+    let mut luma_streams = Vec::with_capacity(n);
+    let mut alpha_streams = Vec::with_capacity(n);
+    for (luma, alpha) in pairs {
+        luma_streams.push(luma);
+        alpha_streams.push(alpha);
     }
 
     isobmff::wrap_hevc_grid_with_alpha(

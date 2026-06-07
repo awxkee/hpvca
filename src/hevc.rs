@@ -997,7 +997,7 @@ fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
             for &v in d.iter() {
                 s += v.unsigned_abs();
             }
-            total += (s + 1) / 2;
+            total += s.div_ceil(2);
         }
     }
     total
