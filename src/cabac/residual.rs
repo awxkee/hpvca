@@ -254,7 +254,7 @@ fn encode_last_sig(
         0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9,
         9, 9,
     ];
-    const G_MIN_IN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
+    static G_MIN_IN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 
     let size = 1u32 << log2_size;
     let max_group = G_GROUP_IDX[(size - 1) as usize];

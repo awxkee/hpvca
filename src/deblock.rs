@@ -52,7 +52,7 @@ fn clip_sample(v: i32, max_val: i32) -> u16 {
 
 /// Chroma QP mapping (HEVC Table 8-22) for 4:2:0.
 fn table8_22(qpi: i32) -> i32 {
-    const TAB: [i32; 13] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37];
+    static TAB: [i32; 13] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37];
     if qpi < 30 {
         qpi
     } else if qpi >= 43 {
