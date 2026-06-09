@@ -11,7 +11,6 @@ fn main() {
         .to_rgba8();
     let arr = img.to_vec();
 
-    let instant = Instant::now();
     let data = hpvca::encode_rgba_with_alpha(
         &arr,
         img.width(),
