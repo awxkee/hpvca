@@ -408,7 +408,7 @@ pub(crate) fn rgb_to_yuv(
                 blend_chroma_row(src1, cb_row, cr_row);
             }
 
-            // Odd height: single trailing luma row with no vertical neighbour.
+            // Odd height: single trailing luma row with no vertical neighbor.
             // Treat as 4:2:2 — horizontal pair average only.
             if h & 1 != 0 {
                 let last_row = h - 1;

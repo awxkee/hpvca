@@ -67,6 +67,11 @@ pub(crate) struct ContextSet {
     // initType0: sao_merge=153, sao_type_idx=200.
     pub(crate) sao_merge_flag: CtxModel,
     pub(crate) sao_type_idx: CtxModel,
+
+    // cu_transquant_bypass_flag (1 ctx). initValue 154 for all init types
+    // (HEVC Table 9-43). Used only when the PPS enables transquant bypass
+    // (lossless coding).
+    pub(crate) cu_transquant_bypass_flag: CtxModel,
 }
 
 impl ContextSet {
@@ -139,6 +144,9 @@ impl ContextSet {
             // SAO initType0: sao_merge_flag=153, sao_type_idx=200 (libde265).
             sao_merge_flag: c(153, qp),
             sao_type_idx: c(200, qp),
+
+            // cu_transquant_bypass_flag initValue 154 (all init types).
+            cu_transquant_bypass_flag: c(154, qp),
         }
     }
 }

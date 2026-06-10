@@ -33,15 +33,17 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/aak.jpg").unwrap().to_luma8();
-    let arr = img.to_vec();//;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
+    let img = image::open("./assets/aak.jpg").unwrap().to_rgb8();
+    let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
     let data = hpvca::encode_rgb(
         &arr,
         img.width(),
         img.height(),
-        &EncodeConfig::default().with_chroma(ChromaFormat::Monochrome),
+        &EncodeConfig::default()
+            .with_chroma(ChromaFormat::Yuv444)
+            .with_lossless(true),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

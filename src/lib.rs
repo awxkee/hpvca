@@ -39,6 +39,7 @@ mod hevc_transform;
 mod intra;
 mod isobmff;
 mod metadata;
+mod ycgco;
 mod yuv;
 
 pub use color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
@@ -69,7 +70,10 @@ const TILE_SIZE: u32 = 512;
 #[derive(Clone, Debug)]
 pub struct EncodeConfig {
     /// Visual quality 1..=100 (higher = better, larger file). Maps to HEVC QP.
+    /// Ignored when [`lossless`](Self::lossless) is set.
     pub quality: u8,
+    /// Mathematically lossless encoding.
+    pub lossless: bool,
     /// Chroma subsampling format. Ignored by the `gray*` entry points, which
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
@@ -89,6 +93,7 @@ impl Default for EncodeConfig {
     fn default() -> Self {
         EncodeConfig {
             quality: 90,
+            lossless: false,
             chroma: ChromaFormat::Yuv420,
             color: ColorMetadata::default(), // sRGB ICC profile
             metadata: Metadata::default(),
@@ -105,6 +110,13 @@ impl EncodeConfig {
 
     pub fn with_quality(mut self, quality: u8) -> Self {
         self.quality = quality;
+        self
+    }
+
+    /// Enable mathematically lossless encoding (see [`lossless`](Self::lossless)).
+    /// In this mode [`quality`](Self::quality) is ignored.
+    pub fn with_lossless(mut self, lossless: bool) -> Self {
+        self.lossless = lossless;
         self
     }
 
@@ -501,7 +513,14 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
     if needs_tiling(yuv.display_w, yuv.display_h) {
         return encode_yuv_tiled(yuv, cfg);
     }
-    let nalu_stream = hevc::encode_intra(yuv, yuv.width, yuv.height, cfg.quality)?;
+    let nalu_stream = hevc::encode_intra(
+        yuv,
+        yuv.width,
+        yuv.height,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
         yuv.display_w,
@@ -532,14 +551,39 @@ fn encode_rgb_wide(
         return encode_rgb_tiled(rgb, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
+    let mut local_cfg = cfg.clone();
     let mut yuv = if enc_w != width || enc_h != height {
         let padded = pad_buf::<3>(rgb, width, height, enc_w, enc_h);
-        yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
+        if local_cfg.lossless {
+            ycgco::rgb_to_ycgco(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
+        } else {
+            yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
+        }
     } else {
-        yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
+        if local_cfg.lossless {
+            ycgco::rgb_to_ycgco(rgb, width, height, cfg.chroma, bit_depth)
+        } else {
+            yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
+        }
     };
     yuv = yuv.with_display(width, height);
-    encode_yuv_raw(&yuv, cfg)
+    if local_cfg.lossless {
+        local_cfg.color = match local_cfg.color {
+            ColorMetadata::Cicp(cicp) => ColorMetadata::Cicp(ColorEncoding {
+                primaries: cicp.primaries,
+                transfer: cicp.transfer,
+                matrix: MatrixCoefficients::YCgCo,
+                full_range: true,
+            }),
+            ColorMetadata::Icc(_) => ColorMetadata::Cicp(ColorEncoding {
+                primaries: Primaries::Bt709,
+                transfer: TransferFunction::Srgb,
+                matrix: MatrixCoefficients::YCgCo,
+                full_range: true,
+            }),
+        };
+    }
+    encode_yuv_raw(&yuv, &local_cfg)
 }
 
 /// Core RGBA-with-alpha path. Dispatches to a paired color+alpha grid for
@@ -583,10 +627,24 @@ fn encode_rgba_with_alpha_wide(
     }
 
     let color_yuv = yuv::rgb_to_yuv(&colour_buf, enc_w, enc_h, cfg.chroma, bit_depth);
-    let color_stream = hevc::encode_intra(&color_yuv, enc_w, enc_h, cfg.quality)?;
+    let color_stream = hevc::encode_intra(
+        &color_yuv,
+        enc_w,
+        enc_h,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
-    let alpha_stream = hevc::encode_intra(&alpha_yuv, enc_w, enc_h, cfg.quality)?;
+    let alpha_stream = hevc::encode_intra(
+        &alpha_yuv,
+        enc_w,
+        enc_h,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
 
     isobmff::wrap_hevc_image_with_alpha(
         &color_stream,
@@ -660,10 +718,24 @@ fn encode_gray_alpha_wide(
     }
 
     let color_yuv = build_mono_yuv(luma_plane, enc_w, enc_h, width, height, bit_depth);
-    let color_stream = hevc::encode_intra(&color_yuv, enc_w, enc_h, cfg.quality)?;
+    let color_stream = hevc::encode_intra(
+        &color_yuv,
+        enc_w,
+        enc_h,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
-    let alpha_stream = hevc::encode_intra(&alpha_yuv, enc_w, enc_h, cfg.quality)?;
+    let alpha_stream = hevc::encode_intra(
+        &alpha_yuv,
+        enc_w,
+        enc_h,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
 
     isobmff::wrap_hevc_image_with_alpha(
         &color_stream,
@@ -680,7 +752,14 @@ fn encode_gray_alpha_wide(
 
 /// Wrap an already-built [`Yuv`] into a HEIC bitstream (no re-validation).
 fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
-    let nalu_stream = hevc::encode_intra(yuv, yuv.width, yuv.height, cfg.quality)?;
+    let nalu_stream = hevc::encode_intra(
+        yuv,
+        yuv.width,
+        yuv.height,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.color_encoding(),
+    )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
         yuv.display_w,
@@ -773,21 +852,50 @@ fn encode_rgb_tiled(
     width: u32,
     height: u32,
     bit_depth: BitDepth,
-    cfg: &EncodeConfig,
+    encode_cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    let mut cfg = encode_cfg.clone();
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
     // TILE_SIZE=512 is always chroma-even for sub_w/sub_h ∈ {1,2}, so
     // encoded_dims returns (512,512) for every subsampling format.
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
 
+    if cfg.lossless {
+        cfg.color = match cfg.color {
+            ColorMetadata::Cicp(cicp) => ColorMetadata::Cicp(ColorEncoding {
+                primaries: cicp.primaries,
+                transfer: cicp.transfer,
+                matrix: MatrixCoefficients::YCgCo,
+                full_range: true,
+            }),
+            ColorMetadata::Icc(_) => ColorMetadata::Cicp(ColorEncoding {
+                primaries: Primaries::Bt709,
+                transfer: TransferFunction::Srgb,
+                matrix: MatrixCoefficients::YCgCo,
+                full_range: true,
+            }),
+        };
+    }
+
     let n = (cols * rows) as usize;
     let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
-        let yuv = yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth);
-        hevc::encode_intra(&yuv, enc_tw, enc_th, cfg.quality)
+        let yuv = if cfg.lossless {
+            ycgco::rgb_to_ycgco(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
+        } else {
+            yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
+        };
+        hevc::encode_intra(
+            &yuv,
+            enc_tw,
+            enc_th,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )
     })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
@@ -832,7 +940,14 @@ fn encode_gray_tiled(
             TILE_SIZE as usize,
         );
         let yuv = build_mono_yuv(luma, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth);
-        hevc::encode_intra(&yuv, TILE_SIZE, TILE_SIZE, cfg.quality)
+        hevc::encode_intra(
+            &yuv,
+            TILE_SIZE,
+            TILE_SIZE,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )
     })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
@@ -906,7 +1021,14 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             chroma: yuv.chroma,
             bit_depth: yuv.bit_depth,
         };
-        hevc::encode_intra(&tile_yuv, enc_tw, enc_th, cfg.quality)
+        hevc::encode_intra(
+            &tile_yuv,
+            enc_tw,
+            enc_th,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )
     })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
@@ -964,7 +1086,14 @@ fn encode_rgba_alpha_tiled(
         }
 
         let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_tw, enc_th, cfg.chroma, bit_depth);
-        let color = hevc::encode_intra(&color_yuv, enc_tw, enc_th, cfg.quality)?;
+        let color = hevc::encode_intra(
+            &color_yuv,
+            enc_tw,
+            enc_th,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
         let alpha_yuv = build_mono_yuv(
@@ -975,7 +1104,14 @@ fn encode_rgba_alpha_tiled(
             TILE_SIZE,
             bit_depth,
         );
-        let alpha = hevc::encode_intra(&alpha_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+        let alpha = hevc::encode_intra(
+            &alpha_yuv,
+            TILE_SIZE,
+            TILE_SIZE,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
     let mut color_streams = Vec::with_capacity(n);
@@ -1041,7 +1177,14 @@ fn encode_gray_alpha_tiled(
         let luma_yuv = build_mono_yuv(
             luma_plane, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth,
         );
-        let luma = hevc::encode_intra(&luma_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+        let luma = hevc::encode_intra(
+            &luma_yuv,
+            TILE_SIZE,
+            TILE_SIZE,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )?;
 
         let alpha_yuv = build_mono_yuv(
             alpha_plane,
@@ -1051,7 +1194,14 @@ fn encode_gray_alpha_tiled(
             TILE_SIZE,
             bit_depth,
         );
-        let alpha = hevc::encode_intra(&alpha_yuv, TILE_SIZE, TILE_SIZE, cfg.quality)?;
+        let alpha = hevc::encode_intra(
+            &alpha_yuv,
+            TILE_SIZE,
+            TILE_SIZE,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.color_encoding(),
+        )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
     let mut luma_streams = Vec::with_capacity(n);

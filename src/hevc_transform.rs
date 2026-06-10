@@ -152,7 +152,7 @@ pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; 
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3). Fixed 64-entry buffer.
 pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
-    let log2n = (n.trailing_zeros()) as i64;
+    let log2n = n.trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let bd_shift = bd + log2n - 5;
     let add = 1i64 << (bd_shift - 1);

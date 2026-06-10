@@ -289,6 +289,7 @@ pub(crate) fn build_sps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+    color: crate::color::ColorEncoding,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -383,7 +384,7 @@ pub(crate) fn build_sps(
 
     // VUI parameters: colour info so decoders display correctly
     bw.write_bit(true); // vui_parameters_present_flag
-    write_vui(&mut bw);
+    write_vui(&mut bw, &color);
 
     // sps_extension: RExt profiles require sps_range_extension to be present
     // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
@@ -415,19 +416,24 @@ pub(crate) fn build_sps(
     }
 }
 
-/// Write minimal VUI (Annex E §E.2.1) with BT.601 colour info.
-fn write_vui(bw: &mut BitWriter) {
+/// Write minimal VUI (Annex E §E.2.1). The colour primaries / transfer /
+/// matrix_coefficients and full-range flag are taken from the configured
+/// [`ColorEncoding`] so the in-stream VUI matches the `colr`/nclx box. Writing a
+/// fixed BT.709 matrix here (the old behaviour) silently contradicts a non-709
+/// `colr` such as YCgCo (matrix 8), which makes decoders that read the VUI apply
+/// the wrong inverse matrix.
+fn write_vui(bw: &mut BitWriter, color: &crate::color::ColorEncoding) {
     bw.write_bit(false); // aspect_ratio_info_present_flag
     bw.write_bit(false); // overscan_info_present_flag
 
     // video_signal_type_present_flag = true
     bw.write_bit(true);
     bw.write_bits(5, 3); // video_format = 5 (unspecified)
-    bw.write_bit(true); // video_full_range_flag = 1 (full range 0-255)
+    bw.write_bit(color.full_range); // video_full_range_flag
     bw.write_bit(true); // colour_description_present_flag
-    bw.write_bits(1, 8); // colour_primaries         = 1 (BT.709) — matches libheif
-    bw.write_bits(13, 8); // transfer_characteristics = 13 (sRGB / IEC 61966-2-1)
-    bw.write_bits(1, 8); // matrix_coefficients      = 1 (BT.709) — matches colr
+    bw.write_bits(color.primaries as u32, 8); // colour_primaries
+    bw.write_bits(color.transfer as u32, 8); // transfer_characteristics
+    bw.write_bits(color.matrix as u32, 8); // matrix_coefficients (e.g. 8 = YCgCo)
 
     bw.write_bit(false); // chroma_loc_info_present_flag
     bw.write_bit(false); // neutral_chroma_indication_flag
@@ -438,7 +444,7 @@ fn write_vui(bw: &mut BitWriter) {
     bw.write_bit(false); // bitstream_restriction_flag
 }
 
-pub(crate) fn build_pps(qp: u8) -> Nalu {
+pub(crate) fn build_pps(qp: u8, lossless: bool) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
 
@@ -466,7 +472,9 @@ pub(crate) fn build_pps(qp: u8) -> Nalu {
     bw.write_bit(false); // pps_slice_chroma_qp_offsets_present_flag
     bw.write_bit(false); // weighted_pred_flag
     bw.write_bit(false); // weighted_bipred_flag
-    bw.write_bit(false); // transquant_bypass_enabled_flag
+    // transquant_bypass_enabled_flag: when set, CUs may carry
+    // cu_transquant_bypass_flag to skip transform+quantization (lossless coding).
+    bw.write_bit(lossless); // transquant_bypass_enabled_flag
     bw.write_bit(false); // tiles_enabled_flag
     bw.write_bit(false); // entropy_coding_sync_enabled_flag
     // No tile fields (tiles_enabled=0).
@@ -503,12 +511,14 @@ pub(crate) fn encode_intra(
     width: u32,
     height: u32,
     quality: u8,
+    lossless: bool,
+    color: crate::color::ColorEncoding,
 ) -> Result<NaluStream, EncodeError> {
     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
-    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth);
+    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth, color);
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-    let pps = build_pps(qp_val);
-    let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality)?;
+    let pps = build_pps(qp_val, lossless);
+    let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality, lossless)?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
     })
@@ -520,6 +530,7 @@ fn build_idr_slice(
     width: u32,
     height: u32,
     quality: u8,
+    lossless: bool,
 ) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
     // Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
@@ -735,6 +746,7 @@ fn build_idr_slice(
                             qp,
                             &mut mode_map,
                             blk_stride,
+                            lossless,
                         );
                         let d_a = region_sse(
                             yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
@@ -802,6 +814,7 @@ fn build_idr_slice(
                                 qp,
                                 &mut mode_map,
                                 blk_stride,
+                                lossless,
                             );
                         }
                         let d_b = region_sse(
@@ -870,6 +883,7 @@ fn build_idr_slice(
                                 qp,
                                 &mut mode_map,
                                 blk_stride,
+                                lossless,
                             );
                         }
                         for br in 0..2 {
@@ -898,20 +912,29 @@ fn build_idr_slice(
     // the returned reconstruction equals a conformant decoder's output and block
     // edges are smoothed).
     // In-loop deblocking. Monochrome filters luma only.
-    if yuv.chroma.is_monochrome() {
-        crate::deblock::deblock_luma_only(&mut rec_y, w, h, qp_val, yuv.bit_depth);
-    } else {
-        crate::deblock::deblock(
-            &mut rec_y,
-            w,
-            h,
-            &mut rec_cb,
-            &mut rec_cr,
-            cw,
-            ch,
-            qp_val,
-            yuv.bit_depth,
-        );
+    //
+    // Lossless (transquant-bypass) CUs are exempt from deblocking per HEVC
+    // §8.7.2: an edge is not filtered when a sample on either side belongs to a
+    // CU with cu_transquant_bypass_flag = 1. With every CU coded in bypass the
+    // filter is a no-op across the whole picture, so we skip it outright — both
+    // to stay bit-exact with a conformant decoder and to avoid perturbing the
+    // already-exact reconstruction.
+    if !lossless {
+        if yuv.chroma.is_monochrome() {
+            crate::deblock::deblock_luma_only(&mut rec_y, w, h, qp_val, yuv.bit_depth);
+        } else {
+            crate::deblock::deblock(
+                &mut rec_y,
+                w,
+                h,
+                &mut rec_cb,
+                &mut rec_cr,
+                cw,
+                ch,
+                qp_val,
+                yuv.bit_depth,
+            );
+        }
     }
 
     Ok((
@@ -1134,6 +1157,9 @@ struct CuParams {
     /// Luma CU/TU size: 8 (the min CB) or 16. Drives part_mode presence, the
     /// luma scan/transform size, and the chroma TB size.
     lu: usize,
+    /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`
+    /// and store the prediction residual verbatim (no transform/quantization).
+    lossless: bool,
 }
 
 /// Coded and source plane dimensions for a frame, shared by the per-CU coding
@@ -1190,6 +1216,7 @@ fn encode_cu(
         chroma,
         bit_depth,
         lu,
+        lossless,
     } = *par;
     let neutral: u16 = bit_depth.neutral(); // 128 (8-bit) / 512 (10-bit)
     let max_val: u16 = bit_depth.max_val(); // 255 / 1023
@@ -1301,6 +1328,15 @@ fn encode_cu(
             _ => intra::predict_angular(yc0, &ya, &yl, lu, luma_mode, true, max_val as i32),
         }
     };
+
+    // ── cu_transquant_bypass_flag ────────────────────────────────────────────
+    // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
+    // when the PPS sets transquant_bypass_enabled_flag (i.e. lossless coding).
+    // We code 1 for every CU, so transform + quantization are skipped and the
+    // residual is stored verbatim.
+    if lossless {
+        enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
+    }
 
     // ── part_mode ──────────────────────────────────────────────────────────
     // Present only when the CU equals the SPS minimum luma CB (8×8); we always
@@ -1464,18 +1500,32 @@ fn encode_cu(
         {
             *d = o as i32 - p as i32;
         }
-        let cb_level = crate::hevc_transform::quantize(
-            &crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits()),
-            ctb,
-            chroma_qp,
-            bit_depth.bits(),
-        );
-        let cr_level = crate::hevc_transform::quantize(
-            &crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits()),
-            ctb,
-            chroma_qp,
-            bit_depth.bits(),
-        );
+        // Row-major chroma "levels": quantized coefficients (lossy) or the raw
+        // residual stored verbatim (lossless / transquant bypass).
+        let (cb_level, cr_level): ([i16; 256], [i16; 256]) = if lossless {
+            let mut cbl = [0i16; 256];
+            let mut crl = [0i16; 256];
+            for i in 0..n_ch {
+                cbl[i] = b_res[i] as i16;
+                crl[i] = r_res[i] as i16;
+            }
+            (cbl, crl)
+        } else {
+            (
+                crate::hevc_transform::quantize(
+                    &crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits()),
+                    ctb,
+                    chroma_qp,
+                    bit_depth.bits(),
+                ),
+                crate::hevc_transform::quantize(
+                    &crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits()),
+                    ctb,
+                    chroma_qp,
+                    bit_depth.bits(),
+                ),
+            )
+        };
         let mut cb_zz = [0i16; 64];
         let mut cr_zz = [0i16; 64];
         for (&(r, c), dst) in chroma_scan.iter().zip(cb_zz.iter_mut()) {
@@ -1488,12 +1538,30 @@ fn encode_cu(
         let cr_nz = cr_zz.iter().any(|&x| x != 0);
 
         // Reconstruct this TB so the next stacked TB (4:2:2) sees it as a reference.
-        let b_dq = crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp, bit_depth.bits());
-        let b_inv = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits());
-        let b_rec = intra::reconstruct(&cb_pred, &b_inv, ctb, max_val);
-        let r_dq = crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp, bit_depth.bits());
-        let r_inv = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits());
-        let r_rec = intra::reconstruct(&cr_pred, &r_inv, ctb, max_val);
+        // Lossless: residual is the row-major level itself. Lossy: dequant + inverse.
+        let (b_rec, r_rec) = if lossless {
+            let mut b_res_rec = [0i32; 64];
+            let mut r_res_rec = [0i32; 64];
+            for i in 0..n_ch {
+                b_res_rec[i] = cb_level[i] as i32;
+                r_res_rec[i] = cr_level[i] as i32;
+            }
+            (
+                intra::reconstruct(&cb_pred, &b_res_rec, ctb, max_val),
+                intra::reconstruct(&cr_pred, &r_res_rec, ctb, max_val),
+            )
+        } else {
+            let b_dq =
+                crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp, bit_depth.bits());
+            let b_inv = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits());
+            let r_dq =
+                crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp, bit_depth.bits());
+            let r_inv = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits());
+            (
+                intra::reconstruct(&cb_pred, &b_inv, ctb, max_val),
+                intra::reconstruct(&cr_pred, &r_inv, ctb, max_val),
+            )
+        };
         for r in 0..ctb {
             for c in 0..ctb {
                 let (row, col) = (sub_ch_row + r, ch_col + c);
@@ -1519,14 +1587,27 @@ fn encode_cu(
         _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
     };
     let y_res = intra::compute_residual_i32(&y_orig, &y_pred, lu);
-    let y_tcoeff = crate::hevc_transform::fwd_transform(&y_res[..lu * lu], lu, bit_depth.bits());
-    let y_level = crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()); // row-major levels
-    // Reorder row-major levels into the mode-dependent scan for residual_coding.
-    // 8×8 luma uses a vertical/horizontal scan for modes 6..=14 / 22..=30 (else
-    // diagonal); 16×16 is always diagonal (HEVC §6.5).
+    // Mode-dependent scan for residual_coding. 8×8 luma uses a vertical/horizontal
+    // scan for modes 6..=14 / 22..=30 (else diagonal); 16×16 is always diagonal
+    // (HEVC §6.5).
     let luma_log2_ts: u32 = if lu == 16 { 4 } else { 3 };
     let luma_scan_idx = dct::scan_idx_for(luma_mode, luma_log2_ts, true, false);
     let luma_scan = dct::coeff_scan(luma_log2_ts, luma_scan_idx);
+    // Row-major "levels". Lossy: quantized forward-transform coefficients. Lossless
+    // (transquant bypass): the prediction residual stored verbatim — the decoder
+    // reads these back as the residual directly (HEVC §8.6.5, no scaling/transform).
+    let y_level: [i16; 256] = if lossless {
+        let mut lv = [0i16; 256];
+        for (d, &r) in lv[..lu * lu].iter_mut().zip(y_res[..lu * lu].iter()) {
+            *d = r as i16;
+        }
+        lv
+    } else {
+        let y_tcoeff =
+            crate::hevc_transform::fwd_transform(&y_res[..lu * lu], lu, bit_depth.bits());
+        crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()) // row-major levels
+    };
+    // Reorder row-major levels into the mode-dependent scan for residual_coding.
     let y_zigzag: Vec<i16> = luma_scan
         .iter()
         .map(|&(r, c)| y_level[r * lu + c])
@@ -1566,10 +1647,23 @@ fn encode_cu(
         }
     }
 
-    // ── Reconstruct luma (integer dequant + inverse transform) ─────────────
-    let y_dq = crate::hevc_transform::dequantize(&y_level, lu, qp, bit_depth.bits());
-    let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, lu, bit_depth.bits());
-    let y_rec = intra::reconstruct(&y_pred, &y_res_rec, lu, max_val);
+    // ── Reconstruct luma ────────────────────────────────────────────────────
+    // Lossless: the residual is the row-major `y_level` itself (pred + residual
+    // recovers the source exactly). Lossy: integer dequant + inverse transform.
+    let y_rec = if lossless {
+        let mut y_res_rec = [0i32; 256];
+        for (d, &l) in y_res_rec[..lu * lu]
+            .iter_mut()
+            .zip(y_level[..lu * lu].iter())
+        {
+            *d = l as i32;
+        }
+        intra::reconstruct(&y_pred, &y_res_rec, lu, max_val)
+    } else {
+        let y_dq = crate::hevc_transform::dequantize(&y_level, lu, qp, bit_depth.bits());
+        let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, lu, bit_depth.bits());
+        intra::reconstruct(&y_pred, &y_res_rec, lu, max_val)
+    };
     for r in 0..lu {
         for c in 0..lu {
             let (row, col) = (lu_row + r, lu_col + c);
@@ -1599,6 +1693,7 @@ fn code_one_cu(
     qp: u8,
     mode_map: &mut [u8],
     blk_stride: usize,
+    lossless: bool,
 ) {
     let PlaneStrides {
         w,
@@ -1640,6 +1735,7 @@ fn code_one_cu(
         chroma: yuv.chroma,
         bit_depth: yuv.bit_depth,
         lu,
+        lossless,
     };
     encode_cu(ent, &src, &mut rec, &geo, &par, mode_map);
 }
@@ -1777,13 +1873,14 @@ mod tests {
             48,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
+            crate::color::ColorEncoding::srgb(),
         );
         assert!(sps.data.len() > 10);
     }
 
     #[test]
     fn pps_builds_cleanly() {
-        let pps = build_pps(30);
+        let pps = build_pps(30, false);
         assert_eq!(pps.data[0], 0x44, "PPS first byte should be 0x44");
     }
 }

@@ -1557,8 +1557,8 @@ mod tests {
         NaluStream {
             nalus: vec![
                 build_vps(16, 16, chroma, bd),
-                build_sps(16, 16, chroma, bd),
-                build_pps(30),
+                build_sps(16, 16, chroma, bd, crate::color::ColorEncoding::srgb()),
+                build_pps(30, false),
             ],
         }
     }
