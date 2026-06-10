@@ -503,8 +503,6 @@ pub(crate) fn build_pps(qp: u8, lossless: bool) -> Nalu {
     }
 }
 
-// ─── IDR slice ───────────────────────────────────────────────────────────────
-
 /// Encode a still image as a single HEVC IDR picture.
 pub(crate) fn encode_intra(
     yuv: &Yuv,
