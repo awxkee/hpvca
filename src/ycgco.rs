@@ -102,7 +102,6 @@ pub(crate) fn rgb_to_ycgco(
         };
     }
 
-    // ── Plane allocation ──────────────────────────────────────────────────
     let sw = chroma.sub_w();
     let sh = chroma.sub_h();
     let cw = w.div_ceil(sw);

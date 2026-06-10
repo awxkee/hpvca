@@ -65,7 +65,7 @@ const TILE_SIZE: u32 = 512;
 /// let cfg = EncodeConfig::new()
 ///     .with_quality(90)
 ///     .with_chroma(ChromaFormat::Yuv444)
-///     .with_color(ColorMetadata::Cicp(ColorEncoding::bt2020_pq()));
+///     .with_color(ColorMetadata::cicp(ColorEncoding::bt2020_pq()));
 /// ```
 #[derive(Clone, Debug)]
 pub struct EncodeConfig {
@@ -130,13 +130,17 @@ impl EncodeConfig {
         self
     }
 
+    /// Attach an ICC profile (`prof` colr box), preserving any CICP encoding already
+    /// set. Chain with [`Self::with_cicp`] to signal both at once.
     pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
-        self.color = ColorMetadata::Icc(icc);
+        self.color.icc = Some(icc);
         self
     }
 
+    /// Set the CICP encoding (`nclx` colr box), preserving any ICC profile already
+    /// set. Chain with [`Self::with_icc_profile`] to signal both at once.
     pub fn with_cicp(mut self, enc: ColorEncoding) -> Self {
-        self.color = ColorMetadata::Cicp(enc);
+        self.color.cicp = Some(enc);
         self
     }
 
@@ -568,22 +572,22 @@ fn encode_rgb_wide(
     };
     yuv = yuv.with_display(width, height);
     if local_cfg.lossless {
-        local_cfg.color = match local_cfg.color {
-            ColorMetadata::Cicp(cicp) => ColorMetadata::Cicp(ColorEncoding {
-                primaries: cicp.primaries,
-                transfer: cicp.transfer,
-                matrix: MatrixCoefficients::YCgCo,
-                full_range: true,
-            }),
-            ColorMetadata::Icc(_) => ColorMetadata::Cicp(ColorEncoding {
-                primaries: Primaries::Bt709,
-                transfer: TransferFunction::Srgb,
-                matrix: MatrixCoefficients::YCgCo,
-                full_range: true,
-            }),
-        };
+        force_ycgco_matrix(&mut local_cfg.color);
     }
     encode_yuv_raw(&yuv, &local_cfg)
+}
+
+/// Override the CICP matrix to YCgCo for the lossless RGB path, preserving the
+/// configured primaries/transfer (defaulting to BT.709/sRGB) and **leaving any ICC
+/// profile in place** so a co-set `prof` box still travels with the image.
+fn force_ycgco_matrix(color: &mut ColorMetadata) {
+    let base = color.cicp.unwrap_or_else(ColorEncoding::srgb);
+    color.cicp = Some(ColorEncoding {
+        primaries: base.primaries,
+        transfer: base.transfer,
+        matrix: MatrixCoefficients::YCgCo,
+        full_range: true,
+    });
 }
 
 /// Core RGBA-with-alpha path. Dispatches to a paired color+alpha grid for
@@ -862,20 +866,7 @@ fn encode_rgb_tiled(
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
 
     if cfg.lossless {
-        cfg.color = match cfg.color {
-            ColorMetadata::Cicp(cicp) => ColorMetadata::Cicp(ColorEncoding {
-                primaries: cicp.primaries,
-                transfer: cicp.transfer,
-                matrix: MatrixCoefficients::YCgCo,
-                full_range: true,
-            }),
-            ColorMetadata::Icc(_) => ColorMetadata::Cicp(ColorEncoding {
-                primaries: Primaries::Bt709,
-                transfer: TransferFunction::Srgb,
-                matrix: MatrixCoefficients::YCgCo,
-                full_range: true,
-            }),
-        };
+        force_ycgco_matrix(&mut cfg.color);
     }
 
     let n = (cols * rows) as usize;

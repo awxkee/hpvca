@@ -96,18 +96,48 @@ fn patch(buf: &mut [u8], start: usize) {
     buf[start..start + 4].copy_from_slice(&size.to_be_bytes());
 }
 
+/// Write the *primary* `colr` box (the fixed index-2 ipco property): `nclx` when a
+/// CICP encoding is present, otherwise the ICC `prof`. When both a CICP encoding and
+/// an ICC profile are set, the ICC profile is emitted separately as a *secondary*
+/// `colr` box via [`write_secondary_colr`] (HEIF allows one `nclx` and one `prof`
+/// `colr` box on the same item).
 fn write_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
-    use crate::color::ColorMetadata;
+    if let Some(enc) = color.cicp.as_ref() {
+        write_colr_nclx(f, enc);
+    } else if let Some(icc) = color.icc.as_ref() {
+        write_colr_icc(f, icc);
+    } else {
+        write_colr_nclx(f, &crate::color::ColorEncoding::srgb());
+    }
+}
+
+fn write_colr_nclx(f: &mut Vec<u8>, enc: &crate::color::ColorEncoding) {
     let sh = f.len();
     write_box(f, b"colr");
-    match color {
-        ColorMetadata::Cicp(enc) => f.extend_from_slice(&enc.nclx_payload()),
-        ColorMetadata::Icc(icc) => {
-            f.extend_from_slice(b"prof");
-            f.extend_from_slice(icc);
-        }
-    }
+    f.extend_from_slice(&enc.nclx_payload());
     patch(f, sh);
+}
+
+fn write_colr_icc(f: &mut Vec<u8>, icc: &[u8]) {
+    let sh = f.len();
+    write_box(f, b"colr");
+    f.extend_from_slice(b"prof");
+    f.extend_from_slice(icc);
+    patch(f, sh);
+}
+
+/// True when both a CICP encoding and an ICC profile are present, so a second `colr`
+/// box must be emitted (and associated) in addition to the primary one.
+fn has_secondary_colr(color: &crate::color::ColorMetadata) -> bool {
+    color.cicp.is_some() && color.icc.is_some()
+}
+
+/// Emit the secondary `colr` box — the ICC `prof` — used when both descriptors are
+/// set. The primary box already carried the `nclx`. No-op otherwise.
+fn write_secondary_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
+    if let (Some(_), Some(icc)) = (color.cicp.as_ref(), color.icc.as_ref()) {
+        write_colr_icc(f, icc);
+    }
 }
 
 /// Write ftyp. RExt profiles (4:2:2, 4:4:4, or 12-bit 4:2:0) use `heix`;
@@ -241,6 +271,8 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         let mut irot_idx = 0u8;
         let mut imir_idx = 0u8;
         let mut clli_idx = 0u8;
+
+        let mut colr2_idx = 0u8;
         {
             let si = f.len();
             write_box(&mut f, b"ipco");
@@ -295,6 +327,11 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             }
             // 8+: optional
             let mut next_prop: u8 = 8;
+            if has_secondary_colr(color_meta) {
+                write_secondary_colr(&mut f, color_meta);
+                colr2_idx = next_prop;
+                next_prop += 1;
+            }
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
                 write_box(&mut f, b"irot");
@@ -329,6 +366,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             w32(&mut f, 2);
             // color: hvcC(1*) colr(2) ispe(3) pixi(4) + optionals
             let mut ca: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            if colr2_idx != 0 {
+                ca.push(colr2_idx);
+            }
             if irot_idx != 0 {
                 ca.push(0x80 | irot_idx);
             }
@@ -478,7 +518,7 @@ pub(crate) fn wrap_hevc_image(
     }
 
     {
-        let extra_props: (u8, u8, u8);
+        let extra_props: (u8, u8, u8, u8);
         let s = f.len();
         write_box(&mut f, b"iprp");
 
@@ -520,6 +560,13 @@ pub(crate) fn wrap_hevc_image(
             let mut irot_idx = 0u8;
             let mut imir_idx = 0u8;
             let mut clli_idx = 0u8;
+
+            let mut colr2_idx = 0u8;
+            if has_secondary_colr(color_meta) {
+                write_secondary_colr(&mut f, color_meta);
+                colr2_idx = next_prop;
+                next_prop += 1;
+            }
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
                 write_box(&mut f, b"irot");
@@ -545,14 +592,17 @@ pub(crate) fn wrap_hevc_image(
                 next_prop += 1;
             }
             let _ = next_prop;
-            extra_props = (irot_idx, imir_idx, clli_idx);
+            extra_props = (irot_idx, imir_idx, clli_idx, colr2_idx);
             patch(&mut f, si);
         }
 
         {
-            let (irot_idx, imir_idx, clli_idx) = extra_props;
+            let (irot_idx, imir_idx, clli_idx, colr2_idx) = extra_props;
             // ipma: hvcC(1*) colr(2) ispe(3) pixi(4) + optionals
             let mut assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            if colr2_idx != 0 {
+                assoc.push(colr2_idx);
+            }
             if irot_idx != 0 {
                 assoc.push(0x80 | irot_idx);
             }
@@ -921,6 +971,8 @@ pub(crate) fn wrap_hevc_grid(
         let mut irot_idx = 0u8;
         let mut imir_idx = 0u8;
         let mut clli_idx = 0u8;
+
+        let mut colr2_idx = 0u8;
         {
             let si = f.len();
             write_box(&mut f, b"ipco");
@@ -961,6 +1013,11 @@ pub(crate) fn wrap_hevc_grid(
             }
             // 6+: orientation / HDR (applied to the grid item)
             let mut next: u8 = 6;
+            if has_secondary_colr(color_meta) {
+                write_secondary_colr(&mut f, color_meta);
+                colr2_idx = next;
+                next += 1;
+            }
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
                 write_box(&mut f, b"irot");
@@ -1010,6 +1067,9 @@ pub(crate) fn wrap_hevc_grid(
             // Grid item: ispe_full(3) + colr(4,essential) + pixi(5) + optional transforms
             w16(&mut f, grid_id);
             let mut ga: Vec<u8> = vec![3, 0x80 | 4, 5]; // colr marked essential
+            if colr2_idx != 0 {
+                ga.push(colr2_idx); // secondary ICC colr, non-essential
+            }
             if irot_idx != 0 {
                 ga.push(0x80 | irot_idx);
             }
@@ -1364,6 +1424,8 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
     let mut irot_idx = 0u8;
     let mut imir_idx = 0u8;
     let mut clli_idx = 0u8;
+
+    let mut colr2_idx = 0u8;
     {
         let s = f.len();
         write_box(&mut f, b"iprp");
@@ -1429,6 +1491,11 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             }
             // 9+: orientation / HDR (color grid only)
             let mut next: u8 = 9;
+            if has_secondary_colr(color_meta) {
+                write_secondary_colr(&mut f, color_meta);
+                colr2_idx = next;
+                next += 1;
+            }
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
                 write_box(&mut f, b"irot");
@@ -1473,6 +1540,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             // Color grid: ispe_full(3) colr(4*) pixi(5) + optionals
             w16(&mut f, color_grid_id);
             let mut ga: Vec<u8> = vec![3, 0x80 | 4, 5];
+            if colr2_idx != 0 {
+                ga.push(colr2_idx); // secondary ICC colr, non-essential
+            }
             if irot_idx != 0 {
                 ga.push(0x80 | irot_idx);
             }

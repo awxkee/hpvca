@@ -213,35 +213,61 @@ impl Default for ColorEncoding {
     }
 }
 
-/// How the output colour space is described in the file. Either an enumerated CICP
-/// encoding (compact `nclx`) or an embedded ICC profile (`prof`).
-///
-/// Apple's ImageIO has historically rendered some `nclx`-only HEICs as black, so the
-/// default ([`ColorMetadata::icc_srgb`]) embeds an sRGB ICC profile. Use
-/// [`ColorMetadata::Cicp`] for compact CICP signalling (e.g. HDR) when the target
-/// decoder honours it.
+/// How the output colour space is described in the file.
 #[derive(Clone, Debug)]
-pub enum ColorMetadata {
-    /// Enumerated CICP code points → `colr` box of type `nclx`.
-    Cicp(ColorEncoding),
-    /// Embedded ICC profile bytes → `colr` box of type `prof`.
-    Icc(Vec<u8>),
+pub struct ColorMetadata {
+    pub cicp: Option<ColorEncoding>,
+    pub icc: Option<Vec<u8>>,
 }
 
 impl ColorMetadata {
-    /// The colour-authoring encoding these metadata imply, used to drive the VUI.
-    /// An ICC profile is treated as sRGB for VUI purposes (the working space).
-    pub fn color_encoding(&self) -> ColorEncoding {
-        match self {
-            ColorMetadata::Cicp(c) => *c,
-            ColorMetadata::Icc(_) => ColorEncoding::srgb(),
+    /// CICP-only signalling (`nclx` box).
+    pub fn cicp(enc: ColorEncoding) -> Self {
+        ColorMetadata {
+            cicp: Some(enc),
+            icc: None,
         }
+    }
+
+    /// ICC-only signalling (`prof` box).
+    pub fn icc(profile: Vec<u8>) -> Self {
+        ColorMetadata {
+            cicp: None,
+            icc: Some(profile),
+        }
+    }
+
+    /// Both an enumerated CICP encoding and an embedded ICC profile. Emits an `nclx`
+    /// `colr` box and a `prof` `colr` box.
+    pub fn cicp_and_icc(enc: ColorEncoding, profile: Vec<u8>) -> Self {
+        ColorMetadata {
+            cicp: Some(enc),
+            icc: Some(profile),
+        }
+    }
+
+    /// Set (or replace) the CICP encoding, leaving any ICC profile in place.
+    pub fn with_cicp(mut self, enc: ColorEncoding) -> Self {
+        self.cicp = Some(enc);
+        self
+    }
+
+    /// Set (or replace) the ICC profile, leaving any CICP encoding in place.
+    pub fn with_icc(mut self, profile: Vec<u8>) -> Self {
+        self.icc = Some(profile);
+        self
+    }
+
+    /// The colour-authoring encoding these metadata imply, used to drive the VUI.
+    /// Falls back to sRGB when only an ICC profile is present (the working space).
+    pub fn color_encoding(&self) -> ColorEncoding {
+        self.cicp.unwrap_or_else(ColorEncoding::srgb)
     }
 }
 
 impl Default for ColorMetadata {
     fn default() -> Self {
-        ColorMetadata::Cicp(ColorEncoding::default())
+        ColorMetadata::cicp(ColorEncoding::default())
     }
 }
 
