@@ -258,7 +258,7 @@ impl ColorMetadata {
         self
     }
 
-    /// The colour-authoring encoding these metadata imply, used to drive the VUI.
+    /// The color-authoring encoding these metadata imply, used to drive the VUI.
     /// Falls back to sRGB when only an ICC profile is present (the working space).
     pub fn color_encoding(&self) -> ColorEncoding {
         self.cicp.unwrap_or_else(ColorEncoding::srgb)
