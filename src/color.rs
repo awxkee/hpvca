@@ -193,6 +193,21 @@ impl ColorEncoding {
         }
     }
 
+    /// Unspecified colorimetry (CICP value 2 for primaries/transfer/matrix),
+    /// full range. Use this — or simply leave the CICP unset — when the color
+    /// space should not be asserted in the file. Note the encoder always
+    /// performs the RGB→YCbCr conversion with full-range BT.709 math regardless,
+    /// so "unspecified" signals only the *display* interpretation; a decoder may
+    /// fall back to its own default matrix.
+    pub const fn unspecified() -> Self {
+        ColorEncoding {
+            primaries: Primaries::Unspecified,
+            transfer: TransferFunction::Unspecified,
+            matrix: MatrixCoefficients::Unspecified,
+            full_range: true,
+        }
+    }
+
     /// The `nclx` payload for a HEIF `colr` box (without the box header):
     /// `colour_type` ('nclx') + the four CICP fields. The `full_range_flag` occupies
     /// the top bit of the final byte; the low 7 bits are reserved zero.
@@ -209,7 +224,7 @@ impl ColorEncoding {
 
 impl Default for ColorEncoding {
     fn default() -> Self {
-        ColorEncoding::srgb()
+        ColorEncoding::unspecified()
     }
 }
 

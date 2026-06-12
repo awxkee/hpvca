@@ -107,7 +107,10 @@ fn write_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
     } else if let Some(icc) = color.icc.as_ref() {
         write_colr_icc(f, icc);
     } else {
-        write_colr_nclx(f, &crate::color::ColorEncoding::srgb());
+        // No CICP and no ICC: signal Unspecified colorimetry rather than
+        // fabricating sRGB (keeps the colr box present so property indices stay
+        // fixed; the encoder's YCbCr math is still full-range BT.709).
+        write_colr_nclx(f, &crate::color::ColorEncoding::unspecified());
     }
 }
 
@@ -1627,7 +1630,13 @@ mod tests {
         NaluStream {
             nalus: vec![
                 build_vps(16, 16, chroma, bd),
-                build_sps(16, 16, chroma, bd, crate::color::ColorEncoding::srgb()),
+                build_sps(
+                    16,
+                    16,
+                    chroma,
+                    bd,
+                    Some(&crate::color::ColorEncoding::srgb()),
+                ),
                 build_pps(30, false),
             ],
         }

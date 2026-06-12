@@ -523,7 +523,7 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         yuv.height,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -637,7 +637,7 @@ fn encode_rgba_with_alpha_wide(
         enc_h,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -647,7 +647,7 @@ fn encode_rgba_with_alpha_wide(
         enc_h,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -728,7 +728,7 @@ fn encode_gray_alpha_wide(
         enc_h,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -738,7 +738,7 @@ fn encode_gray_alpha_wide(
         enc_h,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -762,7 +762,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         yuv.height,
         cfg.quality,
         cfg.lossless,
-        cfg.color.color_encoding(),
+        cfg.color.cicp,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -885,7 +885,7 @@ fn encode_rgb_tiled(
             enc_th,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -937,7 +937,7 @@ fn encode_gray_tiled(
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1018,7 +1018,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             enc_th,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1083,7 +1083,7 @@ fn encode_rgba_alpha_tiled(
             enc_th,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1101,7 +1101,7 @@ fn encode_rgba_alpha_tiled(
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1174,7 +1174,7 @@ fn encode_gray_alpha_tiled(
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1191,7 +1191,7 @@ fn encode_gray_alpha_tiled(
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
-            cfg.color.color_encoding(),
+            cfg.color.cicp,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;

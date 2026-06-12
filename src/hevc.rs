@@ -289,7 +289,7 @@ pub(crate) fn build_sps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    color: crate::color::ColorEncoding,
+    color: Option<&crate::color::ColorEncoding>,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -384,7 +384,7 @@ pub(crate) fn build_sps(
 
     // VUI parameters: colour info so decoders display correctly
     bw.write_bit(true); // vui_parameters_present_flag
-    write_vui(&mut bw, &color);
+    write_vui(&mut bw, color);
 
     // sps_extension: RExt profiles require sps_range_extension to be present
     // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
@@ -416,24 +416,35 @@ pub(crate) fn build_sps(
     }
 }
 
-/// Write minimal VUI (Annex E §E.2.1). The colour primaries / transfer /
-/// matrix_coefficients and full-range flag are taken from the configured
-/// [`ColorEncoding`] so the in-stream VUI matches the `colr`/nclx box. Writing a
-/// fixed BT.709 matrix here (the old behaviour) silently contradicts a non-709
-/// `colr` such as YCgCo (matrix 8), which makes decoders that read the VUI apply
-/// the wrong inverse matrix.
-fn write_vui(bw: &mut BitWriter, color: &crate::color::ColorEncoding) {
+/// Write minimal VUI (Annex E §E.2.1). When a [`ColorEncoding`] is supplied its
+/// primaries / transfer / matrix_coefficients and full-range flag are signalled
+/// so the in-stream VUI matches the `colr`/nclx box (a fixed BT.709 matrix here
+/// would silently contradict a non-709 `colr` such as YCgCo, making decoders
+/// apply the wrong inverse matrix).
+///
+/// When `color` is `None` the colorimetry is left **unspecified**:
+/// `colour_description_present_flag = 0`. The `video_signal_type` is still
+/// signalled with `video_full_range_flag` so the sample range is unambiguous —
+/// the encoder always converts in full range, so that flag defaults to set.
+fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::ColorEncoding>) {
     bw.write_bit(false); // aspect_ratio_info_present_flag
     bw.write_bit(false); // overscan_info_present_flag
 
     // video_signal_type_present_flag = true
     bw.write_bit(true);
     bw.write_bits(5, 3); // video_format = 5 (unspecified)
-    bw.write_bit(color.full_range); // video_full_range_flag
-    bw.write_bit(true); // colour_description_present_flag
-    bw.write_bits(color.primaries as u32, 8); // colour_primaries
-    bw.write_bits(color.transfer as u32, 8); // transfer_characteristics
-    bw.write_bits(color.matrix as u32, 8); // matrix_coefficients (e.g. 8 = YCgCo)
+    bw.write_bit(color.map(|c| c.full_range).unwrap_or(true)); // video_full_range_flag
+    match color {
+        Some(c) => {
+            bw.write_bit(true); // colour_description_present_flag
+            bw.write_bits(c.primaries as u32, 8); // colour_primaries
+            bw.write_bits(c.transfer as u32, 8); // transfer_characteristics
+            bw.write_bits(c.matrix as u32, 8); // matrix_coefficients (e.g. 8 = YCgCo)
+        }
+        None => {
+            bw.write_bit(false); // colour_description_present_flag = 0 (unspecified)
+        }
+    }
 
     bw.write_bit(false); // chroma_loc_info_present_flag
     bw.write_bit(false); // neutral_chroma_indication_flag
@@ -510,10 +521,10 @@ pub(crate) fn encode_intra(
     height: u32,
     quality: u8,
     lossless: bool,
-    color: crate::color::ColorEncoding,
+    color: Option<crate::color::ColorEncoding>,
 ) -> Result<NaluStream, EncodeError> {
     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
-    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth, color);
+    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth, color.as_ref());
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
     let pps = build_pps(qp_val, lossless);
     let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality, lossless)?;
@@ -1871,7 +1882,7 @@ mod tests {
             48,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
-            crate::color::ColorEncoding::srgb(),
+            Some(&crate::color::ColorEncoding::srgb()),
         );
         assert!(sps.data.len() > 10);
     }

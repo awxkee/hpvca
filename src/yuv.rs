@@ -163,16 +163,16 @@ impl Yuv {
 const Q13: i32 = 1 << 13;
 const Q13_HALF: i32 = 1 << 12;
 
-/// BT.709 luma coefficients in Q0.13.
-const KR: i32 = (0.2126_f64 * Q13 as f64) as i32; // 1742
-const KG: i32 = (0.7152_f64 * Q13 as f64) as i32; // 5865
-const KB: i32 = (0.0722_f64 * Q13 as f64) as i32; // 592
+/// BT.601 luma coefficients in Q0.13.
+const KR: i32 = (0.299_f64 * Q13 as f64) as i32; // 2449
+const KG: i32 = (0.587_f64 * Q13 as f64) as i32; // 4809
+const KB: i32 = (0.114_f64 * Q13 as f64) as i32; // 934
 
 /// Chroma reciprocal scales in Q0.13.
-/// diff is Q0 (±maxv), so diff * REC_*_Q13 fits in i32 at 12-bit:
-/// 4095 * 5202 = 21_302_490 < 2^25. Safe.
-const REC_CB_Q13: i32 = (Q13 as f64 / 1.8556_f64) as i32; // 4416
-const REC_CR_Q13: i32 = (Q13 as f64 / 1.5748_f64) as i32; // 5202
+/// Cb denom: 2 × (1 − Kb) = 2 × 0.886  = 1.772
+/// Cr denom: 2 × (1 − Kr) = 2 × 0.701  = 1.402
+const REC_CB_Q13: i32 = (Q13 as f64 / 1.772_f64) as i32; // 4625
+const REC_CR_Q13: i32 = (Q13 as f64 / 1.402_f64) as i32; // 5841
 
 /// Luma dot product in Q13. Call q13_round() to get a pixel value.
 #[inline(always)]
@@ -258,7 +258,6 @@ pub(crate) fn rgb_to_yuv(
         };
     }
 
-    // ── Plane allocation ──────────────────────────────────────────────────
     let sw = chroma.sub_w();
     let sh = chroma.sub_h();
     let cw = w.div_ceil(sw);
