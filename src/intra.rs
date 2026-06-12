@@ -692,7 +692,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn angular_mode18_negative_diagonal() {
         // Mode 18 (angle −32, vertical): predSamples[x][y] = ref[x−y], where the
         // negative half of ref is the left column projected via invAngle.

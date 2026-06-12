@@ -513,6 +513,7 @@ pub fn encode_gray_alpha12_with_alpha(
 /// [`Yuv::from_planes`] or [`yuv::rgb_to_yuv`] to produce a conformant
 /// [`Yuv`]; those functions validate plane sizes on construction.
 pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    yuv.validate()?;
     cfg.validate()?;
     if needs_tiling(yuv.display_w, yuv.display_h) {
         return encode_yuv_tiled(yuv, cfg);
@@ -672,6 +673,8 @@ fn encode_gray_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    validate_buf_u16(gray, width, height, 1)?;
     if needs_tiling(width, height) {
         return encode_gray_tiled(gray, width, height, bit_depth, cfg);
     }
@@ -695,6 +698,8 @@ fn encode_gray_alpha_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    validate_buf_u16(ya, width, height, 2)?;
     if needs_tiling(width, height) {
         return encode_gray_alpha_tiled(ya, width, height, bit_depth, cfg);
     }
@@ -754,6 +759,61 @@ fn encode_gray_alpha_wide(
     )
 }
 
+pub fn encode_yuv_with_alpha(
+    yuv: &Yuv,
+    alpha: &[u16],
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    yuv.validate()?;
+    cfg.validate()?;
+    if alpha.len() != yuv.y.len() {
+        return Err(EncodeError::InvalidInput);
+    }
+    if needs_tiling(yuv.display_w, yuv.display_h) {
+        return encode_yuv_alpha_tiled(yuv, alpha, cfg);
+    }
+
+    // Color image — identical to encode_yuv's single-item path.
+    let color_stream = hevc::encode_intra(
+        yuv,
+        yuv.width,
+        yuv.height,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.cicp,
+    )?;
+
+    // Alpha auxiliary image — monochrome, coded at the colour image's dimensions.
+    let alpha_yuv = build_mono_yuv(
+        alpha.to_vec(),
+        yuv.width,
+        yuv.height,
+        yuv.display_w,
+        yuv.display_h,
+        yuv.bit_depth,
+    );
+    let alpha_stream = hevc::encode_intra(
+        &alpha_yuv,
+        yuv.width,
+        yuv.height,
+        cfg.quality,
+        cfg.lossless,
+        cfg.color.cicp,
+    )?;
+
+    isobmff::wrap_hevc_image_with_alpha(
+        &color_stream,
+        &alpha_stream,
+        yuv.display_w,
+        yuv.display_h,
+        isobmff::ImageMeta {
+            bit_depth: yuv.bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
+    )
+}
+
 /// Wrap an already-built [`Yuv`] into a HEIC bitstream (no re-validation).
 fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
     let nalu_stream = hevc::encode_intra(
@@ -797,8 +857,6 @@ fn build_mono_yuv(
         bit_depth,
     }
 }
-
-// ── Tiling helpers ────────────────────────────────────────────────────────────
 
 /// Resolve a configured thread preference to a concrete worker count. `0` means
 /// "auto": the number of hardware threads the platform reports, or 1 if it
@@ -914,6 +972,8 @@ fn encode_gray_tiled(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    validate_buf_u16(gray, width, height, 1)?;
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
 
@@ -952,6 +1012,117 @@ fn encode_gray_tiled(
         },
         isobmff::ImageMeta {
             bit_depth,
+            color_meta: &cfg.color,
+            metadata: &cfg.metadata,
+        },
+    )
+}
+
+fn encode_yuv_alpha_tiled(
+    yuv: &Yuv,
+    alpha: &[u16],
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    let cols = yuv.display_w.div_ceil(TILE_SIZE);
+    let rows = yuv.display_h.div_ceil(TILE_SIZE);
+    let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, yuv.chroma);
+
+    let sw = yuv.chroma.sub_w() as u32;
+    let sh = yuv.chroma.sub_h() as u32;
+    // Chroma tile dimensions after subsampling.
+    let c_tw = (enc_tw / sw) as usize;
+    let c_th = (enc_th / sh) as usize;
+    // Full chroma plane dimensions (yuv.width is already chroma-even padded).
+    let c_src_w = (yuv.width / sw) as usize;
+    let c_src_h = (yuv.height / sh) as usize;
+
+    let n = (cols * rows) as usize;
+    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+        let row = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        let x0 = (col * TILE_SIZE) as usize;
+        let y0 = (row * TILE_SIZE) as usize;
+
+        let y_tile = extract_plane_tile(
+            &yuv.y,
+            yuv.width as usize,
+            yuv.height as usize,
+            x0,
+            y0,
+            enc_tw as usize,
+            enc_th as usize,
+        );
+        let (cb_tile, cr_tile) = if yuv.chroma.is_monochrome() {
+            (Vec::new(), Vec::new())
+        } else {
+            let cx0 = x0 / sw as usize;
+            let cy0 = y0 / sh as usize;
+            (
+                extract_plane_tile(&yuv.cb, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+                extract_plane_tile(&yuv.cr, c_src_w, c_src_h, cx0, cy0, c_tw, c_th),
+            )
+        };
+
+        let tile_yuv = Yuv {
+            y: y_tile,
+            cb: cb_tile,
+            cr: cr_tile,
+            width: enc_tw,
+            height: enc_th,
+            display_w: enc_tw,
+            display_h: enc_th,
+            chroma: yuv.chroma,
+            bit_depth: yuv.bit_depth,
+        };
+        let color = hevc::encode_intra(
+            &tile_yuv,
+            enc_tw,
+            enc_th,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.cicp,
+        )?;
+
+        let alpha_tile = extract_plane_tile(
+            alpha,
+            yuv.width as usize,
+            yuv.height as usize,
+            x0,
+            y0,
+            enc_tw as usize,
+            enc_th as usize,
+        );
+        let alpha_yuv = build_mono_yuv(alpha_tile, enc_tw, enc_th, enc_tw, enc_th, yuv.bit_depth);
+        let alpha = hevc::encode_intra(
+            &alpha_yuv,
+            enc_tw,
+            enc_th,
+            cfg.quality,
+            cfg.lossless,
+            cfg.color.cicp,
+        )?;
+        Ok::<_, EncodeError>((color, alpha))
+    })?;
+    let mut color_streams = Vec::with_capacity(n);
+    let mut alpha_streams = Vec::with_capacity(n);
+    for (color, alpha) in pairs {
+        color_streams.push(color);
+        alpha_streams.push(alpha);
+    }
+
+    isobmff::wrap_hevc_grid_with_alpha(
+        &color_streams,
+        &alpha_streams,
+        isobmff::GridDims {
+            cols,
+            rows,
+            tile_w: enc_tw,
+            tile_h: enc_th,
+            full_w: yuv.display_w,
+            full_h: yuv.display_h,
+        },
+        isobmff::ImageMeta {
+            bit_depth: yuv.bit_depth,
             color_meta: &cfg.color,
             metadata: &cfg.metadata,
         },
@@ -1140,6 +1311,8 @@ fn encode_gray_alpha_tiled(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    validate_buf_u16(ya, width, height, 2)?;
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
@@ -1692,5 +1865,37 @@ mod tests {
     fn pad_noop_when_aligned() {
         let src: Vec<u16> = (0..12).collect();
         assert_eq!(pad_buf::<3>(&src, 2, 2, 2, 2), src);
+    }
+
+    #[test]
+    fn encode_yuv_with_alpha_roundtrips() {
+        let rgb = vec![128u16; 16 * 16 * 3];
+        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv420, BitDepth::Eight);
+        let alpha = vec![200u16; 16 * 16];
+        let out = encode_yuv_with_alpha(&yuv, &alpha, &cfg()).unwrap();
+        assert!(out.len() > 100);
+        assert_eq!(&out[4..8], b"ftyp");
+        // The auxiliary alpha item adds an `auxl` item reference.
+        assert!(
+            out.windows(4).any(|w| w == b"auxl"),
+            "expected an auxl reference for the alpha aux image"
+        );
+    }
+
+    #[test]
+    fn encode_yuv_with_alpha_444_roundtrips() {
+        let rgb = vec![64u16; 16 * 16 * 3];
+        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv444, BitDepth::Eight);
+        let alpha = vec![255u16; 16 * 16];
+        let out = encode_yuv_with_alpha(&yuv, &alpha, &cfg()).unwrap();
+        assert_eq!(&out[4..8], b"ftyp");
+    }
+
+    #[test]
+    fn encode_yuv_with_alpha_rejects_bad_alpha_len() {
+        let rgb = vec![128u16; 16 * 16 * 3];
+        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv420, BitDepth::Eight);
+        let short_alpha = vec![0u16; 16 * 16 - 1];
+        assert!(encode_yuv_with_alpha(&yuv, &short_alpha, &cfg()).is_err());
     }
 }
