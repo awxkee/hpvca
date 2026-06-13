@@ -1630,13 +1630,7 @@ mod tests {
         NaluStream {
             nalus: vec![
                 build_vps(16, 16, chroma, bd),
-                build_sps(
-                    16,
-                    16,
-                    chroma,
-                    bd,
-                    Some(&crate::color::Cicp::srgb()),
-                ),
+                build_sps(16, 16, chroma, bd, Some(&crate::color::Cicp::srgb())),
                 build_pps(30, false),
             ],
         }
