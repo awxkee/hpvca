@@ -289,7 +289,7 @@ pub(crate) fn build_sps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -426,7 +426,7 @@ pub(crate) fn build_sps(
 /// `colour_description_present_flag = 0`. The `video_signal_type` is still
 /// signalled with `video_full_range_flag` so the sample range is unambiguous —
 /// the encoder always converts in full range, so that flag defaults to set.
-fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::ColorEncoding>) {
+fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
     bw.write_bit(false); // aspect_ratio_info_present_flag
     bw.write_bit(false); // overscan_info_present_flag
 
@@ -521,7 +521,7 @@ pub(crate) fn encode_intra(
     height: u32,
     quality: u8,
     lossless: bool,
-    color: Option<crate::color::ColorEncoding>,
+    color: Option<crate::color::Cicp>,
 ) -> Result<NaluStream, EncodeError> {
     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
     let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth, color.as_ref());
@@ -1882,7 +1882,7 @@ mod tests {
             48,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
         );
         assert!(sps.data.len() > 10);
     }

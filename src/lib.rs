@@ -42,7 +42,7 @@ mod metadata;
 mod ycgco;
 mod yuv;
 
-pub use color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
+pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
@@ -139,7 +139,7 @@ impl EncodeConfig {
 
     /// Set the CICP encoding (`nclx` colr box), preserving any ICC profile already
     /// set. Chain with [`Self::with_icc_profile`] to signal both at once.
-    pub fn with_cicp(mut self, enc: ColorEncoding) -> Self {
+    pub fn with_cicp(mut self, enc: Cicp) -> Self {
         self.color.cicp = Some(enc);
         self
     }
@@ -582,8 +582,8 @@ fn encode_rgb_wide(
 /// configured primaries/transfer (defaulting to BT.709/sRGB) and **leaving any ICC
 /// profile in place** so a co-set `prof` box still travels with the image.
 fn force_ycgco_matrix(color: &mut ColorMetadata) {
-    let base = color.cicp.unwrap_or_else(ColorEncoding::srgb);
-    color.cicp = Some(ColorEncoding {
+    let base = color.cicp.unwrap_or_else(Cicp::srgb);
+    color.cicp = Some(Cicp {
         primaries: base.primaries,
         transfer: base.transfer,
         matrix: MatrixCoefficients::YCgCo,

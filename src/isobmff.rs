@@ -110,11 +110,11 @@ fn write_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
         // No CICP and no ICC: signal Unspecified colorimetry rather than
         // fabricating sRGB (keeps the colr box present so property indices stay
         // fixed; the encoder's YCbCr math is still full-range BT.709).
-        write_colr_nclx(f, &crate::color::ColorEncoding::unspecified());
+        write_colr_nclx(f, &crate::color::Cicp::unspecified());
     }
 }
 
-fn write_colr_nclx(f: &mut Vec<u8>, enc: &crate::color::ColorEncoding) {
+fn write_colr_nclx(f: &mut Vec<u8>, enc: &crate::color::Cicp) {
     let sh = f.len();
     write_box(f, b"colr");
     f.extend_from_slice(&enc.nclx_payload());
@@ -1635,7 +1635,7 @@ mod tests {
                     16,
                     chroma,
                     bd,
-                    Some(&crate::color::ColorEncoding::srgb()),
+                    Some(&crate::color::Cicp::srgb()),
                 ),
                 build_pps(30, false),
             ],

@@ -150,22 +150,19 @@ pub enum MatrixCoefficients {
     YCgCoRo = 17,                // YCgCo-Ro (YCgCo-R type odd),
 }
 
-/// CICP-style colour encoding: the primaries + transfer + matrix the image is
-/// authored in, plus the sample range. Drives both the HEIF `colr` (nclx) box and
-/// the HEVC VUI signalling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColorEncoding {
+pub struct Cicp {
     pub primaries: Primaries,
     pub transfer: TransferFunction,
     pub matrix: MatrixCoefficients,
     pub full_range: bool,
 }
 
-impl ColorEncoding {
+impl Cicp {
     /// sRGB: BT.709 primaries, sRGB transfer, BT.709 matrix, full range. This is the
     /// encoder's working colour space (full-range BT.709 RGB→YCbCr).
     pub const fn srgb() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             matrix: MatrixCoefficients::Bt709,
@@ -175,7 +172,7 @@ impl ColorEncoding {
 
     /// BT.709 video: BT.709 primaries/transfer/matrix, full range.
     pub const fn bt709() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Bt709,
             matrix: MatrixCoefficients::Bt709,
@@ -185,7 +182,7 @@ impl ColorEncoding {
 
     /// BT.2020 PQ (HDR10): BT.2020 primaries, PQ transfer, BT.2020 NCL matrix.
     pub const fn bt2020_pq() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt2020,
             transfer: TransferFunction::Smpte2084,
             matrix: MatrixCoefficients::Bt2020Ncl,
@@ -200,7 +197,7 @@ impl ColorEncoding {
     /// so "unspecified" signals only the *display* interpretation; a decoder may
     /// fall back to its own default matrix.
     pub const fn unspecified() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Unspecified,
             transfer: TransferFunction::Unspecified,
             matrix: MatrixCoefficients::Unspecified,
@@ -222,22 +219,22 @@ impl ColorEncoding {
     }
 }
 
-impl Default for ColorEncoding {
+impl Default for Cicp {
     fn default() -> Self {
-        ColorEncoding::unspecified()
+        Cicp::unspecified()
     }
 }
 
 /// How the output colour space is described in the file.
 #[derive(Clone, Debug)]
 pub struct ColorMetadata {
-    pub cicp: Option<ColorEncoding>,
+    pub cicp: Option<Cicp>,
     pub icc: Option<Vec<u8>>,
 }
 
 impl ColorMetadata {
     /// CICP-only signalling (`nclx` box).
-    pub fn cicp(enc: ColorEncoding) -> Self {
+    pub fn cicp(enc: Cicp) -> Self {
         ColorMetadata {
             cicp: Some(enc),
             icc: None,
@@ -254,7 +251,7 @@ impl ColorMetadata {
 
     /// Both an enumerated CICP encoding and an embedded ICC profile. Emits an `nclx`
     /// `colr` box and a `prof` `colr` box.
-    pub fn cicp_and_icc(enc: ColorEncoding, profile: Vec<u8>) -> Self {
+    pub fn cicp_and_icc(enc: Cicp, profile: Vec<u8>) -> Self {
         ColorMetadata {
             cicp: Some(enc),
             icc: Some(profile),
@@ -262,7 +259,7 @@ impl ColorMetadata {
     }
 
     /// Set (or replace) the CICP encoding, leaving any ICC profile in place.
-    pub fn with_cicp(mut self, enc: ColorEncoding) -> Self {
+    pub fn with_cicp(mut self, enc: Cicp) -> Self {
         self.cicp = Some(enc);
         self
     }
@@ -275,14 +272,14 @@ impl ColorMetadata {
 
     /// The color-authoring encoding these metadata imply, used to drive the VUI.
     /// Falls back to sRGB when only an ICC profile is present (the working space).
-    pub fn color_encoding(&self) -> ColorEncoding {
-        self.cicp.unwrap_or_else(ColorEncoding::srgb)
+    pub fn color_encoding(&self) -> Cicp {
+        self.cicp.unwrap_or_else(Cicp::srgb)
     }
 }
 
 impl Default for ColorMetadata {
     fn default() -> Self {
-        ColorMetadata::cicp(ColorEncoding::default())
+        ColorMetadata::cicp(Cicp::default())
     }
 }
 
@@ -292,7 +289,7 @@ mod tests {
 
     #[test]
     fn nclx_payload_layout() {
-        let p = ColorEncoding::bt709().nclx_payload();
+        let p = Cicp::bt709().nclx_payload();
         assert_eq!(&p[0..4], b"nclx");
         assert_eq!(u16::from_be_bytes([p[4], p[5]]), 1); // BT709 primaries
         assert_eq!(u16::from_be_bytes([p[6], p[7]]), 1); // BT709 transfer
@@ -303,7 +300,7 @@ mod tests {
 
     #[test]
     fn pq_encoding_values() {
-        let e = ColorEncoding::bt2020_pq();
+        let e = Cicp::bt2020_pq();
         assert_eq!(e.primaries as u8, 9);
         assert_eq!(e.transfer as u8, 16);
         assert_eq!(e.matrix as u8, 9);
