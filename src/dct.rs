@@ -197,11 +197,6 @@ pub(crate) fn sb_scan_for(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize
     }
 }
 
-// ── Compile-time scan tables ────────────────────────────────────────────────
-// Built by `const fn` at compile time so no table is generated or heap-allocated
-// at run time. `const_scan_equiv` (tests) asserts they equal the runtime
-// generator below, which the diagonal tests in turn pin to the canonical tables.
-
 const fn raw_scan_const(blk: usize, scan_idx: u8) -> ([(usize, usize); 16], usize) {
     let mut v = [(0usize, 0usize); 16];
     let mut i = 0;
@@ -300,20 +295,20 @@ const fn build_sb_scan_const<const NN: usize>(log2_ts: u32, scan_idx: u8) -> [(u
     out
 }
 
-const COEFF_SCAN_4_H: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 1);
-const COEFF_SCAN_4_V: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 2);
-const COEFF_SCAN_8_H: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 1);
-const COEFF_SCAN_8_V: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 2);
-const COEFF_SCAN_16_H: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 1);
-const COEFF_SCAN_16_V: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 2);
+static COEFF_SCAN_4_H: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 1);
+static COEFF_SCAN_4_V: [(usize, usize); 16] = build_coeff_scan_const::<16>(2, 2);
+static COEFF_SCAN_8_H: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 1);
+static COEFF_SCAN_8_V: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 2);
+static COEFF_SCAN_16_H: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 1);
+static COEFF_SCAN_16_V: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 2);
 
-const SB_SCAN_1: [(usize, usize); 1] = build_sb_scan_const::<1>(2, 0);
-const SB_SCAN_2_D: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 0);
-const SB_SCAN_2_H: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 1);
-const SB_SCAN_2_V: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 2);
-const SB_SCAN_4_D: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 0);
-const SB_SCAN_4_H: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 1);
-const SB_SCAN_4_V: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 2);
+static SB_SCAN_1: [(usize, usize); 1] = build_sb_scan_const::<1>(2, 0);
+static SB_SCAN_2_D: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 0);
+static SB_SCAN_2_H: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 1);
+static SB_SCAN_2_V: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 2);
+static SB_SCAN_4_D: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 0);
+static SB_SCAN_4_H: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 1);
+static SB_SCAN_4_V: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 2);
 
 #[cfg(test)]
 fn build_coeff_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
