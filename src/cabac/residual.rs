@@ -28,7 +28,7 @@
  */
 use super::{
     contexts::ContextSet,
-    engine::{CabacEstimator, CabacWriter},
+    engine::{CabacContextUpdater, CabacEstimator, CabacWriter},
 };
 
 /// Encode cbf_luma (trafo_depth 0 or 1).
@@ -107,6 +107,29 @@ pub(crate) fn estimate_residual_bits(
         sign_data_hiding,
     );
     est.bits()
+}
+
+/// Apply residual-coding context transitions without arithmetic coding or
+/// fractional-bit accumulation. Useful when later syntax needs the exact
+/// post-residual contexts but the residual's rate is candidate-independent.
+pub(crate) fn advance_residual_contexts(
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+) {
+    let mut updater = CabacContextUpdater;
+    write_residual(
+        &mut updater,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+    );
 }
 
 fn write_residual<W: CabacWriter>(

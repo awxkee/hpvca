@@ -62,13 +62,6 @@ pub(crate) fn predict_planar_into(above: &[u16], left: &[u16], n: usize, pred: &
     }
 }
 
-#[inline]
-pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 1024] {
-    let mut pred = [0u16; 1024];
-    predict_planar_into(above, left, n, &mut pred);
-    pred
-}
-
 /// Whether the [1 2 1] reference-smoothing filter applies for this mode/size
 /// (HEVC §8.4.4.2.3, luma). DC and 4×4 never filter; otherwise it depends on the
 /// mode's angular distance from pure horizontal (10) / vertical (26).
@@ -156,18 +149,6 @@ pub(crate) fn predict_dc_into(
     }
 }
 
-#[inline]
-pub(crate) fn predict_dc(
-    above: &[u16],
-    left: &[u16],
-    n: usize,
-    filter_boundary: bool,
-) -> [u16; 1024] {
-    let mut pred = [0u16; 1024];
-    predict_dc_into(above, left, n, filter_boundary, &mut pred);
-    pred
-}
-
 /// Predict an N×N block with an angular mode (2..=34, HEVC §8.4.4.2.6).
 /// `corner` = p[-1][-1]; `above`/`left` hold p[x][-1] / p[-1][y] for x,y = 0..2n-1.
 /// `filter_boundary` applies the pure-vertical (26) / horizontal (10) luma edge
@@ -253,7 +234,7 @@ fn predict_angular_n<const N: usize>(
     // nor an extended reference array. Write contiguous rows directly.
     if angle == 0 {
         if vertical {
-            for (row, &left) in pred.chunks_exact_mut(N).zip(&left[..N]) {
+            for (row, &left) in pred.as_chunks_mut::<N>().0.iter_mut().zip(&left[..N]) {
                 row.copy_from_slice(&above[..N]);
                 if filter_boundary && N < 32 {
                     let value = above[0] as i32 + ((left as i32 - corner as i32) >> 1);
@@ -265,15 +246,14 @@ fn predict_angular_n<const N: usize>(
                 let value = left[0] as i32 + ((above as i32 - corner as i32) >> 1);
                 *dst = value.clamp(0, max_val) as u16;
             }
-            for (row, &sample) in pred.chunks_exact_mut(N).skip(1).zip(&left[1..N]) {
+            for (row, &sample) in pred.as_chunks_mut::<N>().0.iter_mut().skip(1).zip(&left[1..N]) {
                 row.fill(sample);
             }
         } else {
-            for (row, &sample) in pred.chunks_exact_mut(N).zip(&left[..N]) {
+            for (row, &sample) in pred.as_chunks_mut::<N>().0.iter_mut().zip(&left[..N]) {
                 row.fill(sample);
             }
         }
-        return;
     } else {
         let (main, side): (&[u16], &[u16]) = if vertical {
             (above, left)
@@ -285,7 +265,7 @@ fn predict_angular_n<const N: usize>(
             // The ±32 projection lands exactly on integer references. Both
             // positive extreme modes become one contiguous row copy.
             if angle == 32 {
-                for (offset, row) in pred.chunks_exact_mut(N).enumerate() {
+                for (offset, row) in pred.as_chunks_mut::<N>().0.iter_mut().enumerate() {
                     row.copy_from_slice(&main[offset + 1..offset + N + 1]);
                 }
                 return;
@@ -294,7 +274,7 @@ fn predict_angular_n<const N: usize>(
             // No inverse projection is needed. Reading `main` directly avoids
             // copying up to 64 references for roughly half of all angular modes.
             if vertical {
-                for (outer, row) in pred.chunks_exact_mut(N).enumerate() {
+                for (outer, row) in pred.as_chunks_mut::<N>().0.iter_mut().enumerate() {
                     let pos = (outer as i32 + 1) * angle;
                     let index = (pos >> 5) as usize;
                     let fraction = pos & 31;
@@ -320,7 +300,7 @@ fn predict_angular_n<const N: usize>(
                     *index = pos >> 5;
                     *fraction = pos & 31;
                 }
-                for (inner, row) in pred.chunks_exact_mut(N).enumerate() {
+                for (inner, row) in pred.as_chunks_mut::<N>().0.iter_mut().enumerate() {
                     for (dst, (&index, &fraction)) in row
                         .iter_mut()
                         .zip(scratch.indices[..N].iter().zip(&scratch.fractions[..N]))
@@ -359,7 +339,7 @@ fn predict_angular_n<const N: usize>(
             }
 
             if vertical {
-                for (outer, row) in pred.chunks_exact_mut(N).enumerate() {
+                for (outer, row) in pred.as_chunks_mut::<N>().0.iter_mut().enumerate() {
                     let pos = (outer as i32 + 1) * angle;
                     let index = pos >> 5;
                     let fraction = pos & 31;
@@ -388,7 +368,7 @@ fn predict_angular_n<const N: usize>(
                     *index = pos >> 5;
                     *fraction = pos & 31;
                 }
-                for (inner, row) in pred.chunks_exact_mut(N).enumerate() {
+                for (inner, row) in pred.as_chunks_mut::<N>().0.iter_mut().enumerate() {
                     for (dst, (&index, &fraction)) in row
                         .iter_mut()
                         .zip(scratch.indices[..N].iter().zip(&scratch.fractions[..N]))
@@ -406,32 +386,6 @@ fn predict_angular_n<const N: usize>(
             }
         }
     }
-}
-
-#[inline]
-pub(crate) fn predict_angular(
-    corner: u16,
-    above: &[u16],
-    left: &[u16],
-    n: usize,
-    mode: u8,
-    filter_boundary: bool,
-    max_val: i32,
-) -> [u16; 1024] {
-    let mut pred = [0u16; 1024];
-    let mut scratch = AngularScratch::new();
-    predict_angular_into(
-        corner,
-        above,
-        left,
-        n,
-        mode,
-        filter_boundary,
-        max_val,
-        &mut pred,
-        &mut scratch,
-    );
-    pred
 }
 
 /// Predict an N×N block for any chroma mode into reusable storage. Chroma
@@ -453,30 +407,6 @@ pub(crate) fn predict_chroma_tb_into(
         DC => predict_dc_into(above, left, n, false, pred),
         _ => predict_angular_into(corner, above, left, n, mode, false, max_val, pred, scratch),
     }
-}
-
-/// Compatibility wrapper used by tests and non-hot callers.
-pub(crate) fn predict_chroma_tb(
-    mode: u8,
-    corner: u16,
-    above: &[u16],
-    left: &[u16],
-    n: usize,
-    max_val: i32,
-) -> [u16; 1024] {
-    let mut pred = [0u16; 1024];
-    let mut scratch = AngularScratch::new();
-    predict_chroma_tb_into(
-        mode,
-        corner,
-        above,
-        left,
-        n,
-        max_val,
-        &mut pred,
-        &mut scratch,
-    );
-    pred
 }
 
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
@@ -919,12 +849,6 @@ pub(crate) fn compute_residual_i32_into(
     }
 }
 
-pub(crate) fn compute_residual_i32(orig: &[u16], pred: &[u16], n: usize) -> [i32; 1024] {
-    let mut residual = [0i32; 1024];
-    compute_residual_i32_into(orig, pred, n, &mut residual);
-    residual
-}
-
 /// Reconstruct pixels into reusable storage: clamp(pred + residual).
 #[inline]
 pub(crate) fn reconstruct_into(
@@ -945,15 +869,35 @@ pub(crate) fn reconstruct_into(
     }
 }
 
-pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 1024] {
-    let mut out = [0u16; 1024];
-    reconstruct_into(pred, residual, n, max_val, &mut out);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[inline]
+    pub(crate) fn predict_angular(
+        corner: u16,
+        above: &[u16],
+        left: &[u16],
+        n: usize,
+        mode: u8,
+        filter_boundary: bool,
+        max_val: i32,
+    ) -> [u16; 1024] {
+        let mut pred = [0u16; 1024];
+        let mut scratch = AngularScratch::new();
+        predict_angular_into(
+            corner,
+            above,
+            left,
+            n,
+            mode,
+            filter_boundary,
+            max_val,
+            &mut pred,
+            &mut scratch,
+        );
+        pred
+    }
 
     #[test]
     fn angular_mode18_negative_diagonal() {
@@ -992,6 +936,25 @@ mod tests {
         let left = [100u16; 33];
         let p = predict_dc(&above, &left, 8, false);
         assert!(p[..64].iter().all(|&v| v == 100));
+    }
+
+    #[inline]
+    pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 1024] {
+        let mut pred = [0u16; 1024];
+        predict_planar_into(above, left, n, &mut pred);
+        pred
+    }
+
+    #[inline]
+    pub(crate) fn predict_dc(
+        above: &[u16],
+        left: &[u16],
+        n: usize,
+        filter_boundary: bool,
+    ) -> [u16; 1024] {
+        let mut pred = [0u16; 1024];
+        predict_dc_into(above, left, n, filter_boundary, &mut pred);
+        pred
     }
 
     #[test]
@@ -1077,6 +1040,12 @@ mod tests {
         // Top-right pixel should be close to top-right sample
         assert!(pred[7] > 100); // top-right area of block
         assert!(pred[8 * 7] > 100); // bottom-left area
+    }
+
+    pub(crate) fn compute_residual_i32(orig: &[u16], pred: &[u16], n: usize) -> [i32; 1024] {
+        let mut residual = [0i32; 1024];
+        compute_residual_i32_into(orig, pred, n, &mut residual);
+        residual
     }
 
     #[test]

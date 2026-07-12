@@ -96,13 +96,13 @@ static EST_BITS_MPS: [f32; 64] = [
 #[rustfmt::skip]
 static EST_BITS_LPS: [f32; 64] = [
     1.038709, 1.098613, 1.155816, 1.225585, 1.303228, 1.376084, 1.453875, 1.527331,
-    1.599810, 1.676123, 1.756699, 1.828126, 1.903274, 1.979583, 2.052277, 2.127830,
+    1.599_81, 1.676123, 1.756699, 1.828126, 1.903274, 1.979583, 2.052277, 2.127_83,
     2.208615, 2.280162, 2.354635, 2.434016, 2.500752, 2.582698, 2.651404, 2.731857,
-    2.809060, 2.882185, 2.954603, 3.029557, 3.108620, 3.172997, 3.260580, 3.324732,
-    3.413088, 3.484573, 3.562481, 3.641983, 3.701272, 3.774937, 3.854851, 3.937030,
+    2.809_06, 2.882185, 2.954603, 3.029557, 3.108_62, 3.172997, 3.260_58, 3.324732,
+    3.413088, 3.484573, 3.562481, 3.641983, 3.701272, 3.774937, 3.854851, 3.937_03,
     3.998051, 4.074383, 4.157046, 4.242541, 4.318337, 4.372123, 4.455251, 4.543465,
-    4.606535, 4.678325, 4.747726, 4.831597, 4.878486, 4.998051, 5.050780, 5.128427,
-    5.224097, 5.301123, 5.335760, 5.409426, 5.502581, 5.585541, 5.665520, 7.530762,
+    4.606535, 4.678325, 4.747726, 4.831597, 4.878486, 4.998051, 5.050_78, 5.128427,
+    5.224097, 5.301123, 5.335_76, 5.409426, 5.502581, 5.585541, 5.665_52, 7.530762,
 ];
 
 impl CtxModel {
@@ -117,12 +117,11 @@ impl CtxModel {
         }
     }
 
-    /// Fractional CABAC bit cost plus the same probability-state transition as
-    /// a real context-coded bin. Used by speculative encoder RDO so trials do
-    /// not drive the arithmetic coder or touch its output buffer.
+    /// Apply the exact CABAC probability-state transition without calculating
+    /// a fractional rate. This is used when a later RDO stage only needs the
+    /// contexts produced by already-selected syntax.
     #[inline]
-    pub(crate) fn estimate_and_update(&mut self, bin: u8) -> f32 {
-        let bits = self.estimated_bits(bin);
+    pub(crate) fn update(&mut self, bin: u8) {
         let state = self.p_state_idx as usize;
         if (bin ^ self.val_mps) & 1 == 0 {
             self.p_state_idx = TRANS_IDX_MPS[state];
@@ -132,6 +131,15 @@ impl CtxModel {
             }
             self.p_state_idx = TRANS_IDX_LPS[state];
         }
+    }
+
+    /// Fractional CABAC bit cost plus the same probability-state transition as
+    /// a real context-coded bin. Used by speculative encoder RDO so trials do
+    /// not drive the arithmetic coder or touch its output buffer.
+    #[inline]
+    pub(crate) fn estimate_and_update(&mut self, bin: u8) -> f32 {
+        let bits = self.estimated_bits(bin);
+        self.update(bin);
         bits
     }
 
@@ -199,6 +207,23 @@ impl CabacWriter for CabacEstimator {
     fn encode_bypass(&mut self, _bin_val: u8) {
         self.bits += 1.0;
     }
+}
+
+/// Context-only CABAC sink. It follows all regular-bin state transitions but
+/// deliberately ignores bypass bins and rate accumulation. This is much cheaper
+/// than the fractional estimator when only the post-syntax context state is
+/// required by a subsequent winner-only RDOQ pass.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CabacContextUpdater;
+
+impl CabacWriter for CabacContextUpdater {
+    #[inline]
+    fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        ctx.update(bin_val);
+    }
+
+    #[inline]
+    fn encode_bypass(&mut self, _bin_val: u8) {}
 }
 
 /// HEVC CABAC encoder.
@@ -347,64 +372,6 @@ impl CabacEncoder {
         self.emit_bit(two & 1);
     }
 
-    /// Coded length in bits if the stream were terminated here. RDO differences
-    /// two of these for a CU's true marginal coded cost.
-    pub(crate) fn flushed_bits(&self) -> u64 {
-        // A bit-sink that mirrors put_bit/renorm control flow but only counts.
-        struct BitCounter {
-            low: u32,
-            m_range: u32,
-            bits_outstanding: u32,
-            first_bit: bool,
-            count: u64,
-        }
-        impl BitCounter {
-            #[inline]
-            fn put_bit(&mut self) {
-                // first put_bit is suppressed (H.264/HEVC convention); every
-                // subsequent one emits 1 real bit plus all outstanding carry bits.
-                if self.first_bit {
-                    self.first_bit = false;
-                } else {
-                    self.count += 1;
-                }
-                self.count += self.bits_outstanding as u64;
-                self.bits_outstanding = 0;
-            }
-            #[inline]
-            fn renorm(&mut self) {
-                while self.m_range < 256 {
-                    if self.low < 256 {
-                        self.put_bit();
-                    } else if self.low >= 512 {
-                        self.low -= 512;
-                        self.put_bit();
-                    } else {
-                        self.low -= 256;
-                        self.bits_outstanding += 1;
-                    }
-                    self.m_range <<= 1;
-                    self.low <<= 1;
-                }
-            }
-        }
-        let mut s = BitCounter {
-            low: self.low,
-            m_range: self.m_range,
-            bits_outstanding: self.bits_outstanding,
-            first_bit: self.first_bit,
-            count: (self.output.len() as u64) * 8 + self.bit_count as u64,
-        };
-        // encode_terminate(1): range -= 2; low += range; flush()
-        s.m_range -= 2;
-        s.low += s.m_range;
-        // flush(): range = 2; renorm(); put_bit(low>>9 & 1); then 2 emit_bits.
-        s.m_range = 2;
-        s.renorm();
-        s.put_bit();
-        s.count + 2
-    }
-
     pub(crate) fn finish(mut self) -> Vec<u8> {
         // Byte-align: pad the partial byte with zeros.
         if self.bit_count > 0 {
@@ -414,42 +381,6 @@ impl CabacEncoder {
             self.bit_count = 0;
         }
         self.output
-    }
-
-    /// Capture the encoder's resumable state for a speculative RD trial.
-    #[inline]
-    pub(crate) fn snapshot(&self) -> CabacSnapshot {
-        CabacSnapshot {
-            low: self.low,
-            m_range: self.m_range,
-            bits_outstanding: self.bits_outstanding,
-            first_bit: self.first_bit,
-            bit_buffer: self.bit_buffer,
-            bit_count: self.bit_count,
-            output_len: self.output.len(),
-        }
-    }
-
-    /// Roll the encoder back to a previously captured [`CabacSnapshot`].
-    #[inline]
-    pub(crate) fn restore(&mut self, s: &CabacSnapshot) {
-        self.low = s.low;
-        self.m_range = s.m_range;
-        self.bits_outstanding = s.bits_outstanding;
-        self.first_bit = s.first_bit;
-        self.bit_buffer = s.bit_buffer;
-        self.bit_count = s.bit_count;
-        self.output.truncate(s.output_len);
-    }
-
-    /// Reinstate the output bytes an earlier trial appended past `from`, after a
-    /// later trial truncated them. `tail` is the slice the earlier trial wrote
-    /// beyond `from.output_len`; this resets the output to that prefix + tail.
-    /// The caller follows with [`restore`] to put back the matching scalar state.
-    #[inline]
-    pub(crate) fn reinstate_tail(&mut self, from: &CabacSnapshot, tail: &[u8]) {
-        self.output.truncate(from.output_len);
-        self.output.extend_from_slice(tail);
     }
 }
 
@@ -462,28 +393,6 @@ impl CabacWriter for CabacEncoder {
     #[inline]
     fn encode_bypass(&mut self, bin_val: u8) {
         CabacEncoder::encode_bypass(self, bin_val);
-    }
-}
-
-/// Resumable snapshot of a [`CabacEncoder`] (scalar state + output length).
-/// Cheap to take and apply — used to run RD trials in place without cloning the
-/// growing output buffer.
-#[derive(Clone, Copy)]
-pub(crate) struct CabacSnapshot {
-    low: u32,
-    m_range: u32,
-    bits_outstanding: u32,
-    first_bit: bool,
-    bit_buffer: u8,
-    bit_count: u8,
-    output_len: usize,
-}
-
-impl CabacSnapshot {
-    /// Output byte length captured at snapshot time.
-    #[inline]
-    pub(crate) fn output_len(&self) -> usize {
-        self.output_len
     }
 }
 
@@ -543,6 +452,21 @@ mod tests {
         assert_eq!(real_ctx.p_state_idx, estimated_ctx.p_state_idx);
         assert_eq!(real_ctx.val_mps, estimated_ctx.val_mps);
         assert!(est.bits().is_finite() && est.bits() > 0.0);
+    }
+
+    #[test]
+    fn context_only_updater_matches_fractional_estimator_state() {
+        let bins = [1u8, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1];
+        let mut estimated_ctx = CtxModel::fixed(13, 1);
+        let mut updated_ctx = estimated_ctx;
+        let mut est = CabacEstimator::default();
+        let mut updater = CabacContextUpdater;
+        for bin in bins {
+            est.encode_bin(bin, &mut estimated_ctx);
+            updater.encode_bin(bin, &mut updated_ctx);
+        }
+        assert_eq!(estimated_ctx.p_state_idx, updated_ctx.p_state_idx);
+        assert_eq!(estimated_ctx.val_mps, updated_ctx.val_mps);
     }
 
     #[test]

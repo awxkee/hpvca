@@ -29,8 +29,8 @@
 
 use crate::{
     cabac::{
-        CabacEncoder, CabacWriter, ContextSet, IntraModeContexts, encode_cbf_chroma,
-        encode_cbf_luma, encode_residual, estimate_residual_bits,
+        CabacEncoder, CabacWriter, ContextSet, IntraModeContexts, advance_residual_contexts,
+        encode_cbf_chroma, encode_cbf_luma, encode_residual, estimate_residual_bits,
     },
     dct,
     error::EncodeError,
@@ -679,7 +679,7 @@ fn build_idr_slice(
                 cu_depth: &mut cu_depth,
                 blk_stride,
                 lossless,
-                scratch: &mut *scratch,
+                scratch: &mut scratch,
             };
             for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                 let row = lu_row0 + dy * 32;
@@ -773,20 +773,19 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
 /// the standard fast distortion proxy for intra mode decision (correlates with
 /// post-transform coded cost far better than raw SAD).
 #[inline]
-fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
+fn satd_block_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
     let mut total = 0u32;
     let mut diff = [0i32; 16];
-    let active = n * n;
 
-    for (orig_band, pred_band) in orig[..active]
-        .chunks_exact(n * 4)
-        .zip(pred[..active].chunks_exact(n * 4))
+    for (orig_band, pred_band) in orig[..N * N]
+        .chunks_exact(N * 4)
+        .zip(pred[..N * N].chunks_exact(N * 4))
     {
-        for bx in (0..n).step_by(4) {
+        for bx in (0..N).step_by(4) {
             for ((dst_row, orig_row), pred_row) in diff
-                .chunks_exact_mut(4)
-                .zip(orig_band.chunks_exact(n))
-                .zip(pred_band.chunks_exact(n))
+                .as_chunks_mut::<4>().0.iter_mut()
+                .zip(orig_band.chunks_exact(N))
+                .zip(pred_band.chunks_exact(N))
             {
                 for ((dst, &orig), &pred) in dst_row
                     .iter_mut()
@@ -797,7 +796,7 @@ fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
                 }
             }
 
-            for row in diff.chunks_exact_mut(4) {
+            for row in diff.as_chunks_mut::<4>().0 {
                 let a0 = row[0] + row[2];
                 let a1 = row[1] + row[3];
                 let a2 = row[0] - row[2];
@@ -817,14 +816,37 @@ fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
                 diff[8 + col] = a2 + a3;
                 diff[12 + col] = a2 - a3;
             }
-            total += diff
-                .iter()
-                .map(|value| value.unsigned_abs())
-                .sum::<u32>()
-                .div_ceil(2);
+            let sum = diff[0].unsigned_abs()
+                + diff[1].unsigned_abs()
+                + diff[2].unsigned_abs()
+                + diff[3].unsigned_abs()
+                + diff[4].unsigned_abs()
+                + diff[5].unsigned_abs()
+                + diff[6].unsigned_abs()
+                + diff[7].unsigned_abs()
+                + diff[8].unsigned_abs()
+                + diff[9].unsigned_abs()
+                + diff[10].unsigned_abs()
+                + diff[11].unsigned_abs()
+                + diff[12].unsigned_abs()
+                + diff[13].unsigned_abs()
+                + diff[14].unsigned_abs()
+                + diff[15].unsigned_abs();
+            total += (sum + 1) >> 1;
         }
     }
     total
+}
+
+#[inline]
+fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
+    match n {
+        4 => satd_block_n::<4>(orig, pred),
+        8 => satd_block_n::<8>(orig, pred),
+        16 => satd_block_n::<16>(orig, pred),
+        32 => satd_block_n::<32>(orig, pred),
+        _ => panic!("unsupported SATD block size {n}"),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -960,6 +982,143 @@ fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
         .sum::<i64>() as f32
 }
 
+const CHROMA_DM_SYNTAX_IDX: u8 = 4;
+
+#[derive(Clone, Copy, Debug)]
+struct ChromaModeCandidate {
+    /// Actual intra prediction mode used by §8.4.4.2 prediction.
+    pred_mode: u8,
+    /// `intra_chroma_pred_mode`: 0..=3 are explicit, 4 is DM_CHROMA.
+    syntax_idx: u8,
+    /// First-pass SATD + fractional mode-rate cost.
+    cost: f32,
+}
+
+/// HEVC's five chroma candidates: planar, vertical, horizontal, DC and
+/// DM_CHROMA. When DM resolves to one of the four explicit modes, angular mode
+/// 34 replaces that explicit entry so all five candidates remain distinct.
+#[inline]
+fn chroma_mode_candidates(
+    luma_mode: u8,
+    chroma: crate::fmt::ChromaFormat,
+) -> [ChromaModeCandidate; 5] {
+    // Candidate substitution is defined in the nominal 0..=34 mode space. The
+    // 4:2:2 directional remap is applied afterwards to the actual prediction
+    // mode, including the replacement mode 34 (which maps to 31).
+    let mut explicit = [0u8, 26, 10, 1];
+    for mode in &mut explicit {
+        if *mode == luma_mode {
+            *mode = 34;
+        }
+    }
+    let map_mode = |mode: u8| {
+        if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
+            MODE_422_MAP[mode as usize]
+        } else {
+            mode
+        }
+    };
+    let dm_mode = map_mode(luma_mode);
+    let explicit = explicit.map(map_mode);
+    [
+        ChromaModeCandidate {
+            pred_mode: explicit[0],
+            syntax_idx: 0,
+            cost: f32::MAX,
+        },
+        ChromaModeCandidate {
+            pred_mode: explicit[1],
+            syntax_idx: 1,
+            cost: f32::MAX,
+        },
+        ChromaModeCandidate {
+            pred_mode: explicit[2],
+            syntax_idx: 2,
+            cost: f32::MAX,
+        },
+        ChromaModeCandidate {
+            pred_mode: explicit[3],
+            syntax_idx: 3,
+            cost: f32::MAX,
+        },
+        ChromaModeCandidate {
+            pred_mode: dm_mode,
+            syntax_idx: CHROMA_DM_SYNTAX_IDX,
+            cost: f32::MAX,
+        },
+    ]
+}
+
+#[inline]
+fn estimated_chroma_mode_bins(syntax_idx: u8) -> u32 {
+    if syntax_idx == CHROMA_DM_SYNTAX_IDX {
+        1
+    } else {
+        3
+    }
+}
+
+#[inline]
+fn estimate_chroma_mode_bits(ictx: &mut IntraModeContexts, syntax_idx: u8) -> f32 {
+    if syntax_idx == CHROMA_DM_SYNTAX_IDX {
+        ictx.intra_chroma_pred_mode.estimate_and_update(0)
+    } else {
+        ictx.intra_chroma_pred_mode.estimate_and_update(1) + 2.0
+    }
+}
+
+fn encode_chroma_mode<W: CabacWriter>(enc: &mut W, ictx: &mut IntraModeContexts, syntax_idx: u8) {
+    if syntax_idx == CHROMA_DM_SYNTAX_IDX {
+        enc.encode_bin(0, &mut ictx.intra_chroma_pred_mode);
+    } else {
+        debug_assert!(syntax_idx < CHROMA_DM_SYNTAX_IDX);
+        enc.encode_bin(1, &mut ictx.intra_chroma_pred_mode);
+        enc.encode_bypass((syntax_idx >> 1) & 1);
+        enc.encode_bypass(syntax_idx & 1);
+    }
+}
+
+#[inline]
+fn update_chroma_candidate(
+    candidates: &mut [ChromaModeCandidate; 5],
+    mut candidate: ChromaModeCandidate,
+) {
+    let Some(pos) = candidates
+        .iter()
+        .position(|entry| candidate.cost < entry.cost)
+    else {
+        return;
+    };
+    for index in (pos + 1..candidates.len()).rev() {
+        candidates[index] = candidates[index - 1];
+    }
+    core::mem::swap(&mut candidates[pos], &mut candidate);
+}
+
+/// Decide whether the SATD winner is clear enough to commit directly or needs
+/// one exact reconstruction-RDO challenger. Chroma has only five legal modes,
+/// so all modes still participate in the proxy ranking; the expensive transform,
+/// inverse transform and residual-rate walk are reserved for genuinely ambiguous
+/// blocks. 4:4:4 gets the widest window because independent chroma directions are
+/// most valuable there, while 4:2:0 uses the tightest window.
+#[inline]
+fn full_rdo_chroma_count(
+    candidates: &[ChromaModeCandidate; 5],
+    chroma: crate::fmt::ChromaFormat,
+) -> usize {
+    let threshold = match chroma {
+        crate::fmt::ChromaFormat::Yuv444 => 1.08,
+        crate::fmt::ChromaFormat::Yuv422 => 1.05,
+        crate::fmt::ChromaFormat::Yuv420 => 1.03,
+        crate::fmt::ChromaFormat::Monochrome => return 1,
+    };
+    if candidates[1].cost <= candidates[0].cost * threshold {
+        2
+    } else {
+        1
+    }
+}
+
 /// HEVC Table 8-3: luma→chroma intra mode mapping for 4:2:2 (DM_CHROMA).
 static MODE_422_MAP: [u8; 35] = [
     0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25,
@@ -1050,6 +1209,29 @@ fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat) -> u8 {
     }
 }
 
+/// Effective chroma rate multiplier relative to the luma lambda. HM applies the
+/// inverse relation as a chroma distortion weight; multiplying lambda by
+/// `2^((QpC-QpY)/3)` is algebraically identical and avoids touching distortion.
+/// Only 4:2:0 has a non-linear QpC mapping in this encoder.
+#[inline]
+fn chroma_lambda_scale(qp_y: u8, chroma: crate::fmt::ChromaFormat) -> f32 {
+    if !matches!(chroma, crate::fmt::ChromaFormat::Yuv420) {
+        return 1.0;
+    }
+    const DELTA_SCALE: [f32; 7] = [
+        1.0,
+        0.793_700_5,
+        0.629_960_54,
+        0.5,
+        0.396_850_26,
+        0.314_980_27,
+        0.25,
+    ];
+    let qp_c = chroma_qp_for(qp_y, chroma);
+    let delta = qp_y.saturating_sub(qp_c).min(6) as usize;
+    DELTA_SCALE[delta]
+}
+
 struct CuGeometry {
     lu_row: usize,
     lu_col: usize,
@@ -1126,6 +1308,8 @@ impl ChromaTb {
 #[repr(align(64))]
 struct CompressionContext {
     orig: [u16; 1024],
+    chroma_orig_cb: [u16; 1024],
+    chroma_orig_cr: [u16; 1024],
     pred: [u16; 1024],
     best_pred: [u16; 1024],
     reconstructed: [u16; 1024],
@@ -1147,6 +1331,8 @@ impl CompressionContext {
     fn new() -> Self {
         Self {
             orig: [0; 1024],
+            chroma_orig_cb: [0; 1024],
+            chroma_orig_cr: [0; 1024],
             pred: [0; 1024],
             best_pred: [0; 1024],
             reconstructed: [0; 1024],
@@ -1713,10 +1899,12 @@ fn encode_cu<W: CabacWriter>(
                 &mut scratch.levels,
             );
         }
+        let mut nonzero = false;
         for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(scan) {
-            *dst = scratch.levels[row * lu + col];
+            let level = scratch.levels[row * lu + col];
+            *dst = level;
+            nonzero |= level != 0;
         }
-        let nonzero = scratch.scanned[..num_luma].iter().any(|&level| level != 0);
         rate += trial_ctx.cbf_luma[1].estimate_and_update(nonzero as u8);
         if nonzero {
             rate += estimate_residual_bits(
@@ -1814,194 +2002,6 @@ fn encode_cu<W: CabacWriter>(
         }
     }
 
-    // Chroma mode = luma mode (DM_CHROMA), with the 4:2:2 remap (HEVC Table 8-3).
-    let chroma_mode = if chroma.sub_w() == 2 && chroma.sub_h() == 1 {
-        MODE_422_MAP[luma_mode as usize]
-    } else {
-        luma_mode
-    };
-
-    // ── Chroma intra pred mode (DM_CHROMA → single '0' bin) ──────────────
-    if !chroma.is_monochrome() {
-        enc.encode_bin(0, &mut ictx.intra_chroma_pred_mode);
-    }
-
-    // ── Chroma prediction + transform + quantise ─────────────────────────────
-    // Chroma TB size depends on format: 4:2:0/4:2:2 use 4×4 TBs; 4:4:4 uses 8×8.
-    // 4:2:2 stacks two 4×4 TBs vertically. HEVC predicts each chroma TB separately
-    // (§8.4.4.2.1); a lower stacked TB uses the just-reconstructed upper TB as its
-    // above reference. We predict → transform → reconstruct each TB in order.
-    let chroma_qp = chroma_qp_for(qp_slice, chroma) + qp_bd_offset;
-    let sub_w = chroma.sub_w();
-    let sub_h = chroma.sub_h();
-    let luma_ctus_x = yw_stride / 64;
-    // Chroma TB size derives from the luma CU size and subsampling: LU/sub_w.
-    // For LU=8 this reproduces chroma_tb_size() (4:2:0/4:2:2→4, 4:4:4→8); for
-    // LU=16 in 4:2:0 it gives an 8×8 chroma TB.
-    let ctb = lu / sub_w; // chroma TB side: 4 through 32
-    let log2_ctb = ctb.trailing_zeros(); // 2 or 3
-    // Mode-dependent scan for chroma TBs: 4×4 chroma uses vertical/horizontal for
-    // chroma modes 6..=14 / 22..=30 (else diagonal); 8×8 chroma (4:4:4) is always
-    // diagonal. Must match the scan_idx passed to encode_residual for chroma.
-    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
-    let chroma_tb_scan_idx = dct::scan_idx_for(chroma_mode, log2_ctb, false, is_444);
-    let chroma_scan: &[(usize, usize)] = dct::coeff_scan(log2_ctb, chroma_tb_scan_idx);
-
-    for t in 0..n_chroma_tb {
-        let sub_ch_row = ch_row + t * ctb;
-        let filt = ctb > 4 && intra::should_filter_refs(chroma_mode, ctb);
-        let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
-            rec_cb,
-            rec_cr,
-            intra::ChromaRefGeometry {
-                stride: cw_stride,
-                block_row: sub_ch_row,
-                block_col: ch_col,
-                chroma_h: coded_ch_h,
-                n: ctb,
-                sub_w,
-                sub_h,
-                luma_w: yw_stride,
-                luma_h: coded_yh,
-                luma_ctus_x,
-                cur_luma_row: lu_row,
-                cur_luma_col: lu_col,
-                neutral,
-            },
-        );
-        let (baf, blf) = if filt {
-            intra::filter_references(bc0, &ba, &bl, ctb)
-        } else {
-            (ba, bl)
-        };
-        let bcf = if filt {
-            ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16
-        } else {
-            bc0
-        };
-        let (raf, rlf) = if filt {
-            intra::filter_references(rc0, &ra, &rl, ctb)
-        } else {
-            (ra, rl)
-        };
-        let rcf = if filt {
-            ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16
-        } else {
-            rc0
-        };
-        let n_ch = ctb * ctb;
-
-        // Process Cb and Cr sequentially through the same persistent buffers.
-        // Their predictions are independent, while each reconstructed plane is
-        // committed before a possible lower 4:2:2 TB gathers its references.
-        for component in 0..2 {
-            let (src_plane, rec_plane, corner, above, left) = if component == 0 {
-                (&src_cb[..], &mut rec_cb[..], bcf, &baf[..], &blf[..])
-            } else {
-                (&src_cr[..], &mut rec_cr[..], rcf, &raf[..], &rlf[..])
-            };
-
-            intra::predict_chroma_tb_into(
-                chroma_mode,
-                corner,
-                above,
-                left,
-                ctb,
-                max_val as i32,
-                &mut scratch.pred,
-                &mut scratch.angular,
-            );
-            extract_block_dyn_into(
-                src_plane,
-                src_cw,
-                src_ch,
-                sub_ch_row,
-                ch_col,
-                ctb,
-                &mut scratch.orig,
-            );
-            intra::compute_residual_i32_into(
-                &scratch.orig[..n_ch],
-                &scratch.pred[..n_ch],
-                ctb,
-                &mut scratch.residual,
-            );
-
-            if lossless {
-                for (dst, &residual) in scratch.levels[..n_ch]
-                    .iter_mut()
-                    .zip(&scratch.residual[..n_ch])
-                {
-                    *dst = residual as i16;
-                }
-            } else {
-                crate::hevc_transform::fwd_transform_into(
-                    &scratch.residual[..n_ch],
-                    ctb,
-                    bit_depth.bits(),
-                    &mut scratch.coeff,
-                    &mut scratch.transform_tmp,
-                );
-                crate::hevc_transform::quantize_with_sign_hiding_into(
-                    &scratch.coeff,
-                    ctb,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    chroma_scan,
-                    &mut scratch.levels,
-                );
-            }
-
-            let tb = &mut scratch.chroma_tbs[t];
-            let (zigzag, nonzero) = if component == 0 {
-                (&mut tb.cb_zz, &mut tb.cb_nz)
-            } else {
-                (&mut tb.cr_zz, &mut tb.cr_nz)
-            };
-            for (dst, &(row, col)) in zigzag[..n_ch].iter_mut().zip(chroma_scan) {
-                *dst = scratch.levels[row * ctb + col];
-            }
-            *nonzero = zigzag[..n_ch].iter().any(|&level| level != 0);
-
-            if lossless {
-                for (dst, &level) in scratch.inverse[..n_ch]
-                    .iter_mut()
-                    .zip(&scratch.levels[..n_ch])
-                {
-                    *dst = level as i32;
-                }
-            } else {
-                crate::hevc_transform::dequantize_into(
-                    &scratch.levels,
-                    ctb,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    &mut scratch.dequant,
-                );
-                crate::hevc_transform::inv_transform_into(
-                    &scratch.dequant,
-                    ctb,
-                    bit_depth.bits(),
-                    &mut scratch.inverse,
-                    &mut scratch.transform_tmp,
-                );
-            }
-            intra::reconstruct_into(
-                &scratch.pred[..n_ch],
-                &scratch.inverse[..n_ch],
-                ctb,
-                max_val,
-                &mut scratch.reconstructed,
-            );
-            for (src_row, dst_row) in scratch.reconstructed[..n_ch]
-                .chunks_exact(ctb)
-                .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
-            {
-                dst_row[..ctb].copy_from_slice(src_row);
-            }
-        }
-    }
-
     // ── HEVC integer transform + quantize: luma LU×LU ─────────────────────
     // Mode-dependent scan for residual_coding. 8×8 luma uses a vertical/horizontal
     // scan for modes 6..=14 / 22..=30 (else diagonal); larger TUs are diagonal.
@@ -2029,10 +2029,524 @@ fn encode_cu<W: CabacWriter>(
             &mut scratch.rdoq,
         );
     }
+    let mut y_nz = false;
     for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(luma_scan) {
-        *dst = scratch.levels[row * lu + col];
+        let level = scratch.levels[row * lu + col];
+        *dst = level;
+        y_nz |= level != 0;
     }
-    let y_nz = scratch.scanned[..num_luma].iter().any(|&level| level != 0);
+
+    if lossless {
+        for (dst, &level) in scratch.inverse[..num_luma]
+            .iter_mut()
+            .zip(&scratch.levels[..num_luma])
+        {
+            *dst = level as i32;
+        }
+    } else {
+        crate::hevc_transform::dequantize_into(
+            &scratch.levels,
+            lu,
+            qp,
+            bit_depth.bits(),
+            &mut scratch.dequant,
+        );
+        crate::hevc_transform::inv_transform_into(
+            &scratch.dequant,
+            lu,
+            bit_depth.bits(),
+            &mut scratch.inverse,
+            &mut scratch.transform_tmp,
+        );
+    }
+    intra::reconstruct_into(
+        &scratch.best_pred[..num_luma],
+        &scratch.inverse[..num_luma],
+        lu,
+        max_val,
+        &mut scratch.reconstructed,
+    );
+    for (src_row, dst_row) in scratch.reconstructed[..num_luma]
+        .chunks_exact(lu)
+        .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
+    {
+        dst_row[..lu].copy_from_slice(src_row);
+    }
+    // ── Independent chroma intra-mode RDO ──────────────────────────────────
+    // HEVC exposes four explicit chroma modes plus DM_CHROMA. As in HM, a
+    // duplicate explicit mode is replaced by angular mode 34. All five modes are
+    // ranked with prediction SATD and syntax rate. A clearly separated proxy
+    // winner is committed directly; only ambiguous blocks run reconstruction +
+    // fractional-CABAC RDO against one challenger. The chosen mode alone reaches
+    // winner-only RDOQ and the real CABAC coder.
+    let chroma_qp = chroma_qp_for(qp_slice, chroma) + qp_bd_offset;
+    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let luma_ctus_x = yw_stride / 64;
+    let ctb = lu / sub_w; // chroma TB side: 4 through 32
+    let log2_ctb = ctb.trailing_zeros();
+    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
+    let n_ch = ctb * ctb;
+
+    let mut chroma_tb_scan_idx = 0u8;
+
+    if !chroma.is_monochrome() {
+        // Seed the not-yet-coded chroma region with source samples only for the
+        // first-pass 4:2:2 proxy. The lower stacked TB then sees a realistic
+        // above row without any transform work. Exact RDO immediately overwrites
+        // the region with each candidate's reconstructed upper TB.
+        if n_chroma_tb > 1 {
+            let seed_upper_tb = |src_plane: &[u16], rec_plane: &mut [u16]| {
+                for r in 0..ctb {
+                    let sy = (ch_row + r).min(src_ch - 1);
+                    let src_start = sy * src_cw + ch_col.min(src_cw - 1);
+                    let available = src_cw.saturating_sub(ch_col).min(ctb);
+                    let dst_start = (ch_row + r) * cw_stride + ch_col;
+                    let dst = &mut rec_plane[dst_start..dst_start + ctb];
+                    if available != 0 {
+                        dst[..available]
+                            .copy_from_slice(&src_plane[src_start..src_start + available]);
+                        let last = dst[available - 1];
+                        dst[available..].fill(last);
+                    } else {
+                        dst.fill(src_plane[sy * src_cw + src_cw - 1]);
+                    }
+                }
+            };
+            seed_upper_tb(src_cb, rec_cb);
+            seed_upper_tb(src_cr, rec_cr);
+        }
+
+        debug_assert!(n_chroma_tb * n_ch <= 1024);
+        // Extract each source chroma TB once. Proxy ranking, ambiguous-mode
+        // trials and the committed winner all reuse these blocks instead of
+        // repeatedly copying/clamping the same source rows.
+        for t in 0..n_chroma_tb {
+            let sub_ch_row = ch_row + t * ctb;
+            let offset = t * n_ch;
+            extract_block_dyn_into(
+                src_cb,
+                src_cw,
+                src_ch,
+                sub_ch_row,
+                ch_col,
+                ctb,
+                &mut scratch.chroma_orig_cb[offset..offset + n_ch],
+            );
+            extract_block_dyn_into(
+                src_cr,
+                src_cw,
+                src_ch,
+                sub_ch_row,
+                ch_col,
+                ctb,
+                &mut scratch.chroma_orig_cr[offset..offset + n_ch],
+            );
+        }
+
+        let all_candidates = chroma_mode_candidates(luma_mode, chroma);
+        let chroma_satd_lambda = chroma_lambda.sqrt();
+
+        // Proxy references are candidate-independent. Gather availability and
+        // substitute missing samples once per chroma TB instead of repeating the
+        // Morton/decode-order walk for all five modes. For 4:2:2 the source-seeded
+        // upper TB gives the lower proxy its candidate-independent top boundary.
+        let first_proxy_refs = intra::get_reference_samples_chroma_pair(
+            rec_cb,
+            rec_cr,
+            intra::ChromaRefGeometry {
+                stride: cw_stride,
+                block_row: ch_row,
+                block_col: ch_col,
+                chroma_h: coded_ch_h,
+                n: ctb,
+                sub_w,
+                sub_h,
+                luma_w: yw_stride,
+                luma_h: coded_yh,
+                luma_ctus_x,
+                cur_luma_row: lu_row,
+                cur_luma_col: lu_col,
+                neutral,
+            },
+        );
+        let mut proxy_refs = [first_proxy_refs; 2];
+        if n_chroma_tb > 1 {
+            proxy_refs[1] = intra::get_reference_samples_chroma_pair(
+                rec_cb,
+                rec_cr,
+                intra::ChromaRefGeometry {
+                    stride: cw_stride,
+                    block_row: ch_row + ctb,
+                    block_col: ch_col,
+                    chroma_h: coded_ch_h,
+                    n: ctb,
+                    sub_w,
+                    sub_h,
+                    luma_w: yw_stride,
+                    luma_h: coded_yh,
+                    luma_ctus_x,
+                    cur_luma_row: lu_row,
+                    cur_luma_col: lu_col,
+                    neutral,
+                },
+            );
+        }
+
+        let mut ranked = [ChromaModeCandidate {
+            pred_mode: 0,
+            syntax_idx: 0,
+            cost: f32::MAX,
+        }; 5];
+        // Test DM first so its cheap one-bin syntax establishes a useful top-two
+        // cutoff early. A candidate whose partial SATD already exceeds the second
+        // best complete proxy can be abandoned safely: all remaining terms are
+        // non-negative and only the top two can enter reconstruction RDO.
+        for candidate_index in [4usize, 0, 3, 1, 2] {
+            let mut candidate = all_candidates[candidate_index];
+            let mode = candidate.pred_mode;
+            let mut proxy_cost =
+                chroma_satd_lambda * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
+            'proxy_tbs: for t in 0..n_chroma_tb {
+                let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
+                let ((bc0, ba, bl), (rc0, ra, rl)) = &proxy_refs[t];
+                let cb_filtered = if filt {
+                    Some(intra::filter_references(*bc0, ba, bl, ctb))
+                } else {
+                    None
+                };
+                let cr_filtered = if filt {
+                    Some(intra::filter_references(*rc0, ra, rl, ctb))
+                } else {
+                    None
+                };
+                let bcf = if filt {
+                    ((ba[0] as i32 + 2 * (*bc0 as i32) + bl[0] as i32 + 2) >> 2) as u16
+                } else {
+                    *bc0
+                };
+                let rcf = if filt {
+                    ((ra[0] as i32 + 2 * (*rc0 as i32) + rl[0] as i32 + 2) >> 2) as u16
+                } else {
+                    *rc0
+                };
+                let (baf, blf) = match &cb_filtered {
+                    Some((above, left)) => (&above[..], &left[..]),
+                    None => (&ba[..], &bl[..]),
+                };
+                let (raf, rlf) = match &cr_filtered {
+                    Some((above, left)) => (&above[..], &left[..]),
+                    None => (&ra[..], &rl[..]),
+                };
+
+                let source_offset = t * n_ch;
+                for component in 0..2 {
+                    let (orig, corner, above, left) = if component == 0 {
+                        (
+                            &scratch.chroma_orig_cb[source_offset..source_offset + n_ch],
+                            bcf,
+                            baf,
+                            blf,
+                        )
+                    } else {
+                        (
+                            &scratch.chroma_orig_cr[source_offset..source_offset + n_ch],
+                            rcf,
+                            raf,
+                            rlf,
+                        )
+                    };
+                    intra::predict_chroma_tb_into(
+                        mode,
+                        corner,
+                        above,
+                        left,
+                        ctb,
+                        max_val as i32,
+                        &mut scratch.pred,
+                        &mut scratch.angular,
+                    );
+                    proxy_cost += satd_block(orig, &scratch.pred[..n_ch], ctb) as f32;
+                    if proxy_cost >= ranked[1].cost {
+                        break 'proxy_tbs;
+                    }
+                }
+            }
+            candidate.cost = proxy_cost;
+            update_chroma_candidate(&mut ranked, candidate);
+        }
+
+        let full_rd_count = full_rdo_chroma_count(&ranked, chroma);
+        let mut residual_ctx_after_luma = ctx.clone();
+        if y_nz {
+            // Chroma RDOQ needs the contexts after the already-selected luma
+            // residual, but its bit count is constant across chroma modes. Walk
+            // the syntax with a context-only sink rather than paying for f32
+            // entropy accumulation on every CU.
+            advance_residual_contexts(
+                &mut residual_ctx_after_luma,
+                &scratch.scanned[..num_luma],
+                luma_log2_ts,
+                true,
+                luma_scan_idx,
+                !lossless,
+            );
+        }
+
+        let mut evaluate_chroma = |candidate: ChromaModeCandidate,
+                                   estimate_rate: bool,
+                                   winner_rdoq: bool,
+                                   cost_limit: f32|
+         -> f32 {
+            let mode = candidate.pred_mode;
+            let scan_idx = dct::scan_idx_for(mode, log2_ctb, false, is_444);
+            let scan = dct::coeff_scan(log2_ctb, scan_idx);
+            let mut distortion = 0.0f32;
+
+            for t in 0..n_chroma_tb {
+                let sub_ch_row = ch_row + t * ctb;
+                let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
+                let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                    rec_cb,
+                    rec_cr,
+                    intra::ChromaRefGeometry {
+                        stride: cw_stride,
+                        block_row: sub_ch_row,
+                        block_col: ch_col,
+                        chroma_h: coded_ch_h,
+                        n: ctb,
+                        sub_w,
+                        sub_h,
+                        luma_w: yw_stride,
+                        luma_h: coded_yh,
+                        luma_ctus_x,
+                        cur_luma_row: lu_row,
+                        cur_luma_col: lu_col,
+                        neutral,
+                    },
+                );
+                let (baf, blf, bcf) = if filt {
+                    let (above, left) = intra::filter_references(bc0, &ba, &bl, ctb);
+                    let corner = ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16;
+                    (above, left, corner)
+                } else {
+                    (ba, bl, bc0)
+                };
+                let (raf, rlf, rcf) = if filt {
+                    let (above, left) = intra::filter_references(rc0, &ra, &rl, ctb);
+                    let corner = ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16;
+                    (above, left, corner)
+                } else {
+                    (ra, rl, rc0)
+                };
+
+                let source_offset = t * n_ch;
+                for component in 0..2 {
+                    let (orig, rec_plane, corner, above, left) = if component == 0 {
+                        (
+                            &scratch.chroma_orig_cb[source_offset..source_offset + n_ch],
+                            &mut rec_cb[..],
+                            bcf,
+                            &baf[..],
+                            &blf[..],
+                        )
+                    } else {
+                        (
+                            &scratch.chroma_orig_cr[source_offset..source_offset + n_ch],
+                            &mut rec_cr[..],
+                            rcf,
+                            &raf[..],
+                            &rlf[..],
+                        )
+                    };
+
+                    intra::predict_chroma_tb_into(
+                        mode,
+                        corner,
+                        above,
+                        left,
+                        ctb,
+                        max_val as i32,
+                        &mut scratch.pred,
+                        &mut scratch.angular,
+                    );
+                    intra::compute_residual_i32_into(
+                        orig,
+                        &scratch.pred[..n_ch],
+                        ctb,
+                        &mut scratch.residual,
+                    );
+
+                    if lossless {
+                        for (dst, &residual) in scratch.levels[..n_ch]
+                            .iter_mut()
+                            .zip(&scratch.residual[..n_ch])
+                        {
+                            *dst = residual as i16;
+                        }
+                    } else {
+                        crate::hevc_transform::fwd_transform_into(
+                            &scratch.residual[..n_ch],
+                            ctb,
+                            bit_depth.bits(),
+                            &mut scratch.coeff,
+                            &mut scratch.transform_tmp,
+                        );
+                        if winner_rdoq {
+                            crate::hevc_transform::rdoq_chroma_with_sign_hiding_into(
+                                &scratch.coeff,
+                                ctb,
+                                chroma_qp,
+                                bit_depth.bits(),
+                                scan,
+                                scan_idx,
+                                chroma_lambda,
+                                &residual_ctx_after_luma,
+                                &mut scratch.levels,
+                                &mut scratch.rdoq,
+                            );
+                        } else {
+                            crate::hevc_transform::quantize_with_sign_hiding_into(
+                                &scratch.coeff,
+                                ctb,
+                                chroma_qp,
+                                bit_depth.bits(),
+                                scan,
+                                &mut scratch.levels,
+                            );
+                        }
+                    }
+
+                    let tb = &mut scratch.chroma_tbs[t];
+                    let (zigzag, nonzero) = if component == 0 {
+                        (&mut tb.cb_zz, &mut tb.cb_nz)
+                    } else {
+                        (&mut tb.cr_zz, &mut tb.cr_nz)
+                    };
+                    *nonzero = false;
+                    for (dst, &(scan_row, scan_col)) in zigzag[..n_ch].iter_mut().zip(scan) {
+                        let level = scratch.levels[scan_row * ctb + scan_col];
+                        *dst = level;
+                        *nonzero |= level != 0;
+                    }
+
+                    if lossless {
+                        for (dst, &level) in scratch.inverse[..n_ch]
+                            .iter_mut()
+                            .zip(&scratch.levels[..n_ch])
+                        {
+                            *dst = level as i32;
+                        }
+                    } else {
+                        crate::hevc_transform::dequantize_into(
+                            &scratch.levels,
+                            ctb,
+                            chroma_qp,
+                            bit_depth.bits(),
+                            &mut scratch.dequant,
+                        );
+                        crate::hevc_transform::inv_transform_into(
+                            &scratch.dequant,
+                            ctb,
+                            bit_depth.bits(),
+                            &mut scratch.inverse,
+                            &mut scratch.transform_tmp,
+                        );
+                    }
+                    intra::reconstruct_into(
+                        &scratch.pred[..n_ch],
+                        &scratch.inverse[..n_ch],
+                        ctb,
+                        max_val,
+                        &mut scratch.reconstructed,
+                    );
+                    distortion += block_sse(orig, &scratch.reconstructed[..n_ch], ctb);
+                    if estimate_rate && distortion >= cost_limit {
+                        return distortion;
+                    }
+                    for (src_row, dst_row) in scratch.reconstructed[..n_ch]
+                        .chunks_exact(ctb)
+                        .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
+                    {
+                        dst_row[..ctb].copy_from_slice(src_row);
+                    }
+                }
+            }
+
+            if !estimate_rate || distortion >= cost_limit {
+                return distortion;
+            }
+
+            // Follow the real syntax order so chroma residual estimates see
+            // the CABAC states produced by luma residual coding. Only the
+            // fractional sink is used; the arithmetic coder is untouched.
+            let mut trial_ctx = residual_ctx_after_luma.clone();
+            let mut trial_ictx = ictx.clone();
+            let mut rate = estimate_chroma_mode_bits(&mut trial_ictx, candidate.syntax_idx);
+            for tb in &scratch.chroma_tbs[..n_chroma_tb] {
+                rate += trial_ctx.cbf_chroma[0].estimate_and_update(tb.cb_nz as u8);
+            }
+            for tb in &scratch.chroma_tbs[..n_chroma_tb] {
+                rate += trial_ctx.cbf_chroma[0].estimate_and_update(tb.cr_nz as u8);
+            }
+            // cbf_luma is candidate-independent and uses a separate context,
+            // so omitting it preserves ordering and avoids a constant cost.
+            for tb in &scratch.chroma_tbs[..n_chroma_tb] {
+                if tb.cb_nz {
+                    rate += estimate_residual_bits(
+                        &mut trial_ctx,
+                        &tb.cb_zz[..n_ch],
+                        log2_ctb,
+                        false,
+                        scan_idx,
+                        !lossless,
+                    );
+                }
+            }
+            for tb in &scratch.chroma_tbs[..n_chroma_tb] {
+                if tb.cr_nz {
+                    rate += estimate_residual_bits(
+                        &mut trial_ctx,
+                        &tb.cr_zz[..n_ch],
+                        log2_ctb,
+                        false,
+                        scan_idx,
+                        !lossless,
+                    );
+                }
+            }
+            distortion + chroma_lambda * rate
+        };
+
+        let best_chroma = if full_rd_count == 1 {
+            // The proxy winner is clearly separated. Commit it directly with
+            // winner-only chroma RDOQ, avoiding the old scalar trial followed by
+            // an identical prediction/transform/reconstruction replay.
+            let winner = ranked[0];
+            let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            winner
+        } else {
+            // Only genuinely ambiguous blocks pay for one challenger. Trial
+            // modes use scalar quantization; the chosen mode is then replayed
+            // once with winner-only RDOQ.
+            let mut winner = ranked[0];
+            let mut best_cost = f32::MAX;
+            for &candidate in &ranked[..full_rd_count] {
+                let cost = evaluate_chroma(candidate, true, false, best_cost);
+                if cost < best_cost {
+                    best_cost = cost;
+                    winner = candidate;
+                }
+            }
+            let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            winner
+        };
+        drop(evaluate_chroma);
+
+        chroma_tb_scan_idx = dct::scan_idx_for(best_chroma.pred_mode, log2_ctb, false, is_444);
+        encode_chroma_mode(enc, ictx, best_chroma.syntax_idx);
+    }
 
     // ── CABAC: transform_tree() syntax ─────────────────────────────────────
     // split_transform_flag is inferred 0 (max_transform_hierarchy_depth_intra = 0),
@@ -2090,46 +2604,6 @@ fn encode_cu<W: CabacWriter>(
             );
         }
     }
-
-    // ── Reconstruct luma ────────────────────────────────────────────────────
-    if lossless {
-        for (dst, &level) in scratch.inverse[..num_luma]
-            .iter_mut()
-            .zip(&scratch.levels[..num_luma])
-        {
-            *dst = level as i32;
-        }
-    } else {
-        crate::hevc_transform::dequantize_into(
-            &scratch.levels,
-            lu,
-            qp,
-            bit_depth.bits(),
-            &mut scratch.dequant,
-        );
-        crate::hevc_transform::inv_transform_into(
-            &scratch.dequant,
-            lu,
-            bit_depth.bits(),
-            &mut scratch.inverse,
-            &mut scratch.transform_tmp,
-        );
-    }
-    intra::reconstruct_into(
-        &scratch.best_pred[..num_luma],
-        &scratch.inverse[..num_luma],
-        lu,
-        max_val,
-        &mut scratch.reconstructed,
-    );
-    for (src_row, dst_row) in scratch.reconstructed[..num_luma]
-        .chunks_exact(lu)
-        .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
-    {
-        dst_row[..lu].copy_from_slice(src_row);
-    }
-    // Chroma was already reconstructed into rec_cb/rec_cr inside the per-sub-TB loop
-    // above (so each stacked sub-TB could serve as the next one's intra reference).
 }
 
 /// Encode one intra CU (luma side `lu` = 8, 16, or 32) at (lu_row,lu_col) into the
@@ -2210,7 +2684,7 @@ fn extract_block_n_into<const N: usize>(
     out: &mut [u16],
 ) {
     debug_assert!(out.len() >= N * N);
-    for (r, dst) in out[..N * N].chunks_exact_mut(N).enumerate() {
+    for (r, dst) in out[..N * N].as_chunks_mut::<N>().0.iter_mut().enumerate() {
         let src_row = (row + r).min(src_h - 1);
         let available = src_w.saturating_sub(col).min(N);
         if available != 0 {
@@ -2335,6 +2809,115 @@ mod tests {
         assert_eq!(estimated_luma_mode_bins(1, &mpm), 3);
         assert_eq!(estimated_luma_mode_bins(26, &mpm), 3);
         assert_eq!(estimated_luma_mode_bins(17, &mpm), 6);
+    }
+
+    #[test]
+    fn chroma_candidates_replace_the_dm_duplicate() {
+        let modes = chroma_mode_candidates(26, crate::fmt::ChromaFormat::Yuv444);
+        assert_eq!(
+            modes.map(|candidate| candidate.pred_mode),
+            [0, 34, 10, 1, 26]
+        );
+        assert_eq!(modes.map(|candidate| candidate.syntax_idx), [0, 1, 2, 3, 4]);
+
+        let mapped = chroma_mode_candidates(26, crate::fmt::ChromaFormat::Yuv422);
+        assert_eq!(mapped[1].pred_mode, MODE_422_MAP[34]);
+        assert_eq!(mapped[4].pred_mode, MODE_422_MAP[26]);
+        for i in 0..mapped.len() {
+            for j in i + 1..mapped.len() {
+                assert_ne!(mapped[i].pred_mode, mapped[j].pred_mode);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_mode_bin_estimate_matches_binarization() {
+        assert_eq!(estimated_chroma_mode_bins(CHROMA_DM_SYNTAX_IDX), 1);
+        for syntax_idx in 0..CHROMA_DM_SYNTAX_IDX {
+            assert_eq!(estimated_chroma_mode_bins(syntax_idx), 3);
+        }
+    }
+
+    #[test]
+    fn chroma_mode_binarization_uses_dm_flag_then_two_bypass_bits() {
+        #[derive(Default)]
+        struct Recorder {
+            regular: Vec<u8>,
+            bypass: Vec<u8>,
+        }
+        impl CabacWriter for Recorder {
+            fn encode_bin(&mut self, bin_val: u8, ctx: &mut crate::cabac::engine::CtxModel) {
+                self.regular.push(bin_val);
+                let _ = ctx.estimate_and_update(bin_val);
+            }
+
+            fn encode_bypass(&mut self, bin_val: u8) {
+                self.bypass.push(bin_val);
+            }
+        }
+
+        let mut ictx = IntraModeContexts::init_islice(26);
+        let mut dm = Recorder::default();
+        encode_chroma_mode(&mut dm, &mut ictx, CHROMA_DM_SYNTAX_IDX);
+        assert_eq!(dm.regular, [0]);
+        assert!(dm.bypass.is_empty());
+
+        let mut ictx = IntraModeContexts::init_islice(26);
+        let mut explicit = Recorder::default();
+        encode_chroma_mode(&mut explicit, &mut ictx, 2);
+        assert_eq!(explicit.regular, [1]);
+        assert_eq!(explicit.bypass, [1, 0]);
+    }
+
+    #[test]
+    fn chroma_full_rdo_is_only_expanded_for_close_proxy_modes() {
+        let make = |first: f32, second: f32| {
+            let mut candidates = [ChromaModeCandidate {
+                pred_mode: 0,
+                syntax_idx: 0,
+                cost: f32::MAX,
+            }; 5];
+            candidates[0].cost = first;
+            candidates[1].cost = second;
+            candidates
+        };
+
+        assert_eq!(
+            full_rdo_chroma_count(&make(100.0, 102.0), crate::fmt::ChromaFormat::Yuv420),
+            2
+        );
+        assert_eq!(
+            full_rdo_chroma_count(&make(100.0, 104.0), crate::fmt::ChromaFormat::Yuv420),
+            1
+        );
+        assert_eq!(
+            full_rdo_chroma_count(&make(100.0, 107.0), crate::fmt::ChromaFormat::Yuv444),
+            2
+        );
+        assert_eq!(
+            full_rdo_chroma_count(&make(100.0, 109.0), crate::fmt::ChromaFormat::Yuv444),
+            1
+        );
+    }
+
+    #[test]
+    fn chroma_lambda_tracks_the_420_qp_mapping() {
+        assert_eq!(
+            chroma_lambda_scale(29, crate::fmt::ChromaFormat::Yuv420),
+            1.0
+        );
+        assert_eq!(
+            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv420),
+            0.25
+        );
+        assert_eq!(
+            chroma_lambda_scale(51, crate::fmt::ChromaFormat::Yuv420),
+            0.25
+        );
+        assert_eq!(
+            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv444),
+            1.0
+        );
     }
 
     #[test]

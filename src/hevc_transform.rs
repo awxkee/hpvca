@@ -115,10 +115,9 @@ static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 const MAX_TB: usize = 1024;
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
-/// Persistent work area for winner-only RDOQ. The previous implementation put
-/// three 1024-entry cost arrays on every CU stack frame and cleared them for each
-/// winner. Reuse one frame-owned allocation; cost entries are overwritten lazily
-/// and only the active coefficient-group topology is reset.
+/// Persistent work area for winner-only RDOQ. The HM-style pass jointly
+/// selects coefficient levels, coefficient-group significance, CBF and the last
+/// position; no second magnitude replay is needed.
 pub(crate) struct RdoqScratch {
     cost_coeff: [f32; MAX_TB],
     cost_coeff0: [f32; MAX_TB],
@@ -157,14 +156,6 @@ pub(crate) fn fwd_transform_into(
         32 => fwd_transform_32(res, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
     }
-}
-
-/// Compatibility wrapper for tests and non-hot callers.
-pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
-    let mut out = [0i32; MAX_TB];
-    let mut tmp = [0i32; MAX_TB];
-    fwd_transform_into(res, n, bit_depth, &mut out, &mut tmp);
-    out
 }
 
 #[inline]
@@ -329,6 +320,7 @@ fn rdoq_level_bits(
     c1_idx: u32,
     c2_idx: u32,
     rice: u32,
+    is_luma: bool,
     ctx: &ContextSet,
 ) -> f32 {
     debug_assert!(abs_level > 0);
@@ -336,9 +328,11 @@ fn rdoq_level_bits(
     const C2_FLAGS: u32 = 1;
 
     let mut bits = 1.0; // sign bypass bin
-    let one_ctx =
-        (ctx_set * 4 + c1.clamp(0, 3) as usize).min(ctx.coeff_abs_level_greater1.len() - 1);
-    let abs_ctx = ctx_set.min(ctx.coeff_abs_level_greater2.len() - 1);
+    let greater1_offset = if is_luma { 0 } else { 16 };
+    let one_ctx = (greater1_offset + ctx_set * 4 + c1.clamp(0, 3) as usize)
+        .min(ctx.coeff_abs_level_greater1.len() - 1);
+    let greater2_offset = if is_luma { 0 } else { 4 };
+    let abs_ctx = (greater2_offset + ctx_set).min(ctx.coeff_abs_level_greater2.len() - 1);
     let base_level = if c1_idx < C1_FLAGS {
         2 + (c2_idx < C2_FLAGS) as u32
     } else {
@@ -370,7 +364,14 @@ fn rdoq_level_bits(
 }
 
 #[inline]
-fn last_sig_bits(ctx: &ContextSet, x: usize, y: usize, log2_size: u32, scan_idx: u8) -> f32 {
+fn last_sig_bits(
+    ctx: &ContextSet,
+    x: usize,
+    y: usize,
+    log2_size: u32,
+    scan_idx: u8,
+    is_luma: bool,
+) -> f32 {
     static GROUP_IDX: [usize; 32] = [
         0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9,
         9, 9,
@@ -378,8 +379,14 @@ fn last_sig_bits(ctx: &ContextSet, x: usize, y: usize, log2_size: u32, scan_idx:
     static MIN_IN_GROUP: [usize; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 
     let (x, y) = if scan_idx == 2 { (y, x) } else { (x, y) };
-    let ctx_offset = (3 * (log2_size - 2) + ((log2_size - 1) >> 2)) as usize;
-    let ctx_shift = ((log2_size + 1) >> 2) as usize;
+    let (ctx_offset, ctx_shift) = if is_luma {
+        (
+            (3 * (log2_size - 2) + ((log2_size - 1) >> 2)) as usize,
+            ((log2_size + 1) >> 2) as usize,
+        )
+    } else {
+        (15usize, (log2_size - 2) as usize)
+    };
     let max_group = GROUP_IDX[(1usize << log2_size) - 1];
 
     let prefix_bits = |value: usize, models: &[crate::cabac::engine::CtxModel]| {
@@ -403,52 +410,56 @@ fn last_sig_bits(ctx: &ContextSet, x: usize, y: usize, log2_size: u32, scan_idx:
     prefix_bits(x, &ctx.last_sig_coeff_x_prefix) + prefix_bits(y, &ctx.last_sig_coeff_y_prefix)
 }
 
-#[inline]
-fn rdoq_distortion_scale(n: usize, bit_depth: u8) -> f32 {
-    // The forward transform represents an orthonormal coefficient multiplied by
-    // 2^(15-bitDepth-log2(N)); invert that scale to express coefficient error in
-    // the same spatial-SSE domain as the encoder's lambda.
-    let exponent = 2 * (bit_depth as i32 + n.trailing_zeros() as i32 - 15);
-    2f32.powi(exponent)
-}
-
-#[inline]
-fn dequant_abs_level(level: u32, n: usize, qp: u8, bit_depth: u8) -> i64 {
-    let log2n = n.trailing_zeros() as i64;
-    let bd_shift = bit_depth as i64 + log2n - 5;
-    let add = 1i64 << (bd_shift - 1);
-    let factor = DEQUANT_SCALE[(qp % 6) as usize] * (1i64 << (qp as i64 / 6)) * 16;
-    ((level as i64 * factor + add) >> bd_shift).clamp(0, 32767)
-}
-
-#[inline]
-fn coefficient_distortion(
-    coeff_abs: i64,
-    level: u32,
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
+#[derive(Clone, Copy)]
+struct RdoqDistortion {
+    factor: i64,
+    add: i64,
+    shift: u32,
     scale: f32,
-) -> f32 {
-    let error = coeff_abs - dequant_abs_level(level, n, qp, bit_depth);
-    (error * error) as f32 * scale
 }
 
-/// HM-style rate-distortion optimized quantization for the committed luma mode.
+impl RdoqDistortion {
+    #[inline]
+    fn new(n: usize, qp: u8, bit_depth: u8) -> Self {
+        let log2n = n.trailing_zeros() as i32;
+        let shift = (bit_depth as i32 + log2n - 5) as u32;
+        let exponent = 2 * (bit_depth as i32 + log2n - 15);
+        let scale = if exponent >= 0 {
+            (1u32 << exponent as u32) as f32
+        } else {
+            1.0 / (1u32 << (-exponent) as u32) as f32
+        };
+        Self {
+            factor: DEQUANT_SCALE[(qp % 6) as usize] * (1i64 << (qp / 6)) * 16,
+            add: 1i64 << (shift - 1),
+            shift,
+            scale,
+        }
+    }
+
+    #[inline]
+    fn coefficient_cost(self, coeff_abs: i64, level: u32) -> f32 {
+        let dequant = ((level as i64 * self.factor + self.add) >> self.shift).clamp(0, 32767);
+        let error = coeff_abs - dequant;
+        (error * error) as f32 * self.scale
+    }
+}
+
+/// Rate-distortion optimized quantization for a committed luma or chroma mode.
 ///
-/// The fast intra shortlist uses [`quantize_with_sign_hiding`]. Only its winner
-/// enters this path. RDOQ considers the rounded level and one lower level per coefficient,
-/// can zero weak coefficients and whole 4×4 coefficient groups, and optimizes
-/// the last-significant position. CABAC costs use frozen probability states from
-/// the current TU entrance, while c1/c2 and Rice adaptation follow the candidate
-/// levels in reverse scan order, matching HM's normal RDOQ structure.
-pub(crate) fn rdoq_luma_with_sign_hiding_into(
+/// Fast mode shortlists use [`quantize_with_sign_hiding`]; only the selected mode
+/// enters this path. This HM-style RDOQ pass selects coefficient levels,
+/// significance, coefficient groups, CBF and the last position while following
+/// greater1/greater2 and Rice state. CABAC probabilities stay frozen at TU entry,
+/// as in normal encoder RDOQ.
+fn rdoq_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
     qp: u8,
     bit_depth: u8,
     scan: &[(usize, usize)],
     scan_idx: u8,
+    is_luma: bool,
     lambda: f32,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
@@ -459,7 +470,7 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
 
     let num_coeffs = n * n;
     debug_assert_eq!(scan.len(), num_coeffs);
-    debug_assert!(matches!(n, 8 | 16 | 32));
+    debug_assert!(matches!(n, 4 | 8 | 16 | 32));
     let log2_size = n.trailing_zeros();
     let num_groups = num_coeffs / GROUP_SIZE;
     let sb_side = n / 4;
@@ -467,9 +478,8 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
     let q_bits = 14 + qp as i64 / 6 + (15 - bit_depth as i64 - log2_size as i64);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let round = 1i64 << (q_bits - 1);
-    let distortion_scale = rdoq_distortion_scale(n, bit_depth);
+    let distortion = RdoqDistortion::new(n, qp, bit_depth);
 
-    levels[..num_coeffs].fill(0); // absolute levels until final sign restore
     let RdoqScratch {
         cost_coeff,
         cost_coeff0,
@@ -477,10 +487,9 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
         cost_group_sig,
         group_flags,
     } = scratch;
-    // Coefficient costs are assigned before every read. Only the significance
-    // topology needs clearing between TUs; avoiding three full cost-array fills
-    // saves 12 KiB of writes for every winner-only RDOQ invocation.
-    group_flags[..sb_side * sb_side].fill(0);
+    // Every coefficient and group entry is assigned on this reverse scan before
+    // it can be observed. This avoids clearing the level and group arrays for
+    // every winner-only TU.
     let mut block_uncoded_cost = 0.0;
     let mut base_cost = 0.0;
     let mut last_scan_pos = None;
@@ -497,8 +506,13 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
         let right = sbx + 1 < sb_side && group_flags[group_grid + 1] != 0;
         let below = sby + 1 < sb_side && group_flags[group_grid + sb_side] != 0;
         let prev_csbf = right as u8 | ((below as u8) << 1);
+        group_flags[group_grid] = 0;
 
-        let mut ctx_set = if group == 0 { 0usize } else { 2usize };
+        let mut ctx_set = if group == 0 || !is_luma {
+            0usize
+        } else {
+            2usize
+        };
         if carry_c1 == 0 {
             ctx_set += 1;
         }
@@ -520,11 +534,12 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
             let coeff_abs = (coeff[pos] as i64).abs();
             let scaled = coeff_abs * q_scale;
             let max_abs = ((scaled + round) >> q_bits).clamp(0, i16::MAX as i64) as u32;
-            let dist0 = coefficient_distortion(coeff_abs, 0, n, qp, bit_depth, distortion_scale);
+            let dist0 = distortion.coefficient_cost(coeff_abs, 0);
             cost_coeff0[scan_pos] = dist0;
             block_uncoded_cost += dist0;
 
             if last_scan_pos.is_none() && max_abs == 0 {
+                levels[pos] = 0;
                 cost_coeff[scan_pos] = dist0;
                 base_cost += dist0;
                 continue;
@@ -534,7 +549,7 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
                 last_group = group;
             }
             let is_last = last_scan_pos == Some(scan_pos);
-            let sig_ctx = sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, true)
+            let sig_ctx = sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
                 .min(ctx.sig_coeff_flag.len() - 1);
             let sig0 = if is_last {
                 0.0
@@ -552,15 +567,9 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
             if max_abs > 0 {
                 let min_abs = if max_abs > 1 { max_abs - 1 } else { 1 };
                 for abs_level in [max_abs, min_abs] {
-                    let dist = coefficient_distortion(
-                        coeff_abs,
-                        abs_level,
-                        n,
-                        qp,
-                        bit_depth,
-                        distortion_scale,
-                    );
-                    let rate = rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, ctx);
+                    let dist = distortion.coefficient_cost(coeff_abs, abs_level);
+                    let rate =
+                        rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx);
                     let coded_cost = dist + sig1 + lambda * rate;
                     if coded_cost < best_cost || is_last && best_level == 0 {
                         best_cost = coded_cost;
@@ -575,16 +584,10 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
                 if !is_last && max_abs >= 3 {
                     best_cost = f32::MAX;
                     for abs_level in [max_abs, min_abs] {
-                        let dist = coefficient_distortion(
-                            coeff_abs,
-                            abs_level,
-                            n,
-                            qp,
-                            bit_depth,
-                            distortion_scale,
+                        let dist = distortion.coefficient_cost(coeff_abs, abs_level);
+                        let rate = rdoq_level_bits(
+                            abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx,
                         );
-                        let rate =
-                            rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, ctx);
                         let coded_cost = dist + sig1 + lambda * rate;
                         if coded_cost < best_cost {
                             best_cost = coded_cost;
@@ -642,7 +645,11 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
             continue;
         }
 
-        let cg_ctx = (prev_csbf != 0) as usize;
+        let cg_ctx = if is_luma {
+            (prev_csbf != 0) as usize
+        } else {
+            2 + (prev_csbf != 0) as usize
+        };
         let csbf0 = lambda * ctx.coded_sub_block_flag[cg_ctx].estimated_bits(0);
         let csbf1 = lambda * ctx.coded_sub_block_flag[cg_ctx].estimated_bits(1);
         if !group_has_nonzero {
@@ -686,7 +693,11 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
     // Compare the non-zero TU against CBF=0, then move the last-significant
     // position down through trailing unit levels. HM stops once it reaches a
     // level greater than one because discarding it is rarely profitable.
-    let cbf = ctx.cbf_luma[1];
+    let cbf = if is_luma {
+        ctx.cbf_luma[1]
+    } else {
+        ctx.cbf_chroma[0]
+    };
     let mut best_cost = block_uncoded_cost + lambda * cbf.estimated_bits(0);
     base_cost += lambda * cbf.estimated_bits(1);
     let mut best_last_p1 = 0usize;
@@ -707,7 +718,8 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
             let pos = row * n + col;
             let level = levels[pos].unsigned_abs() as u32;
             if level != 0 {
-                let total = base_cost + lambda * last_sig_bits(ctx, col, row, log2_size, scan_idx)
+                let total = base_cost
+                    + lambda * last_sig_bits(ctx, col, row, log2_size, scan_idx, is_luma)
                     - cost_sig[scan_pos];
                 if total < best_cost {
                     best_cost = total;
@@ -728,18 +740,22 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
     }
 
     for (scan_pos, &(row, col)) in scan.iter().enumerate() {
-        let pos = row * n + col;
         if scan_pos >= best_last_p1 {
-            levels[pos] = 0;
-        } else if coeff[pos] < 0 {
+            levels[row * n + col] = 0;
+        }
+    }
+
+    for &(row, col) in scan.iter().take(best_last_p1) {
+        let pos = row * n + col;
+        if coeff[pos] < 0 {
             levels[pos] = -levels[pos];
         }
     }
     apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
 }
 
-/// Compatibility wrapper for tests and non-hot callers.
-pub(crate) fn rdoq_luma_with_sign_hiding(
+/// Winner-only RDOQ for a committed luma mode.
+pub(crate) fn rdoq_luma_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
     qp: u8,
@@ -748,22 +764,33 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
     scan_idx: u8,
     lambda: f32,
     ctx: &ContextSet,
-) -> [i16; MAX_TB] {
-    let mut levels = [0i16; MAX_TB];
-    let mut scratch = RdoqScratch::new();
-    rdoq_luma_with_sign_hiding_into(
-        coeff,
-        n,
-        qp,
-        bit_depth,
-        scan,
-        scan_idx,
-        lambda,
-        ctx,
-        &mut levels,
-        &mut scratch,
+    levels: &mut [i16; MAX_TB],
+    scratch: &mut RdoqScratch,
+) {
+    rdoq_with_sign_hiding_into(
+        coeff, n, qp, bit_depth, scan, scan_idx, true, lambda, ctx, levels, scratch,
     );
-    levels
+}
+
+/// Winner-only RDOQ for a committed chroma mode. Chroma uses its own
+/// significant-coefficient, coefficient-group, greater1/greater2 and CBF
+/// contexts while sharing the same HM-style significance, level, CG, CBF and
+/// last-position optimization as luma.
+pub(crate) fn rdoq_chroma_with_sign_hiding_into(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+    scan_idx: u8,
+    lambda: f32,
+    ctx: &ContextSet,
+    levels: &mut [i16; MAX_TB],
+    scratch: &mut RdoqScratch,
+) {
+    rdoq_with_sign_hiding_into(
+        coeff, n, qp, bit_depth, scan, scan_idx, false, lambda, ctx, levels, scratch,
+    );
 }
 
 /// Forward quantization followed by HEVC sign-data hiding.
@@ -783,18 +810,6 @@ pub(crate) fn quantize_with_sign_hiding_into(
 ) {
     debug_assert_eq!(scan.len(), n * n);
     quantize_impl_into(coeff, n, qp, bit_depth, Some(scan), out);
-}
-
-pub(crate) fn quantize_with_sign_hiding(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-) -> [i16; MAX_TB] {
-    let mut out = [0i16; MAX_TB];
-    quantize_with_sign_hiding_into(coeff, n, qp, bit_depth, scan, &mut out);
-    out
 }
 
 /// Apply HEVC sign-data hiding to an already selected set of coefficient levels.
@@ -848,23 +863,10 @@ fn quantize_impl_into(
     }
 
     // HM avoids testing the degenerate one-coefficient, unit-level TU.
-    if abs_sum >= 2 {
-        if let Some(scan) = sign_hiding_scan {
+    if abs_sum >= 2
+        && let Some(scan) = sign_hiding_scan {
             sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, true);
         }
-    }
-}
-
-fn quantize_impl(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    sign_hiding_scan: Option<&[(usize, usize)]>,
-) -> [i16; MAX_TB] {
-    let mut out = [0i16; MAX_TB];
-    quantize_impl_into(coeff, n, qp, bit_depth, sign_hiding_scan, &mut out);
-    out
 }
 
 /// HEVC/HM signBitHidingHDQ, distortion-only variant (no rate term).
@@ -974,13 +976,12 @@ fn sign_bit_hiding_hdq(
                 Some((-delta, 1))
             };
 
-            if let Some((cost, change)) = candidate {
-                if cost < best_cost {
+            if let Some((cost, change)) = candidate
+                && cost < best_cost {
                     best_cost = cost;
                     best_pos = Some(pos);
                     best_change = change;
                 }
-            }
         }
 
         let pos = best_pos.expect("eligible sign-hiding group has a valid adjustment");
@@ -1017,12 +1018,6 @@ pub(crate) fn dequantize_into(
     }
 }
 
-pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
-    let mut out = [0i32; MAX_TB];
-    dequantize_into(level, n, qp, bit_depth, &mut out);
-    out
-}
-
 /// Inverse integer transform (spec 8.6.4.2) into reusable output/intermediate
 /// buffers. Only the first `n*n` entries are touched.
 #[inline]
@@ -1040,13 +1035,6 @@ pub(crate) fn inv_transform_into(
         32 => inv_transform_32(coeff, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
     }
-}
-
-pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
-    let mut out = [0i32; MAX_TB];
-    let mut tmp = [0i32; MAX_TB];
-    inv_transform_into(coeff, n, bit_depth, &mut out, &mut tmp);
-    out
 }
 
 #[inline]
@@ -1275,6 +1263,14 @@ mod tests {
         quantize_impl(coeff, n, qp, bit_depth, None)
     }
 
+    /// Compatibility wrapper for tests and non-hot callers.
+    pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+        let mut out = [0i32; MAX_TB];
+        let mut tmp = [0i32; MAX_TB];
+        fwd_transform_into(res, n, bit_depth, &mut out, &mut tmp);
+        out
+    }
+
     /// Full pipeline residual → fwd → quant → dequant → inv reconstructs the
     /// residual within the quantization error. At low QP the error is small;
     /// a gross T16/scan/buffer bug would blow this far past tolerance.
@@ -1299,6 +1295,19 @@ mod tests {
             mean_abs <= max_mean_abs,
             "N={n} qp={qp}: mean|err|={mean_abs:.3} exceeds {max_mean_abs}"
         );
+    }
+
+    pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
+        let mut out = [0i32; MAX_TB];
+        dequantize_into(level, n, qp, bit_depth, &mut out);
+        out
+    }
+
+    pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+        let mut out = [0i32; MAX_TB];
+        let mut tmp = [0i32; MAX_TB];
+        inv_transform_into(coeff, n, bit_depth, &mut out, &mut tmp);
+        out
     }
 
     #[test]
@@ -1339,7 +1348,8 @@ mod tests {
         }
 
         let mut expected = [0i32; MAX_TB];
-        fwd_transform_n::<32>(&residual, &T32, 8, &mut expected);
+        let mut tmp = [0i32; MAX_TB];
+        fwd_transform_n::<32>(&residual, &T32, 8, &mut expected, &mut tmp);
         let actual = fwd_transform(&residual, 32, 8);
         assert_eq!(actual, expected);
     }
@@ -1354,7 +1364,8 @@ mod tests {
         }
 
         let mut expected = [0i32; MAX_TB];
-        inv_transform_n::<32>(&coeff, &T32, 10, &mut expected);
+        let mut tmp = [0i32; MAX_TB];
+        inv_transform_n::<32>(&coeff, &T32, 10, &mut expected, &mut tmp);
         let actual = inv_transform(&coeff, 32, 10);
         assert_eq!(actual, expected);
 
@@ -1363,9 +1374,33 @@ mod tests {
         for (index, value) in [(0usize, 1200), (32, -900), (97, 700), (511, -300)] {
             coeff[index] = value;
         }
-        inv_transform_n::<32>(&coeff, &T32, 8, &mut expected);
+        inv_transform_n::<32>(&coeff, &T32, 8, &mut expected, &mut tmp);
         let actual = inv_transform(&coeff, 32, 8);
         assert_eq!(actual, expected);
+    }
+
+    fn quantize_impl(
+        coeff: &[i32],
+        n: usize,
+        qp: u8,
+        bit_depth: u8,
+        sign_hiding_scan: Option<&[(usize, usize)]>,
+    ) -> [i16; MAX_TB] {
+        let mut out = [0i16; MAX_TB];
+        quantize_impl_into(coeff, n, qp, bit_depth, sign_hiding_scan, &mut out);
+        out
+    }
+
+    pub(crate) fn quantize_with_sign_hiding(
+        coeff: &[i32],
+        n: usize,
+        qp: u8,
+        bit_depth: u8,
+        scan: &[(usize, usize)],
+    ) -> [i16; MAX_TB] {
+        let mut out = [0i16; MAX_TB];
+        quantize_with_sign_hiding_into(coeff, n, qp, bit_depth, scan, &mut out);
+        out
     }
 
     #[test]
@@ -1399,6 +1434,62 @@ mod tests {
             &ctx,
         );
         assert!(levels[..64].iter().all(|&level| level == 0));
+    }
+
+    pub(crate) fn rdoq_luma_with_sign_hiding(
+        coeff: &[i32],
+        n: usize,
+        qp: u8,
+        bit_depth: u8,
+        scan: &[(usize, usize)],
+        scan_idx: u8,
+        lambda: f32,
+        ctx: &ContextSet,
+    ) -> [i16; MAX_TB] {
+        let mut levels = [0i16; MAX_TB];
+        let mut scratch = RdoqScratch::new();
+        rdoq_luma_with_sign_hiding_into(
+            coeff,
+            n,
+            qp,
+            bit_depth,
+            scan,
+            scan_idx,
+            lambda,
+            ctx,
+            &mut levels,
+            &mut scratch,
+        );
+        levels
+    }
+
+    #[test]
+    fn chroma_rdoq_supports_4x4_and_chroma_contexts() {
+        let scan = crate::dct::coeff_scan(2, 0);
+        let mut coeff = [0i32; MAX_TB];
+        for (i, &(row, col)) in scan.iter().enumerate() {
+            let magnitude = 240 + i as i32 * 41;
+            coeff[row * 4 + col] = if i % 4 == 0 { -magnitude } else { magnitude };
+        }
+        let ctx = ContextSet::init_islice(22);
+        let mut levels = [0i16; MAX_TB];
+        let mut scratch = RdoqScratch::new();
+        rdoq_chroma_with_sign_hiding_into(
+            &coeff,
+            4,
+            22,
+            8,
+            scan,
+            0,
+            0.57 * 2f32.powf((22.0 - 12.0) / 3.0),
+            &ctx,
+            &mut levels,
+            &mut scratch,
+        );
+        assert!(levels[..16].iter().any(|&level| level != 0));
+        for (&level, &source) in levels[..16].iter().zip(&coeff[..16]) {
+            assert!(level == 0 || level.signum() as i32 == source.signum());
+        }
     }
 
     #[test]
