@@ -33,4 +33,6 @@ pub(crate) mod residual;
 
 pub(crate) use contexts::{ContextSet, IntraModeContexts};
 pub(crate) use engine::CabacEncoder;
-pub(crate) use residual::{encode_cbf_chroma, encode_cbf_luma, encode_residual};
+pub(crate) use residual::{
+    encode_cbf_chroma, encode_cbf_luma, encode_residual, estimate_residual_bits,
+};

@@ -26,7 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use super::{contexts::ContextSet, engine::CabacEncoder};
+use super::{
+    contexts::ContextSet,
+    engine::{CabacEncoder, CabacEstimator, CabacWriter},
+};
 
 /// Encode cbf_luma (trafo_depth 0 or 1).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_LUMA] + !trafo_depth)
@@ -64,6 +67,50 @@ pub(crate) fn encode_cbf_chroma(
 /// `sign_data_hiding` — omit the inferred first-significant sign in eligible CGs
 pub(crate) fn encode_residual(
     enc: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+) {
+    write_residual(
+        enc,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+    );
+}
+
+/// Estimate residual syntax with fractional CABAC bits while applying the same
+/// context transitions as real coding. The caller supplies a trial-local context
+/// clone; the arithmetic coder and its output buffer are never touched.
+pub(crate) fn estimate_residual_bits(
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+) -> f32 {
+    let mut est = CabacEstimator::default();
+    write_residual(
+        &mut est,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+    );
+    est.bits()
+}
+
+fn write_residual<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     coeffs: &[i16],
     log2_ts: u32,
@@ -234,8 +281,8 @@ pub(crate) fn encode_residual(
 /// For luma log2_size=3:  ctx_offset=3, ctx_shift=1
 /// For chroma log2_size=2: ctx_offset=15, ctx_shift=0
 /// For chroma log2_size=3: ctx_offset=15, ctx_shift=1
-fn encode_last_sig(
-    enc: &mut CabacEncoder,
+fn encode_last_sig<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     last_x: u32,
     last_y: u32,
@@ -262,7 +309,7 @@ fn encode_last_sig(
     let size = 1u32 << log2_size;
     let max_group = G_GROUP_IDX[(size - 1) as usize];
 
-    let encode_prefix = |enc: &mut CabacEncoder,
+    let encode_prefix = |enc: &mut W,
                          ctx_arr: &mut [super::engine::CtxModel],
                          v: u32,
                          ctx_offset: usize,
@@ -278,7 +325,7 @@ fn encode_last_sig(
             enc.encode_bin(0, &mut ctx_arr[ci]);
         }
     };
-    let encode_suffix = |enc: &mut CabacEncoder, v: u32| {
+    let encode_suffix = |enc: &mut W, v: u32| {
         let group = G_GROUP_IDX[v as usize];
         if group > 3 {
             let suffix = v - G_MIN_IN_GROUP[group as usize];
@@ -313,7 +360,7 @@ fn encode_last_sig(
 /// `xc,yc` are the coefficient's position within the whole TU. `prev_csbf` is the
 /// 2-bit neighbour code for this coefficient's sub-block (bit0 = right sub-block
 /// coded, bit1 = bottom sub-block coded). `scan_idx` is 0=diag, 1=horiz, 2=vert.
-fn sig_coeff_ctx(
+pub(crate) fn sig_coeff_ctx(
     xc: usize,
     yc: usize,
     prev_csbf: u8,
@@ -412,8 +459,8 @@ fn sign_is_hidden(sig_pos: &[usize], enabled: bool) -> bool {
 /// Encode coeff_abs_level_greater1, greater2, sign flags, and remaining levels
 /// for one sub-block. `sig_pos` is in high→low scan order. Mirrors libde265/zune
 /// (and HM) exactly, including the cross-sub-block context carry.
-fn encode_coeff_levels(
-    enc: &mut CabacEncoder,
+fn encode_coeff_levels<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     coeffs: &[i16],
     sig_pos: &[usize],
@@ -521,7 +568,7 @@ fn encode_coeff_levels(
 }
 
 /// Bypass-coded coeff_abs_level_remaining using truncated Rice/Exp-Golomb.
-fn encode_coeff_remaining(enc: &mut CabacEncoder, value: u32, rice_k: u32) {
+fn encode_coeff_remaining<W: CabacWriter>(enc: &mut W, value: u32, rice_k: u32) {
     // Inverse of HEVC coeff_abs_level_remaining (§9.3.3.x): a unary prefix of
     // `prefix` ones terminated by a 0, then a fixed-length suffix.
     //   prefix <= 3:  value = (prefix << k) + suffix(k bits)
@@ -612,6 +659,14 @@ mod tests {
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(out.len() < 4); // only the terminate flush
+    }
+
+    #[test]
+    fn fractional_residual_estimate_is_finite() {
+        let coeffs = make_coeffs(&[(0, 12), (1, -3), (2, 1), (8, 5)], 64);
+        let mut ctx = ContextSet::init_islice(26);
+        let bits = estimate_residual_bits(&mut ctx, &coeffs, 3, true, 0, true);
+        assert!(bits.is_finite() && bits > 0.0);
     }
 
     #[test]

@@ -164,15 +164,15 @@ const Q13: i32 = 1 << 13;
 const Q13_HALF: i32 = 1 << 12;
 
 /// BT.601 luma coefficients in Q0.13.
-const KR: i32 = (0.299_f64 * Q13 as f64) as i32; // 2449
-const KG: i32 = (0.587_f64 * Q13 as f64) as i32; // 4809
-const KB: i32 = (0.114_f64 * Q13 as f64) as i32; // 934
+const KR: i32 = (0.299_f32 * Q13 as f32) as i32; // 2449
+const KG: i32 = (0.587_f32 * Q13 as f32) as i32; // 4809
+const KB: i32 = (0.114_f32 * Q13 as f32) as i32; // 934
 
 /// Chroma reciprocal scales in Q0.13.
 /// Cb denom: 2 × (1 − Kb) = 2 × 0.886  = 1.772
 /// Cr denom: 2 × (1 − Kr) = 2 × 0.701  = 1.402
-const REC_CB_Q13: i32 = (Q13 as f64 / 1.772_f64) as i32; // 4625
-const REC_CR_Q13: i32 = (Q13 as f64 / 1.402_f64) as i32; // 5841
+const REC_CB_Q13: i32 = (Q13 as f32 / 1.772_f32) as i32; // 4625
+const REC_CR_Q13: i32 = (Q13 as f32 / 1.402_f32) as i32; // 5841
 
 /// Luma dot product in Q13. Call q13_round() to get a pixel value.
 #[inline(always)]

@@ -30,7 +30,7 @@
 use crate::{
     cabac::{
         CabacEncoder, ContextSet, IntraModeContexts, encode_cbf_chroma, encode_cbf_luma,
-        encode_residual,
+        encode_residual, estimate_residual_bits,
     },
     dct,
     error::EncodeError,
@@ -606,7 +606,7 @@ fn build_idr_slice(
     let mut ctx = ContextSet::init_islice(qp);
     let mut ictx = IntraModeContexts::init_islice(qp);
     // HM-style intra Lagrange multiplier for J = SSE + λ·R (R in bits).
-    let lambda = 0.57_f64 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
     // Per-8×8-block quadtree depth (2 = covered by a 16×16 CU, 3 = an 8×8 CU);
     // drives the 16-level split_cu_flag context (depends on neighbour depths).
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
@@ -755,6 +755,7 @@ fn build_idr_slice(
                             16,
                             strides8,
                             qp,
+                            lambda,
                             &mut mode_map,
                             blk_stride,
                             lossless,
@@ -763,7 +764,7 @@ fn build_idr_slice(
                             yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
                             strides8,
                         );
-                        let bits_a = cab.flushed_bits().saturating_sub(base_bits) as f64;
+                        let bits_a = cab.flushed_bits().saturating_sub(base_bits) as f32;
 
                         // Snapshot trial A's coder + context so the winner can be
                         // restored after trial B overwrites them. Trial B is encoded
@@ -823,6 +824,7 @@ fn build_idr_slice(
                                 8,
                                 strides8,
                                 qp,
+                                lambda,
                                 &mut mode_map,
                                 blk_stride,
                                 lossless,
@@ -832,7 +834,7 @@ fn build_idr_slice(
                             yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
                             strides8,
                         );
-                        let bits_b = cab.flushed_bits().saturating_sub(base_bits) as f64;
+                        let bits_b = cab.flushed_bits().saturating_sub(base_bits) as f32;
 
                         chose_16 = d_a + lambda * bits_a <= d_b + lambda * bits_b;
                         if chose_16 {
@@ -892,6 +894,7 @@ fn build_idr_slice(
                                 8,
                                 strides8,
                                 qp,
+                                lambda,
                                 &mut mode_map,
                                 blk_stride,
                                 lossless,
@@ -1034,6 +1037,129 @@ fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     total
 }
 
+#[derive(Clone, Copy)]
+struct IntraModeCandidate {
+    mode: u8,
+    cost: f32,
+}
+
+/// Insert one RMD result into a fixed-size ascending candidate list.
+///
+/// HM retains eight modes for an 8×8 PU and three for a 16×16 PU when the MPM
+/// fast path is enabled. The list is tiny, so a branch-light insertion is both
+/// cheaper and more predictable than sorting all 35 modes.
+#[inline]
+fn update_intra_candidate(candidates: &mut [IntraModeCandidate], mode: u8, cost: f32) {
+    let Some(pos) = candidates
+        .iter()
+        .position(|candidate| cost < candidate.cost)
+    else {
+        return;
+    };
+    candidates.copy_within(pos..candidates.len() - 1, pos + 1);
+    candidates[pos] = IntraModeCandidate { mode, cost };
+}
+
+#[inline]
+fn estimated_luma_mode_bins(mode: u8, mpm: &[u8; 3]) -> u32 {
+    match mpm.iter().position(|&candidate| candidate == mode) {
+        Some(0) => 2,           // prev_intra_luma_pred_flag + mpm_idx "0"
+        Some(1) | Some(2) => 3, // prev flag + two bypass bins
+        None => 6,              // prev flag + rem_intra_luma_pred_mode[5]
+        Some(_) => unreachable!(),
+    }
+}
+
+#[inline]
+fn estimate_luma_mode_bits(ictx: &mut IntraModeContexts, mode: u8, mpm: &[u8; 3]) -> f32 {
+    if let Some(idx) = mpm.iter().position(|&candidate| candidate == mode) {
+        ictx.prev_intra_luma_pred_flag.estimate_and_update(1) + if idx == 0 { 1.0 } else { 2.0 }
+    } else {
+        ictx.prev_intra_luma_pred_flag.estimate_and_update(0) + 5.0
+    }
+}
+
+#[inline]
+fn push_sorted_unique_candidate(
+    candidates: &mut [IntraModeCandidate],
+    len: &mut usize,
+    candidate: IntraModeCandidate,
+) {
+    if candidates[..*len]
+        .iter()
+        .any(|entry| entry.mode == candidate.mode)
+    {
+        return;
+    }
+    let pos = candidates[..*len]
+        .iter()
+        .position(|entry| candidate.cost < entry.cost)
+        .unwrap_or(*len);
+    candidates.copy_within(pos..*len, pos + 1);
+    candidates[pos] = candidate;
+    *len += 1;
+}
+
+/// Bound the expensive reconstruction pass. Three 8×8 candidates and two 16×16
+/// candidates recover nearly all of the full shortlist gain in practice; a
+/// relative SATD gate usually reduces this to two candidates on easy blocks.
+#[inline]
+fn full_rdo_candidate_count(candidates: &[IntraModeCandidate], lu: usize) -> usize {
+    let min_count = 2.min(candidates.len());
+    let max_count = (if lu == 8 { 3 } else { 2 }).min(candidates.len());
+    if min_count == max_count {
+        return min_count;
+    }
+    let limit = candidates[0].cost * 1.20;
+    let mut count = min_count;
+    while count < max_count && candidates[count].cost <= limit {
+        count += 1;
+    }
+    count
+}
+
+fn encode_luma_mode(enc: &mut CabacEncoder, ictx: &mut IntraModeContexts, mode: u8, mpm: &[u8; 3]) {
+    if let Some(idx) = mpm.iter().position(|&candidate| candidate == mode) {
+        enc.encode_bin(1, &mut ictx.prev_intra_luma_pred_flag);
+        // mpm_idx TR(cMax=2) bypass: 0→"0", 1→"10", 2→"11".
+        match idx {
+            0 => enc.encode_bypass(0),
+            1 => {
+                enc.encode_bypass(1);
+                enc.encode_bypass(0);
+            }
+            _ => {
+                enc.encode_bypass(1);
+                enc.encode_bypass(1);
+            }
+        }
+    } else {
+        enc.encode_bin(0, &mut ictx.prev_intra_luma_pred_flag);
+        // Inverse of the decoder's sorted-MPM insertion process.
+        let mut rem = mode as i32;
+        for &candidate in mpm {
+            if candidate < mode {
+                rem -= 1;
+            }
+        }
+        for bit in (0..5).rev() {
+            enc.encode_bypass(((rem >> bit) & 1) as u8);
+        }
+    }
+}
+
+#[inline]
+fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
+    orig[..n * n]
+        .iter()
+        .zip(&rec[..n * n])
+        .map(|(&a, &b)| {
+            let d = a as i64 - b as i64;
+            d * d
+        })
+        .sum::<i64>() as f32
+}
+
 /// HEVC Table 8-3: luma→chroma intra mode mapping for 4:2:2 (DM_CHROMA).
 static MODE_422_MAP: [u8; 35] = [
     0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25,
@@ -1168,6 +1294,8 @@ struct CuParams {
     /// Luma CU/TU size: 8 (the min CB) or 16. Drives part_mode presence, the
     /// luma scan/transform size, and the chroma TB size.
     lu: usize,
+    /// Frame-constant intra RD multiplier, precomputed once from the slice QP.
+    lambda: f32,
     /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`
     /// and store the prediction residual verbatim (no transform/quantization).
     lossless: bool,
@@ -1227,6 +1355,7 @@ fn encode_cu(
         chroma,
         bit_depth,
         lu,
+        lambda,
         lossless,
     } = *par;
     let neutral: u16 = bit_depth.neutral(); // 128 (8-bit) / 512 (10-bit)
@@ -1287,20 +1416,23 @@ fn encode_cu(
         },
     );
 
-    // Rough mode decision: rank all 35 modes by SATD(orig − pred) + λ_m·mode_bits
-    // and keep the cheapest. λ_m ≈ √λ matches the SATD (≈√SSE) domain.
-    let y_orig_rmd = extract_block_dyn(src_y, src_yw, src_yh, lu_row, lu_col, lu);
-    let lambda = 0.57_f64 * 2f64.powf((qp_slice as f64 - 12.0) / 3.0);
+    // Two-stage intra mode decision:
+    //   1. rank all 35 modes with SATD + sqrt(lambda) * estimated mode bins;
+    //   2. reconstruction-RDO an adaptively bounded subset of the HM-style
+    //      shortlist using fractional CABAC costs, not the real arithmetic coder.
+    //
+    // The selected winner alone enters RDOQ. Its prediction, residual, and forward
+    // transform are cached here so committing the CU does not repeat that work.
+    let y_orig = match lu {
+        16 => extract_block_n::<16>(src_y, src_yw, src_yh, lu_row, lu_col),
+        _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
+    };
     let lambda_mode = lambda.sqrt();
-    let mut best_mode = PLANAR;
-    let mut best_cost = f64::INFINITY;
-    // The smoothed references depend only on the block, not the mode, so compute
-    // them once and reuse across all filtering modes instead of recomputing
-    // the filter for each of the ~28 modes that smooth.
+    // The smoothed references depend only on the block, not the mode.
     let (fa, fl) = intra::filter_references(yc0, &ya, &yl, lu);
     let cf = ((ya[0] as i32 + 2 * yc0 as i32 + yl[0] as i32 + 2) >> 2) as u16;
-    for mode in 0u8..35 {
-        let pred = if intra::should_filter_refs(mode, lu) {
+    let predict_luma = |mode| {
+        if intra::should_filter_refs(mode, lu) {
             match mode {
                 PLANAR => intra::predict_planar(&fa, &fl, lu),
                 DC => intra::predict_dc(&fa, &fl, lu, true),
@@ -1312,33 +1444,117 @@ fn encode_cu(
                 DC => intra::predict_dc(&ya, &yl, lu, true),
                 _ => intra::predict_angular(yc0, &ya, &yl, lu, mode, true, max_val as i32),
             }
-        };
-        let satd = satd_block(&y_orig_rmd, &pred, lu) as f64;
-        let mode_bits = if let Some(i) = mpm.iter().position(|&m| m == mode) {
-            (1 + i + 1) as f64 // prev_flag=1 + mpm_idx unary
-        } else {
-            6.0 // prev_flag=0 + 5-bit rem
-        };
-        let cost = satd + lambda_mode * mode_bits;
-        if cost < best_cost {
-            best_cost = cost;
-            best_mode = mode;
-        }
-    }
-    let luma_mode = best_mode;
-    let y_pred = if intra::should_filter_refs(luma_mode, lu) {
-        match luma_mode {
-            PLANAR => intra::predict_planar(&fa, &fl, lu),
-            DC => intra::predict_dc(&fa, &fl, lu, true),
-            _ => intra::predict_angular(cf, &fa, &fl, lu, luma_mode, true, max_val as i32),
-        }
-    } else {
-        match luma_mode {
-            PLANAR => intra::predict_planar(&ya, &yl, lu),
-            DC => intra::predict_dc(&ya, &yl, lu, true),
-            _ => intra::predict_angular(yc0, &ya, &yl, lu, luma_mode, true, max_val as i32),
         }
     };
+
+    const MAX_RMD_MODES: usize = 8;
+    const MAX_RD_MODES: usize = 11; // 8 RMD modes + up to 3 missing MPMs
+    let fast_mode_count = if lu == 8 { 8 } else { 3 };
+    let mut rmd = [IntraModeCandidate {
+        mode: PLANAR,
+        cost: f32::MAX,
+    }; MAX_RMD_MODES];
+    let mut mode_costs = [f32::MAX; 35];
+    for mode in 0u8..35 {
+        let pred = predict_luma(mode);
+        let satd = satd_block(&y_orig, &pred, lu) as f32;
+        let cost = satd + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
+        mode_costs[mode as usize] = cost;
+        update_intra_candidate(&mut rmd[..fast_mode_count], mode, cost);
+    }
+
+    let mut rd_candidates = [IntraModeCandidate {
+        mode: PLANAR,
+        cost: f32::MAX,
+    }; MAX_RD_MODES];
+    let mut rd_mode_count = 0usize;
+    for &candidate in &rmd[..fast_mode_count] {
+        push_sorted_unique_candidate(&mut rd_candidates, &mut rd_mode_count, candidate);
+    }
+    for &mode in &mpm {
+        push_sorted_unique_candidate(
+            &mut rd_candidates,
+            &mut rd_mode_count,
+            IntraModeCandidate {
+                mode,
+                cost: mode_costs[mode as usize],
+            },
+        );
+    }
+    let full_rd_count = full_rdo_candidate_count(&rd_candidates[..rd_mode_count], lu);
+    let luma_log2_ts = if lu == 16 { 4 } else { 3 };
+    let mut luma_mode = rd_candidates[0].mode;
+    let mut best_rd_cost = f32::MAX;
+    let mut best_pred = [0u16; 256];
+    let mut best_residual = [0i32; 256];
+    let mut best_tcoeff = [0i32; 256];
+
+    for candidate in &rd_candidates[..full_rd_count] {
+        let mode = candidate.mode;
+        let mut trial_ctx = ctx.clone();
+        let mut trial_ictx = ictx.clone();
+        let mut rate = 0.0f32;
+
+        if lossless {
+            rate += trial_ctx.cu_transquant_bypass_flag.estimate_and_update(1);
+        }
+        if lu == 8 {
+            rate += trial_ictx.part_mode.estimate_and_update(1);
+        }
+        rate += estimate_luma_mode_bits(&mut trial_ictx, mode, &mpm);
+
+        let pred = predict_luma(mode);
+        let residual = intra::compute_residual_i32(&y_orig, &pred, lu);
+        let scan_idx = dct::scan_idx_for(mode, luma_log2_ts, true, false);
+        let scan = dct::coeff_scan(luma_log2_ts, scan_idx);
+        let mut coeff = [0i32; 256];
+        let levels = if lossless {
+            let mut out = [0i16; 256];
+            for (dst, &src) in out[..lu * lu].iter_mut().zip(&residual[..lu * lu]) {
+                *dst = src as i16;
+            }
+            out
+        } else {
+            coeff =
+                crate::hevc_transform::fwd_transform(&residual[..lu * lu], lu, bit_depth.bits());
+            crate::hevc_transform::quantize_with_sign_hiding(&coeff, lu, qp, bit_depth.bits(), scan)
+        };
+        let mut scanned = [0i16; 256];
+        for (dst, &(row, col)) in scanned.iter_mut().zip(scan) {
+            *dst = levels[row * lu + col];
+        }
+        let nonzero = scanned[..lu * lu].iter().any(|&level| level != 0);
+        rate += trial_ctx.cbf_luma[1].estimate_and_update(nonzero as u8);
+        if nonzero {
+            rate += estimate_residual_bits(
+                &mut trial_ctx,
+                &scanned[..lu * lu],
+                luma_log2_ts,
+                true,
+                scan_idx,
+                !lossless,
+            );
+        }
+
+        let rec_block = if lossless {
+            intra::reconstruct(&pred, &residual, lu, max_val)
+        } else {
+            let dequantized = crate::hevc_transform::dequantize(&levels, lu, qp, bit_depth.bits());
+            let rec_residual =
+                crate::hevc_transform::inv_transform(&dequantized, lu, bit_depth.bits());
+            intra::reconstruct(&pred, &rec_residual, lu, max_val)
+        };
+        let cost = block_sse(&y_orig, &rec_block, lu) + lambda * rate;
+        if cost < best_rd_cost {
+            best_rd_cost = cost;
+            luma_mode = mode;
+            best_pred = pred;
+            best_residual = residual;
+            best_tcoeff = coeff;
+        }
+    }
+
+    let y_pred = best_pred;
 
     // ── cu_transquant_bypass_flag ────────────────────────────────────────────
     // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
@@ -1358,37 +1574,7 @@ fn encode_cu(
     let _ = &ictx.part_mode;
 
     // ── Luma intra pred mode syntax ──────────────────────────────────────────
-    if let Some(idx) = mpm.iter().position(|&m| m == luma_mode) {
-        enc.encode_bin(1, &mut ictx.prev_intra_luma_pred_flag);
-        // mpm_idx TR(cMax=2) bypass: 0→"0", 1→"10", 2→"11".
-        match idx {
-            0 => {
-                enc.encode_bypass(0);
-            }
-            1 => {
-                enc.encode_bypass(1);
-                enc.encode_bypass(0);
-            }
-            _ => {
-                enc.encode_bypass(1);
-                enc.encode_bypass(1);
-            }
-        }
-    } else {
-        enc.encode_bin(0, &mut ictx.prev_intra_luma_pred_flag);
-        // rem_intra_luma_pred_mode (5-bit FL). The decoder reconstructs the mode
-        // by adding 1 for each sorted MPM <= the running value, so the inverse is
-        // rem = luma_mode − (number of MPM candidates strictly less than it).
-        let mut rem = luma_mode as i32;
-        for &m in mpm.iter() {
-            if (m as i32) < luma_mode as i32 {
-                rem -= 1;
-            }
-        }
-        for i in (0..5).rev() {
-            enc.encode_bypass(((rem >> i) & 1) as u8);
-        }
-    }
+    encode_luma_mode(enc, ictx, luma_mode, &mpm);
 
     // Record this CU's luma mode for neighbours' MPM derivation.
     for br in 0..(lu / 8) {
@@ -1596,12 +1782,7 @@ fn encode_cu(
     }
 
     // ── HEVC integer transform + quantize: luma LU×LU ─────────────────────
-    // Const-generic extractor so the copy is specialized for each size.
-    let y_orig = match lu {
-        16 => extract_block_n::<16>(src_y, src_yw, src_yh, lu_row, lu_col),
-        _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
-    };
-    let y_res = intra::compute_residual_i32(&y_orig, &y_pred, lu);
+    let y_res = best_residual;
     // Mode-dependent scan for residual_coding. 8×8 luma uses a vertical/horizontal
     // scan for modes 6..=14 / 22..=30 (else diagonal); 16×16 is always diagonal
     // (HEVC §6.5).
@@ -1618,22 +1799,23 @@ fn encode_cu(
         }
         lv
     } else {
-        let y_tcoeff =
-            crate::hevc_transform::fwd_transform(&y_res[..lu * lu], lu, bit_depth.bits());
-        crate::hevc_transform::quantize_with_sign_hiding(
-            &y_tcoeff,
+        crate::hevc_transform::rdoq_luma_with_sign_hiding(
+            &best_tcoeff,
             lu,
             qp,
             bit_depth.bits(),
             luma_scan,
-        ) // row-major levels
+            luma_scan_idx,
+            lambda,
+            ctx,
+        )
     };
     // Reorder row-major levels into the mode-dependent scan for residual_coding.
-    let y_zigzag: Vec<i16> = luma_scan
-        .iter()
-        .map(|&(r, c)| y_level[r * lu + c])
-        .collect();
-    let y_nz = y_zigzag.iter().any(|&x| x != 0);
+    let mut y_zigzag = [0i16; 256];
+    for (dst, &(r, c)) in y_zigzag.iter_mut().zip(luma_scan) {
+        *dst = y_level[r * lu + c];
+    }
+    let y_nz = y_zigzag[..lu * lu].iter().any(|&x| x != 0);
 
     // ── CABAC: transform_tree() syntax ─────────────────────────────────────
     // split_transform_flag is inferred 0 (max_transform_hierarchy_depth_intra = 0),
@@ -1657,7 +1839,7 @@ fn encode_cu(
         encode_residual(
             enc,
             ctx,
-            &y_zigzag,
+            &y_zigzag[..lu * lu],
             luma_log2_ts,
             true,
             luma_scan_idx,
@@ -1736,6 +1918,7 @@ fn code_one_cu(
     lu: usize,
     strides: PlaneStrides,
     qp: u8,
+    lambda: f32,
     mode_map: &mut [u8],
     blk_stride: usize,
     lossless: bool,
@@ -1780,6 +1963,7 @@ fn code_one_cu(
         chroma: yuv.chroma,
         bit_depth: yuv.bit_depth,
         lu,
+        lambda,
         lossless,
     };
     encode_cu(ent, &src, &mut rec, &geo, &par, mode_map);
@@ -1788,7 +1972,7 @@ fn code_one_cu(
 /// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and
 /// reconstruction over one 16×16-luma CU region, with the encoder's edge
 /// clamping for padded regions. Differences are integer-valued samples, so the
-/// sum of squares is computed exactly in `i64` (returned as `f64` for the
+/// sum of squares is computed exactly in `i64` (returned as `f32` for the
 /// caller's Lagrangian, which mixes it with λ·bits).
 #[allow(clippy::too_many_arguments)]
 fn region_sse(
@@ -1801,7 +1985,7 @@ fn region_sse(
     ch_row: usize,
     ch_col: usize,
     strides: PlaneStrides,
-) -> f64 {
+) -> f32 {
     let PlaneStrides {
         w,
         src_yw,
@@ -1838,7 +2022,7 @@ fn region_sse(
             }
         }
     }
-    sse as f64
+    sse as f32
 }
 
 /// Extract an N×N block from a plane (compile-time N, so the copy is specialized
@@ -1883,6 +2067,75 @@ fn extract_block_dyn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intra_candidate_list_keeps_best_costs_sorted() {
+        let mut candidates = [IntraModeCandidate {
+            mode: u8::MAX,
+            cost: f32::MAX,
+        }; 3];
+        update_intra_candidate(&mut candidates, 10, 10.0);
+        update_intra_candidate(&mut candidates, 20, 4.0);
+        update_intra_candidate(&mut candidates, 30, 7.0);
+        update_intra_candidate(&mut candidates, 40, 12.0);
+        update_intra_candidate(&mut candidates, 50, 5.0);
+
+        assert_eq!(candidates.map(|candidate| candidate.mode), [20, 50, 30]);
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| pair[0].cost <= pair[1].cost)
+        );
+    }
+
+    #[test]
+    fn full_rdo_candidate_budget_is_bounded() {
+        let close = [
+            IntraModeCandidate {
+                mode: 0,
+                cost: 100.0,
+            },
+            IntraModeCandidate {
+                mode: 1,
+                cost: 105.0,
+            },
+            IntraModeCandidate {
+                mode: 2,
+                cost: 115.0,
+            },
+            IntraModeCandidate {
+                mode: 3,
+                cost: 150.0,
+            },
+        ];
+        assert_eq!(full_rdo_candidate_count(&close, 8), 3);
+        assert_eq!(full_rdo_candidate_count(&close, 16), 2);
+
+        let separated = [
+            IntraModeCandidate {
+                mode: 0,
+                cost: 100.0,
+            },
+            IntraModeCandidate {
+                mode: 1,
+                cost: 130.0,
+            },
+            IntraModeCandidate {
+                mode: 2,
+                cost: 140.0,
+            },
+        ];
+        assert_eq!(full_rdo_candidate_count(&separated, 8), 2);
+    }
+
+    #[test]
+    fn luma_mode_bin_estimate_matches_mpm_binarization() {
+        let mpm = [0, 1, 26];
+        assert_eq!(estimated_luma_mode_bins(0, &mpm), 2);
+        assert_eq!(estimated_luma_mode_bins(1, &mpm), 3);
+        assert_eq!(estimated_luma_mode_bins(26, &mpm), 3);
+        assert_eq!(estimated_luma_mode_bins(17, &mpm), 6);
+    }
 
     #[test]
     fn bit_writer_basic() {

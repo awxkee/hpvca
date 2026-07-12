@@ -77,7 +77,64 @@ pub(crate) struct CtxModel {
     pub(crate) val_mps: u8,
 }
 
+// Fractional bit estimates for the 64 CABAC probability states. These use the
+// average LPS probability represented by RANGE_TAB_LPS over the four range
+// classes. HM uses the same kind of frozen-context entropy estimates for RDOQ:
+// probability states are sampled at the TU entrance, while c1/c2/Rice syntax
+// state still follows the candidate levels.
+#[rustfmt::skip]
+static EST_BITS_MPS: [f32; 64] = [
+    0.962303, 0.907699, 0.859384, 0.804965, 0.749568, 0.701959, 0.655262, 0.614665,
+    0.577596, 0.541455, 0.506198, 0.477201, 0.448776, 0.421908, 0.398025, 0.374826,
+    0.351704, 0.332561, 0.313866, 0.295216, 0.280483, 0.263488, 0.250106, 0.235369,
+    0.222108, 0.210290, 0.199249, 0.188472, 0.177775, 0.169542, 0.158983, 0.151692,
+    0.142221, 0.135013, 0.127592, 0.120457, 0.115408, 0.109439, 0.103326, 0.097407,
+    0.093239, 0.088284, 0.083223, 0.078302, 0.074190, 0.071407, 0.067314, 0.063232,
+    0.060470, 0.057475, 0.054724, 0.051577, 0.049899, 0.045867, 0.044195, 0.041845,
+    0.039124, 0.037063, 0.036173, 0.034351, 0.032179, 0.030361, 0.028708, 0.007823,
+];
+#[rustfmt::skip]
+static EST_BITS_LPS: [f32; 64] = [
+    1.038709, 1.098613, 1.155816, 1.225585, 1.303228, 1.376084, 1.453875, 1.527331,
+    1.599810, 1.676123, 1.756699, 1.828126, 1.903274, 1.979583, 2.052277, 2.127830,
+    2.208615, 2.280162, 2.354635, 2.434016, 2.500752, 2.582698, 2.651404, 2.731857,
+    2.809060, 2.882185, 2.954603, 3.029557, 3.108620, 3.172997, 3.260580, 3.324732,
+    3.413088, 3.484573, 3.562481, 3.641983, 3.701272, 3.774937, 3.854851, 3.937030,
+    3.998051, 4.074383, 4.157046, 4.242541, 4.318337, 4.372123, 4.455251, 4.543465,
+    4.606535, 4.678325, 4.747726, 4.831597, 4.878486, 4.998051, 5.050780, 5.128427,
+    5.224097, 5.301123, 5.335760, 5.409426, 5.502581, 5.585541, 5.665520, 7.530762,
+];
+
 impl CtxModel {
+    /// Frozen-context fractional bit estimate used by winner-only RDOQ.
+    #[inline]
+    pub(crate) fn estimated_bits(self, bin: u8) -> f32 {
+        let state = self.p_state_idx as usize;
+        if (bin ^ self.val_mps) & 1 == 0 {
+            EST_BITS_MPS[state]
+        } else {
+            EST_BITS_LPS[state]
+        }
+    }
+
+    /// Fractional CABAC bit cost plus the same probability-state transition as
+    /// a real context-coded bin. Used by speculative encoder RDO so trials do
+    /// not drive the arithmetic coder or touch its output buffer.
+    #[inline]
+    pub(crate) fn estimate_and_update(&mut self, bin: u8) -> f32 {
+        let bits = self.estimated_bits(bin);
+        let state = self.p_state_idx as usize;
+        if (bin ^ self.val_mps) & 1 == 0 {
+            self.p_state_idx = TRANS_IDX_MPS[state];
+        } else {
+            if self.p_state_idx == 0 {
+                self.val_mps ^= 1;
+            }
+            self.p_state_idx = TRANS_IDX_LPS[state];
+        }
+        bits
+    }
+
     /// Initialise from HEVC spec §9.3.2.2.
     pub(crate) fn init(init_value: u8, qp: u8) -> Self {
         // HEVC §9.3.2.2 context initialization.
@@ -107,6 +164,40 @@ impl CtxModel {
             p_state_idx: p,
             val_mps: m,
         }
+    }
+}
+
+/// Minimal CABAC writer interface shared by the real arithmetic coder and the
+/// fractional-bit estimator used by speculative RD trials.
+pub(crate) trait CabacWriter {
+    fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel);
+    fn encode_bypass(&mut self, bin_val: u8);
+}
+
+/// Fast fractional-bit CABAC sink. It updates context states exactly like the
+/// arithmetic coder, but bypass bins simply add one bit and no output is
+/// generated. This is the normal hot-path model for encoder mode RDO.
+#[derive(Default)]
+pub(crate) struct CabacEstimator {
+    bits: f32,
+}
+
+impl CabacEstimator {
+    #[inline]
+    pub(crate) fn bits(&self) -> f32 {
+        self.bits
+    }
+}
+
+impl CabacWriter for CabacEstimator {
+    #[inline]
+    fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        self.bits += ctx.estimate_and_update(bin_val);
+    }
+
+    #[inline]
+    fn encode_bypass(&mut self, _bin_val: u8) {
+        self.bits += 1.0;
     }
 }
 
@@ -362,6 +453,18 @@ impl CabacEncoder {
     }
 }
 
+impl CabacWriter for CabacEncoder {
+    #[inline]
+    fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        CabacEncoder::encode_bin(self, bin_val, ctx);
+    }
+
+    #[inline]
+    fn encode_bypass(&mut self, bin_val: u8) {
+        CabacEncoder::encode_bypass(self, bin_val);
+    }
+}
+
 /// Resumable snapshot of a [`CabacEncoder`] (scalar state + output length).
 /// Cheap to take and apply — used to run RD trials in place without cloning the
 /// growing output buffer.
@@ -424,6 +527,22 @@ mod tests {
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn fractional_estimator_matches_context_transitions() {
+        let bins = [0u8, 0, 1, 0, 1, 1, 0, 0, 1];
+        let mut real_ctx = CtxModel::fixed(20, 0);
+        let mut estimated_ctx = real_ctx;
+        let mut enc = CabacEncoder::new();
+        let mut est = CabacEstimator::default();
+        for bin in bins {
+            enc.encode_bin(bin, &mut real_ctx);
+            est.encode_bin(bin, &mut estimated_ctx);
+        }
+        assert_eq!(real_ctx.p_state_idx, estimated_ctx.p_state_idx);
+        assert_eq!(real_ctx.val_mps, estimated_ctx.val_mps);
+        assert!(est.bits().is_finite() && est.bits() > 0.0);
     }
 
     #[test]
