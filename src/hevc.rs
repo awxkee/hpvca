@@ -174,11 +174,25 @@ pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
     186 // Level 6.2 — effectively unlimited for still images
 }
 
+#[inline]
+fn uses_rext_profile(
+    chroma: crate::fmt::ChromaFormat,
+    bit_depth: crate::fmt::BitDepth,
+    lossless: bool,
+) -> bool {
+    let is_420 = matches!(
+        chroma,
+        crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
+    );
+    lossless || !is_420 || bit_depth.bits() > 10
+}
+
 fn write_profile_tier_level(
     bw: &mut BitWriter,
     level_idc: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+    lossless: bool,
 ) {
     // Select profile based on chroma and bit depth (matching Apple / x265 behavior):
     //   4:2:0 / mono 8-bit  → profile 3 (Main Still Picture), compat 0x70000000
@@ -189,7 +203,10 @@ fn write_profile_tier_level(
         crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
     );
     let bits = bit_depth.bits();
-    let is_rext = !is_420 || bits > 10;
+    // Implicit residual DPCM is an HEVC Range Extensions tool. Lossless streams
+    // use it for horizontal/vertical intra modes, so even 8/10-bit 4:2:0 must
+    // advertise an RExt profile rather than Main/Main10/Main Still Picture.
+    let is_rext = uses_rext_profile(chroma, bit_depth, lossless);
 
     let (profile_idc, compat): (u32, u32) = if is_rext {
         (4, 0x0800_0000) // RExt
@@ -216,12 +233,18 @@ fn write_profile_tier_level(
         // RExt extended constraint block (44 bits = 10 named flags + 34 zeros)
         let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
         let is_mono = matches!(chroma, crate::fmt::ChromaFormat::Monochrome);
+        // HM promotes any stream using the general RExt tool set (including
+        // implicit RDPCM) to a 4:4:4 constraint profile, even when the coded
+        // picture itself is 4:2:0/4:2:2. Narrower RExt profiles do not permit
+        // this tool. Keep the actual bit-depth constraint, but deliberately do
+        // not claim max-4:2:2/max-4:2:0/monochrome for lossless RDPCM streams.
+        let constraint_444 = lossless || is_444;
         bw.write_bit(bits <= 12); // max_12bit_constraint_flag
         bw.write_bit(bits <= 10); // max_10bit_constraint_flag
         bw.write_bit(bits <= 8); // max_8bit_constraint_flag
-        bw.write_bit(!is_444 || is_mono); // max_422chroma_constraint_flag
-        bw.write_bit(is_420 || is_mono); // max_420chroma_constraint_flag
-        bw.write_bit(is_mono); // max_monochrome_constraint_flag
+        bw.write_bit(!constraint_444 && (!is_444 || is_mono)); // max_422chroma_constraint_flag
+        bw.write_bit(!constraint_444 && (is_420 || is_mono)); // max_420chroma_constraint_flag
+        bw.write_bit(!constraint_444 && is_mono); // max_monochrome_constraint_flag
         bw.write_bit(true); // intra_constraint_flag = 1
         bw.write_bit(false); // one_picture_only_constraint_flag = 0
         bw.write_bit(true); // lower_bit_rate_constraint_flag = 1
@@ -242,6 +265,7 @@ pub(crate) fn build_vps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+    lossless: bool,
 ) -> Nalu {
     let coded_w = (width + 63) & !63;
     let coded_h = (height + 63) & !63;
@@ -257,7 +281,7 @@ pub(crate) fn build_vps(
     bw.write_bit(true); // vps_temporal_id_nesting_flag
     bw.write_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
 
-    write_profile_tier_level(&mut bw, level, chroma, bit_depth);
+    write_profile_tier_level(&mut bw, level, chroma, bit_depth, lossless);
 
     // vps_sub_layer_ordering_info_present_flag = false → only [0] entry
     bw.write_bit(false);
@@ -284,11 +308,26 @@ pub(crate) fn build_vps(
     }
 }
 
+fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool) {
+    bw.write_bit(false); // transform_skip_rotation_enabled_flag
+    bw.write_bit(false); // transform_skip_context_enabled_flag
+    // In transquant-bypass intra TUs this is inferred for final horizontal
+    // and vertical prediction modes; no CU/TU syntax element is required.
+    bw.write_bit(lossless); // implicit_rdpcm_enabled_flag
+    bw.write_bit(false); // explicit_rdpcm_enabled_flag
+    bw.write_bit(false); // extended_precision_processing_flag
+    bw.write_bit(false); // intra_smoothing_disabled_flag
+    bw.write_bit(false); // high_precision_offsets_enabled_flag
+    bw.write_bit(false); // persistent_rice_adaptation_enabled_flag
+    bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
+}
+
 pub(crate) fn build_sps(
     width: u32,
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
+    lossless: bool,
     color: Option<&crate::color::Cicp>,
 ) -> Nalu {
     let mut bw = BitWriter::new();
@@ -299,7 +338,7 @@ pub(crate) fn build_sps(
     bw.write_bit(true); // sps_temporal_id_nesting_flag
 
     let sps_level = level_idc_for((width + 63) & !63, (height + 63) & !63);
-    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth);
+    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth, lossless);
 
     bw.write_ue(0); // sps_seq_parameter_set_id = 0
 
@@ -391,7 +430,7 @@ pub(crate) fn build_sps(
     // sps_extension: RExt profiles require sps_range_extension to be present
     // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
     // Apple's decoder rejects 12-bit streams whose SPS lacks the range extension.
-    let need_range_ext = bit_depth.bits() > 8;
+    let need_range_ext = uses_rext_profile(chroma, bit_depth, lossless);
     bw.write_bit(need_range_ext); // sps_extension_present_flag
     if need_range_ext {
         bw.write_bit(true); // sps_range_extension_flag = 1
@@ -399,16 +438,7 @@ pub(crate) fn build_sps(
         bw.write_bit(false); // sps_3d_extension_flag = 0
         bw.write_bit(false); // sps_scc_extension_flag = 0
         bw.write_bits(0, 4); // sps_extension_4bits = 0
-        // sps_range_extension() — all flags 0 (no RExt features used for intra-only)
-        bw.write_bit(false); // transform_skip_rotation_enabled_flag
-        bw.write_bit(false); // transform_skip_context_enabled_flag
-        bw.write_bit(false); // implicit_rdpcm_enabled_flag
-        bw.write_bit(false); // explicit_rdpcm_enabled_flag
-        bw.write_bit(false); // extended_precision_processing_flag
-        bw.write_bit(false); // intra_smoothing_disabled_flag
-        bw.write_bit(false); // high_precision_offsets_enabled_flag
-        bw.write_bit(false); // persistent_rice_adaptation_enabled_flag
-        bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
+        write_sps_range_extension(&mut bw, lossless);
     }
 
     bw.rbsp_trailing_bits();
@@ -527,8 +557,15 @@ pub(crate) fn encode_intra(
     lossless: bool,
     color: Option<crate::color::Cicp>,
 ) -> Result<NaluStream, EncodeError> {
-    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth);
-    let sps = build_sps(width, height, yuv.chroma, yuv.bit_depth, color.as_ref());
+    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless);
+    let sps = build_sps(
+        width,
+        height,
+        yuv.chroma,
+        yuv.bit_depth,
+        lossless,
+        color.as_ref(),
+    );
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
     let pps = build_pps(qp_val, lossless);
     let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality, lossless)?;
@@ -783,9 +820,11 @@ fn satd_block_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
     {
         for bx in (0..N).step_by(4) {
             for ((dst_row, orig_row), pred_row) in diff
-                .as_chunks_mut::<4>().0.iter_mut()
-                .zip(orig_band.chunks_exact(N))
-                .zip(pred_band.chunks_exact(N))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(orig_band.as_chunks::<N>().0.iter())
+                .zip(pred_band.as_chunks::<N>().0.iter())
             {
                 for ((dst, &orig), &pred) in dst_row
                     .iter_mut()
@@ -980,6 +1019,123 @@ fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
             d * d
         })
         .sum::<i64>() as f32
+}
+
+/// HEVC RExt implicit residual-DPCM direction for an intra prediction mode.
+/// The tool is inferred—there is no CU/TU syntax element—when the SPS enables
+/// `implicit_rdpcm_enabled_flag` and the TU is transform-skipped or transquant
+/// bypassed. HM applies vertical RDPCM to mode 26 and horizontal RDPCM to mode
+/// 10, after the 4:2:2 chroma mode remapping has already been performed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImplicitRdpcm {
+    Off,
+    Horizontal,
+    Vertical,
+}
+
+#[inline]
+fn implicit_rdpcm_mode(intra_mode: u8) -> ImplicitRdpcm {
+    match intra_mode {
+        10 => ImplicitRdpcm::Horizontal,
+        26 => ImplicitRdpcm::Vertical,
+        _ => ImplicitRdpcm::Off,
+    }
+}
+
+/// Convert a raster-order, unquantized lossless prediction residual into the
+/// coefficient samples decoded by HEVC implicit RDPCM. This is the lossless
+/// branch of HM's `applyForwardRDPCM`: the first sample on each prediction line
+/// is unchanged and every following sample is differenced from its predecessor.
+#[inline]
+fn forward_lossless_rdpcm_into(
+    residual: &[i32],
+    n: usize,
+    mode: ImplicitRdpcm,
+    levels: &mut [i16],
+) {
+    debug_assert!(residual.len() >= n * n);
+    debug_assert!(levels.len() >= n * n);
+
+    match mode {
+        ImplicitRdpcm::Off => {
+            for (dst, &src) in levels[..n * n].iter_mut().zip(&residual[..n * n]) {
+                *dst = src as i16;
+            }
+        }
+        ImplicitRdpcm::Horizontal => {
+            for (src_row, dst_row) in residual[..n * n]
+                .chunks_exact(n)
+                .zip(levels[..n * n].chunks_exact_mut(n))
+            {
+                let mut previous = 0i32;
+                for (&sample, dst) in src_row.iter().zip(dst_row) {
+                    *dst = (sample - previous) as i16;
+                    previous = sample;
+                }
+            }
+        }
+        ImplicitRdpcm::Vertical => {
+            let (src_first, src_rest) = residual[..n * n].split_at(n);
+            let (dst_first, dst_rest) = levels[..n * n].split_at_mut(n);
+            for (dst, &sample) in dst_first.iter_mut().zip(src_first) {
+                *dst = sample as i16;
+            }
+            for (current, (previous, dst)) in src_rest.chunks_exact(n).zip(
+                residual[..n * (n - 1)]
+                    .chunks_exact(n)
+                    .zip(dst_rest.chunks_exact_mut(n)),
+            ) {
+                for ((&sample, &above), out) in current.iter().zip(previous).zip(dst) {
+                    *out = (sample - above) as i16;
+                }
+            }
+        }
+    }
+}
+
+/// Reference inverse used by tests and by future decoder-side reuse. Keeping it
+/// next to the forward path makes the exact cumulative-sum semantics explicit.
+#[cfg(test)]
+fn inverse_lossless_rdpcm_into(
+    levels: &[i16],
+    n: usize,
+    mode: ImplicitRdpcm,
+    residual: &mut [i32],
+) {
+    debug_assert!(levels.len() >= n * n);
+    debug_assert!(residual.len() >= n * n);
+
+    match mode {
+        ImplicitRdpcm::Off => {
+            for (dst, &src) in residual[..n * n].iter_mut().zip(&levels[..n * n]) {
+                *dst = src as i32;
+            }
+        }
+        ImplicitRdpcm::Horizontal => {
+            for (src_row, dst_row) in levels[..n * n]
+                .chunks_exact(n)
+                .zip(residual[..n * n].chunks_exact_mut(n))
+            {
+                let mut accumulator = 0i32;
+                for (&delta, dst) in src_row.iter().zip(dst_row) {
+                    accumulator += delta as i32;
+                    *dst = accumulator;
+                }
+            }
+        }
+        ImplicitRdpcm::Vertical => {
+            for col in 0..n {
+                let mut accumulator = 0i32;
+                for (src_row, dst_row) in levels[..n * n]
+                    .chunks_exact(n)
+                    .zip(residual[..n * n].chunks_exact_mut(n))
+                {
+                    accumulator += src_row[col] as i32;
+                    dst_row[col] = accumulator;
+                }
+            }
+        }
+    }
 }
 
 const CHROMA_DM_SYNTAX_IDX: u8 = 4;
@@ -1278,8 +1434,8 @@ struct CuParams {
     lu: usize,
     /// Frame-constant intra RD multiplier, precomputed once from the slice QP.
     lambda: f32,
-    /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`
-    /// and store the prediction residual verbatim (no transform/quantization).
+    /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`,
+    /// skip transform/quantization, and apply inferred RDPCM for pure H/V modes.
     lossless: bool,
 }
 
@@ -1405,6 +1561,7 @@ fn fill_cu_depth(depths: &mut [u8], row: usize, col: usize, size: usize, depth: 
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn encode_cu_leaf(
     cab: &mut CabacEncoder,
     ctx: &mut ContextSet,
@@ -1617,6 +1774,7 @@ struct Cu32Plan {
 
 /// Encode a preselected 32×32 subtree with no speculative branches. Every leaf
 /// gets the normal winner-only RDOQ exactly once.
+#[allow(clippy::too_many_arguments)]
 fn commit_cu32_plan(
     cab: &mut CabacEncoder,
     ctx: &mut ContextSet,
@@ -1811,7 +1969,8 @@ fn encode_cu<W: CabacWriter>(
     };
 
     const MAX_RMD_MODES: usize = 8;
-    const MAX_RD_MODES: usize = 11; // 8 RMD modes + up to 3 missing MPMs
+    // 8 RMD modes + up to 3 missing MPMs + the two implicit-RDPCM modes.
+    const MAX_RD_MODES: usize = 13;
     let fast_mode_count = if lu == 8 { 8 } else { 3 };
     let mut rmd = [IntraModeCandidate {
         mode: PLANAR,
@@ -1847,7 +2006,41 @@ fn encode_cu<W: CabacWriter>(
             },
         );
     }
-    let full_rd_count = full_rdo_candidate_count(&rd_candidates[..rd_mode_count], lu);
+    if lossless {
+        // SATD does not model the second prediction stage introduced by implicit
+        // RDPCM. Pure horizontal/vertical can therefore be poor SATD candidates
+        // but excellent entropy candidates. Always retain both for exact rate RDO.
+        for mode in [10u8, 26] {
+            push_sorted_unique_candidate(
+                &mut rd_candidates,
+                &mut rd_mode_count,
+                IntraModeCandidate {
+                    mode,
+                    cost: mode_costs[mode as usize],
+                },
+            );
+        }
+    }
+    let mut full_rd_count = full_rdo_candidate_count(&rd_candidates[..rd_mode_count], lu);
+    if lossless {
+        // Move the two inferred-RDPCM modes into the evaluated prefix without
+        // increasing the normal lossy candidate budget.
+        for mode in [10u8, 26] {
+            if rd_candidates[..full_rd_count]
+                .iter()
+                .any(|candidate| candidate.mode == mode)
+            {
+                continue;
+            }
+            if let Some(index) = rd_candidates[..rd_mode_count]
+                .iter()
+                .position(|candidate| candidate.mode == mode)
+            {
+                rd_candidates.swap(full_rd_count, index);
+                full_rd_count += 1;
+            }
+        }
+    }
     let luma_log2_ts = lu.trailing_zeros();
     let mut luma_mode = rd_candidates[0].mode;
     let mut best_rd_cost = f32::MAX;
@@ -1876,12 +2069,12 @@ fn encode_cu<W: CabacWriter>(
         let scan_idx = dct::scan_idx_for(mode, luma_log2_ts, true, false);
         let scan = dct::coeff_scan(luma_log2_ts, scan_idx);
         if lossless {
-            for (dst, &src) in scratch.levels[..num_luma]
-                .iter_mut()
-                .zip(&scratch.residual[..num_luma])
-            {
-                *dst = src as i16;
-            }
+            forward_lossless_rdpcm_into(
+                &scratch.residual[..num_luma],
+                lu,
+                implicit_rdpcm_mode(mode),
+                &mut scratch.levels,
+            );
         } else {
             crate::hevc_transform::fwd_transform_into(
                 &scratch.residual[..num_luma],
@@ -1924,14 +2117,11 @@ fn encode_cu<W: CabacWriter>(
         if rate_cost >= best_rd_cost {
             continue;
         }
-        if lossless {
-            intra::reconstruct_into(
-                &scratch.pred[..num_luma],
-                &scratch.residual[..num_luma],
-                lu,
-                max_val,
-                &mut scratch.reconstructed,
-            );
+        let cost = if lossless {
+            // Transquant bypass plus inverse RDPCM reconstructs the source exactly
+            // for every prediction mode, so lossless mode RDO is a pure rate
+            // decision. Avoid a redundant reconstruction and full-block SSE pass.
+            rate_cost
         } else {
             crate::hevc_transform::dequantize_into(
                 &scratch.levels,
@@ -1954,12 +2144,12 @@ fn encode_cu<W: CabacWriter>(
                 max_val,
                 &mut scratch.reconstructed,
             );
-        }
-        let cost = block_sse(
-            &scratch.orig[..num_luma],
-            &scratch.reconstructed[..num_luma],
-            lu,
-        ) + rate_cost;
+            block_sse(
+                &scratch.orig[..num_luma],
+                &scratch.reconstructed[..num_luma],
+                lu,
+            ) + rate_cost
+        };
         if cost < best_rd_cost {
             best_rd_cost = cost;
             luma_mode = mode;
@@ -1978,8 +2168,8 @@ fn encode_cu<W: CabacWriter>(
     // ── cu_transquant_bypass_flag ────────────────────────────────────────────
     // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
     // when the PPS sets transquant_bypass_enabled_flag (i.e. lossless coding).
-    // We code 1 for every CU, so transform + quantization are skipped and the
-    // residual is stored verbatim.
+    // We code 1 for every CU, so transform + quantization are skipped. With the
+    // SPS RExt flag, horizontal/vertical modes additionally use inferred RDPCM.
     if lossless {
         enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
     }
@@ -2009,12 +2199,12 @@ fn encode_cu<W: CabacWriter>(
     let luma_scan_idx = dct::scan_idx_for(luma_mode, luma_log2_ts, true, false);
     let luma_scan = dct::coeff_scan(luma_log2_ts, luma_scan_idx);
     if lossless {
-        for (dst, &residual) in scratch.levels[..num_luma]
-            .iter_mut()
-            .zip(&scratch.best_residual[..num_luma])
-        {
-            *dst = residual as i16;
-        }
+        forward_lossless_rdpcm_into(
+            &scratch.best_residual[..num_luma],
+            lu,
+            implicit_rdpcm_mode(luma_mode),
+            &mut scratch.levels,
+        );
     } else {
         crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
             &scratch.best_coeff,
@@ -2037,11 +2227,15 @@ fn encode_cu<W: CabacWriter>(
     }
 
     if lossless {
-        for (dst, &level) in scratch.inverse[..num_luma]
+        // RDPCM changes only the coded residual representation. The decoded
+        // cumulative sum is exactly the original prediction residual, which is
+        // already cached for the selected mode, so reconstruction needs no
+        // encoder-side inverse-DPCM pass.
+        for (dst, &residual) in scratch.inverse[..num_luma]
             .iter_mut()
-            .zip(&scratch.levels[..num_luma])
+            .zip(&scratch.best_residual[..num_luma])
         {
-            *dst = level as i32;
+            *dst = residual;
         }
     } else {
         crate::hevc_transform::dequantize_into(
@@ -2199,85 +2393,100 @@ fn encode_cu<W: CabacWriter>(
             syntax_idx: 0,
             cost: f32::MAX,
         }; 5];
-        // Test DM first so its cheap one-bin syntax establishes a useful top-two
-        // cutoff early. A candidate whose partial SATD already exceeds the second
-        // best complete proxy can be abandoned safely: all remaining terms are
-        // non-negative and only the top two can enter reconstruction RDO.
-        for candidate_index in [4usize, 0, 3, 1, 2] {
-            let mut candidate = all_candidates[candidate_index];
-            let mode = candidate.pred_mode;
-            let mut proxy_cost =
-                chroma_satd_lambda * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
-            'proxy_tbs: for t in 0..n_chroma_tb {
-                let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
-                let ((bc0, ba, bl), (rc0, ra, rl)) = &proxy_refs[t];
-                let cb_filtered = if filt {
-                    Some(intra::filter_references(*bc0, ba, bl, ctb))
-                } else {
-                    None
-                };
-                let cr_filtered = if filt {
-                    Some(intra::filter_references(*rc0, ra, rl, ctb))
-                } else {
-                    None
-                };
-                let bcf = if filt {
-                    ((ba[0] as i32 + 2 * (*bc0 as i32) + bl[0] as i32 + 2) >> 2) as u16
-                } else {
-                    *bc0
-                };
-                let rcf = if filt {
-                    ((ra[0] as i32 + 2 * (*rc0 as i32) + rl[0] as i32 + 2) >> 2) as u16
-                } else {
-                    *rc0
-                };
-                let (baf, blf) = match &cb_filtered {
-                    Some((above, left)) => (&above[..], &left[..]),
-                    None => (&ba[..], &bl[..]),
-                };
-                let (raf, rlf) = match &cr_filtered {
-                    Some((above, left)) => (&above[..], &left[..]),
-                    None => (&ra[..], &rl[..]),
-                };
-
-                let source_offset = t * n_ch;
-                for component in 0..2 {
-                    let (orig, corner, above, left) = if component == 0 {
-                        (
-                            &scratch.chroma_orig_cb[source_offset..source_offset + n_ch],
-                            bcf,
-                            baf,
-                            blf,
-                        )
+        if lossless {
+            // Every mode reconstructs exactly, so SATD is not an RD proxy at all.
+            // Evaluate the five legal chroma modes directly by entropy rate; DM is
+            // first because its one-bin mode syntax is the most likely early winner.
+            for (dst, candidate_index) in ranked.iter_mut().zip([4usize, 0, 3, 1, 2]) {
+                *dst = all_candidates[candidate_index];
+                dst.cost = 0.0;
+            }
+        } else {
+            // Test DM first so its cheap one-bin syntax establishes a useful top-two
+            // cutoff early. A candidate whose partial SATD already exceeds the second
+            // best complete proxy can be abandoned safely: all remaining terms are
+            // non-negative and only the top two can enter reconstruction RDO.
+            for candidate_index in [4usize, 0, 3, 1, 2] {
+                let mut candidate = all_candidates[candidate_index];
+                let mode = candidate.pred_mode;
+                let mut proxy_cost =
+                    chroma_satd_lambda * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
+                #[allow(clippy::needless_range_loop)]
+                'proxy_tbs: for t in 0..n_chroma_tb {
+                    let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
+                    let ((bc0, ba, bl), (rc0, ra, rl)) = &proxy_refs[t];
+                    let cb_filtered = if filt {
+                        Some(intra::filter_references(*bc0, ba, bl, ctb))
                     } else {
-                        (
-                            &scratch.chroma_orig_cr[source_offset..source_offset + n_ch],
-                            rcf,
-                            raf,
-                            rlf,
-                        )
+                        None
                     };
-                    intra::predict_chroma_tb_into(
-                        mode,
-                        corner,
-                        above,
-                        left,
-                        ctb,
-                        max_val as i32,
-                        &mut scratch.pred,
-                        &mut scratch.angular,
-                    );
-                    proxy_cost += satd_block(orig, &scratch.pred[..n_ch], ctb) as f32;
-                    if proxy_cost >= ranked[1].cost {
-                        break 'proxy_tbs;
+                    let cr_filtered = if filt {
+                        Some(intra::filter_references(*rc0, ra, rl, ctb))
+                    } else {
+                        None
+                    };
+                    let bcf = if filt {
+                        ((ba[0] as i32 + 2 * (*bc0 as i32) + bl[0] as i32 + 2) >> 2) as u16
+                    } else {
+                        *bc0
+                    };
+                    let rcf = if filt {
+                        ((ra[0] as i32 + 2 * (*rc0 as i32) + rl[0] as i32 + 2) >> 2) as u16
+                    } else {
+                        *rc0
+                    };
+                    let (baf, blf) = match &cb_filtered {
+                        Some((above, left)) => (&above[..], &left[..]),
+                        None => (&ba[..], &bl[..]),
+                    };
+                    let (raf, rlf) = match &cr_filtered {
+                        Some((above, left)) => (&above[..], &left[..]),
+                        None => (&ra[..], &rl[..]),
+                    };
+
+                    let source_offset = t * n_ch;
+                    for component in 0..2 {
+                        let (orig, corner, above, left) = if component == 0 {
+                            (
+                                &scratch.chroma_orig_cb[source_offset..source_offset + n_ch],
+                                bcf,
+                                baf,
+                                blf,
+                            )
+                        } else {
+                            (
+                                &scratch.chroma_orig_cr[source_offset..source_offset + n_ch],
+                                rcf,
+                                raf,
+                                rlf,
+                            )
+                        };
+                        intra::predict_chroma_tb_into(
+                            mode,
+                            corner,
+                            above,
+                            left,
+                            ctb,
+                            max_val as i32,
+                            &mut scratch.pred,
+                            &mut scratch.angular,
+                        );
+                        proxy_cost += satd_block(orig, &scratch.pred[..n_ch], ctb) as f32;
+                        if proxy_cost >= ranked[1].cost {
+                            break 'proxy_tbs;
+                        }
                     }
                 }
+                candidate.cost = proxy_cost;
+                update_chroma_candidate(&mut ranked, candidate);
             }
-            candidate.cost = proxy_cost;
-            update_chroma_candidate(&mut ranked, candidate);
         }
 
-        let full_rd_count = full_rdo_chroma_count(&ranked, chroma);
+        let full_rd_count = if lossless {
+            ranked.len()
+        } else {
+            full_rdo_chroma_count(&ranked, chroma)
+        };
         let mut residual_ctx_after_luma = ctx.clone();
         if y_nz {
             // Chroma RDOQ needs the contexts after the already-selected luma
@@ -2379,12 +2588,12 @@ fn encode_cu<W: CabacWriter>(
                     );
 
                     if lossless {
-                        for (dst, &residual) in scratch.levels[..n_ch]
-                            .iter_mut()
-                            .zip(&scratch.residual[..n_ch])
-                        {
-                            *dst = residual as i16;
-                        }
+                        forward_lossless_rdpcm_into(
+                            &scratch.residual[..n_ch],
+                            ctb,
+                            implicit_rdpcm_mode(mode),
+                            &mut scratch.levels,
+                        );
                     } else {
                         crate::hevc_transform::fwd_transform_into(
                             &scratch.residual[..n_ch],
@@ -2432,11 +2641,15 @@ fn encode_cu<W: CabacWriter>(
                     }
 
                     if lossless {
-                        for (dst, &level) in scratch.inverse[..n_ch]
-                            .iter_mut()
-                            .zip(&scratch.levels[..n_ch])
+                        // Transquant bypass plus inverse RDPCM reproduces `orig`
+                        // exactly. Copy the source block directly into the reference
+                        // picture (needed by the lower 4:2:2 TB) and skip inverse
+                        // processing, reconstruction and an always-zero SSE pass.
+                        for (src_row, dst_row) in orig
+                            .chunks_exact(ctb)
+                            .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
                         {
-                            *dst = level as i32;
+                            dst_row[..ctb].copy_from_slice(src_row);
                         }
                     } else {
                         crate::hevc_transform::dequantize_into(
@@ -2453,23 +2666,23 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.inverse,
                             &mut scratch.transform_tmp,
                         );
-                    }
-                    intra::reconstruct_into(
-                        &scratch.pred[..n_ch],
-                        &scratch.inverse[..n_ch],
-                        ctb,
-                        max_val,
-                        &mut scratch.reconstructed,
-                    );
-                    distortion += block_sse(orig, &scratch.reconstructed[..n_ch], ctb);
-                    if estimate_rate && distortion >= cost_limit {
-                        return distortion;
-                    }
-                    for (src_row, dst_row) in scratch.reconstructed[..n_ch]
-                        .chunks_exact(ctb)
-                        .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
-                    {
-                        dst_row[..ctb].copy_from_slice(src_row);
+                        intra::reconstruct_into(
+                            &scratch.pred[..n_ch],
+                            &scratch.inverse[..n_ch],
+                            ctb,
+                            max_val,
+                            &mut scratch.reconstructed,
+                        );
+                        distortion += block_sse(orig, &scratch.reconstructed[..n_ch], ctb);
+                        if estimate_rate && distortion >= cost_limit {
+                            return distortion;
+                        }
+                        for (src_row, dst_row) in scratch.reconstructed[..n_ch]
+                            .chunks_exact(ctb)
+                            .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
+                        {
+                            dst_row[..ctb].copy_from_slice(src_row);
+                        }
                     }
                 }
             }
@@ -2542,7 +2755,6 @@ fn encode_cu<W: CabacWriter>(
             let _ = evaluate_chroma(winner, false, true, f32::MAX);
             winner
         };
-        drop(evaluate_chroma);
 
         chroma_tb_scan_idx = dct::scan_idx_for(best_chroma.pred_mode, log2_ctb, false, is_444);
         encode_chroma_mode(enc, ictx, best_chroma.syntax_idx);
@@ -2553,7 +2765,7 @@ fn encode_cu<W: CabacWriter>(
     // so it is not coded — matching x265's parsing.
     //
     // cbf order (HEVC §7.3.8.8): for ChromaArrayType==2 (4:2:2) the two stacked
-    // chroma TBs each have their own cbf, signalled cb[0],cb[1] then cr[0],cr[1],
+    // chroma TBs each have their own cbf, signaled cb[0],cb[1] then cr[0],cr[1],
     // before cbf_luma. For 4:2:0 there is one of each.
     for t in &scratch.chroma_tbs[..n_chroma_tb] {
         encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
@@ -2921,6 +3133,112 @@ mod tests {
     }
 
     #[test]
+    fn lossless_profile_enables_rext() {
+        let mut lossy = BitWriter::new();
+        write_profile_tier_level(
+            &mut lossy,
+            93,
+            crate::fmt::ChromaFormat::Yuv420,
+            crate::fmt::BitDepth::Eight,
+            false,
+        );
+        let lossy = lossy.finish();
+        assert_eq!(lossy[0] & 0x1f, 3);
+
+        let mut lossless = BitWriter::new();
+        write_profile_tier_level(
+            &mut lossless,
+            93,
+            crate::fmt::ChromaFormat::Yuv420,
+            crate::fmt::BitDepth::Eight,
+            true,
+        );
+        let lossless = lossless.finish();
+        assert_eq!(lossless[0] & 0x1f, 4);
+        // General RExt tools force the 4:4:4 constraint profile in HM: do not
+        // claim max-4:2:2, max-4:2:0 or monochrome merely because the source is
+        // 4:2:0. The intra constraint remains set.
+        assert_eq!(lossless[5] & 0x01, 0); // max_422chroma_constraint_flag
+        assert_eq!(lossless[6] & 0xc0, 0); // max_420 + max_monochrome
+        assert_ne!(lossless[6] & 0x20, 0); // intra_constraint_flag
+    }
+
+    #[test]
+    fn lossless_range_extension_sets_only_implicit_rdpcm() {
+        let mut enabled = BitWriter::new();
+        write_sps_range_extension(&mut enabled, true);
+        assert_eq!(enabled.finish().as_slice(), &[0x20, 0x00]);
+
+        let mut disabled = BitWriter::new();
+        write_sps_range_extension(&mut disabled, false);
+        assert_eq!(disabled.finish().as_slice(), &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn implicit_rdpcm_mode_is_inferred_from_final_intra_mode() {
+        assert_eq!(implicit_rdpcm_mode(10), ImplicitRdpcm::Horizontal);
+        assert_eq!(implicit_rdpcm_mode(26), ImplicitRdpcm::Vertical);
+        assert_eq!(implicit_rdpcm_mode(0), ImplicitRdpcm::Off);
+        assert_eq!(implicit_rdpcm_mode(34), ImplicitRdpcm::Off);
+    }
+
+    #[test]
+    fn implicit_rdpcm_roundtrips_all_supported_tb_sizes() {
+        for n in [4usize, 8, 16, 32] {
+            let mut residual = [0i32; 1024];
+            for (index, sample) in residual[..n * n].iter_mut().enumerate() {
+                let row = index / n;
+                let col = index % n;
+                *sample = (((row * 977 + col * 613 + row * col * 29) % 8191) as i32) - 4095;
+            }
+
+            for mode in [
+                ImplicitRdpcm::Off,
+                ImplicitRdpcm::Horizontal,
+                ImplicitRdpcm::Vertical,
+            ] {
+                let mut levels = [0i16; 1024];
+                let mut decoded = [0i32; 1024];
+                forward_lossless_rdpcm_into(&residual, n, mode, &mut levels);
+                inverse_lossless_rdpcm_into(&levels, n, mode, &mut decoded);
+                assert_eq!(
+                    &decoded[..n * n],
+                    &residual[..n * n],
+                    "roundtrip failed for {n}x{n} {mode:?}"
+                );
+                assert!(
+                    levels[..n * n]
+                        .iter()
+                        .all(|&level| (-8190..=8190).contains(&(level as i32)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_rdpcm_differences_the_expected_axis() {
+        let residual = [
+            1, 3, 6, 10, //
+            2, 5, 9, 14, //
+            4, 8, 13, 19, //
+            7, 12, 18, 25,
+        ];
+        let mut levels = [0i16; 1024];
+
+        forward_lossless_rdpcm_into(&residual, 4, ImplicitRdpcm::Horizontal, &mut levels);
+        assert_eq!(
+            &levels[..16],
+            &[1, 2, 3, 4, 2, 3, 4, 5, 4, 4, 5, 6, 7, 5, 6, 7]
+        );
+
+        forward_lossless_rdpcm_into(&residual, 4, ImplicitRdpcm::Vertical, &mut levels);
+        assert_eq!(
+            &levels[..16],
+            &[1, 3, 6, 10, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
     fn bit_writer_basic() {
         let mut bw = BitWriter::new();
         bw.write_bits(0b10110, 5);
@@ -2943,6 +3261,7 @@ mod tests {
             256,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
+            false,
         );
         assert_eq!(vps.data[0], 0x40, "VPS first byte should be 0x40");
     }
@@ -2954,6 +3273,7 @@ mod tests {
             48,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
+            false,
             Some(&crate::color::Cicp::srgb()),
         );
         assert!(sps.data.len() > 10);

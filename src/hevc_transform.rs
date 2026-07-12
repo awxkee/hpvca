@@ -313,6 +313,7 @@ fn coeff_remaining_bits(value: u32, rice: u32) -> f32 {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn rdoq_level_bits(
     abs_level: u32,
     ctx_set: usize,
@@ -446,12 +447,7 @@ impl RdoqDistortion {
 }
 
 /// Rate-distortion optimized quantization for a committed luma or chroma mode.
-///
-/// Fast mode shortlists use [`quantize_with_sign_hiding`]; only the selected mode
-/// enters this path. This HM-style RDOQ pass selects coefficient levels,
-/// significance, coefficient groups, CBF and the last position while following
-/// greater1/greater2 and Rice state. CABAC probabilities stay frozen at TU entry,
-/// as in normal encoder RDOQ.
+#[allow(clippy::too_many_arguments)]
 fn rdoq_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
@@ -755,6 +751,7 @@ fn rdoq_with_sign_hiding_into(
 }
 
 /// Winner-only RDOQ for a committed luma mode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_luma_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
@@ -776,6 +773,7 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
 /// significant-coefficient, coefficient-group, greater1/greater2 and CBF
 /// contexts while sharing the same HM-style significance, level, CG, CBF and
 /// last-position optimization as luma.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_chroma_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
@@ -864,18 +862,12 @@ fn quantize_impl_into(
 
     // HM avoids testing the degenerate one-coefficient, unit-level TU.
     if abs_sum >= 2
-        && let Some(scan) = sign_hiding_scan {
-            sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, true);
-        }
+        && let Some(scan) = sign_hiding_scan
+    {
+        sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, true);
+    }
 }
 
-/// HEVC/HM signBitHidingHDQ, distortion-only variant (no rate term).
-///
-/// One sign may be hidden per 4×4 coefficient group when the distance between
-/// its first and last significant scan positions is at least four. If the
-/// current parity does not encode the first sign, choose the ±1 level change
-/// with the smallest quantization-error increase while preserving a decodable
-/// first-significant coefficient.
 fn sign_bit_hiding_hdq(
     levels: &mut [i16; MAX_TB],
     coeff: &[i32],
@@ -977,11 +969,12 @@ fn sign_bit_hiding_hdq(
             };
 
             if let Some((cost, change)) = candidate
-                && cost < best_cost {
-                    best_cost = cost;
-                    best_pos = Some(pos);
-                    best_change = change;
-                }
+                && cost < best_cost
+            {
+                best_cost = cost;
+                best_pos = Some(pos);
+                best_change = change;
+            }
         }
 
         let pos = best_pos.expect("eligible sign-hiding group has a valid adjustment");

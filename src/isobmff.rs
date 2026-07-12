@@ -143,10 +143,10 @@ fn write_secondary_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
     }
 }
 
-/// Write ftyp. RExt profiles (4:2:2, 4:4:4, or 12-bit 4:2:0) use `heix`;
-/// Main/Main10 (4:2:0 up to 10-bit) use `heic`.
-fn write_ftyp(f: &mut Vec<u8>, chroma_idc: u8, bit_depth: u8) {
-    let rext = chroma_idc > 1 || bit_depth > 10;
+/// Write ftyp from the actual coded profile. RExt streams use `heix`; Main,
+/// Main10 and Main Still Picture use `heic`. Reading this from hvcC also covers
+/// 8/10-bit 4:2:0 lossless streams, which become RExt when implicit RDPCM is used.
+fn write_ftyp(f: &mut Vec<u8>, rext: bool) {
     let brand: &[u8; 4] = if rext { b"heix" } else { b"heic" };
     let s = f.len();
     write_box(f, b"ftyp");
@@ -156,6 +156,12 @@ fn write_ftyp(f: &mut Vec<u8>, chroma_idc: u8, bit_depth: u8) {
     f.extend_from_slice(b"mif1");
     f.extend_from_slice(b"miaf");
     patch(f, s);
+}
+
+#[inline]
+fn hvcc_uses_rext(hvcc: &[u8]) -> bool {
+    // HEVCDecoderConfigurationRecord: byte 1 contains profile_space/tier/idc.
+    matches!(hvcc.get(1), Some(profile) if *profile & 0x1f == 4)
 }
 
 /// Write iloc version=0 with base_offset_size=4.
@@ -191,13 +197,12 @@ pub(crate) fn wrap_hevc_image_with_alpha(
     let alpha_sample = alpha.to_length_prefixed_slices();
     let color_hvcc = build_hvcc(color, bit_depth.bits())?;
     let alpha_hvcc = build_hvcc(alpha, bit_depth.bits())?;
-    let chroma_idc = sps_chroma_format_idc(color).unwrap_or(1);
 
     const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
 
     let mut f: Vec<u8> = Vec::new();
 
-    write_ftyp(&mut f, chroma_idc, bit_depth.bits());
+    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc));
 
     let meta_start = f.len();
     write_fullbox(&mut f, b"meta", 0, 0);
@@ -426,11 +431,10 @@ pub(crate) fn wrap_hevc_image(
     } = img;
     let hevc_sample = stream.to_length_prefixed_slices();
     let hvcc_data = build_hvcc(stream, bit_depth.bits())?;
-    let chroma_idc = sps_chroma_format_idc(stream).unwrap_or(1);
 
     let mut f: Vec<u8> = Vec::new();
 
-    write_ftyp(&mut f, chroma_idc, bit_depth.bits());
+    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data));
 
     let meta_start = f.len();
     write_fullbox(&mut f, b"meta", 0, 0);
@@ -776,7 +780,6 @@ pub(crate) fn wrap_hevc_grid(
 
     // Build hvcC once from the first tile (all tiles share the same SPS/PPS).
     let hvcc_data = build_hvcc(&tiles[0], bit_depth.bits())?;
-    let chroma_idc = sps_chroma_format_idc(&tiles[0]).unwrap_or(1);
 
     // Pre-encode all tile mdat samples.
     let tile_samples: Vec<Vec<u8>> = tiles
@@ -821,7 +824,7 @@ pub(crate) fn wrap_hevc_grid(
     let mut f: Vec<u8> = Vec::new();
 
     // ── ftyp ─────────────────────────────────────────────────────────────────
-    write_ftyp(&mut f, chroma_idc, bit_depth.bits());
+    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data));
 
     // ── meta ─────────────────────────────────────────────────────────────────
     let meta_start = f.len();
@@ -1167,7 +1170,6 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
 
     let color_hvcc = build_hvcc(&color_tiles[0], bit_depth.bits())?;
     let alpha_hvcc = build_hvcc(&alpha_tiles[0], bit_depth.bits())?;
-    let chroma_idc = sps_chroma_format_idc(&color_tiles[0]).unwrap_or(1);
 
     let color_samples: Vec<Vec<u8>> = color_tiles
         .iter()
@@ -1216,7 +1218,7 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
     let mut f: Vec<u8> = Vec::new();
 
     // ── ftyp ─────────────────────────────────────────────────────────────────
-    write_ftyp(&mut f, chroma_idc, bit_depth.bits());
+    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc));
 
     // ── meta ─────────────────────────────────────────────────────────────────
     let meta_start = f.len();
@@ -1629,8 +1631,8 @@ mod tests {
         use crate::hevc::{build_pps, build_sps, build_vps};
         NaluStream {
             nalus: vec![
-                build_vps(16, 16, chroma, bd),
-                build_sps(16, 16, chroma, bd, Some(&crate::color::Cicp::srgb())),
+                build_vps(16, 16, chroma, bd, false),
+                build_sps(16, 16, chroma, bd, false, Some(&crate::color::Cicp::srgb())),
                 build_pps(30, false),
             ],
         }
@@ -1640,6 +1642,26 @@ mod tests {
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
         )
+    }
+
+    fn make_lossless_stream() -> NaluStream {
+        use crate::hevc::{build_pps, build_sps, build_vps};
+        let chroma = crate::fmt::ChromaFormat::Yuv420;
+        let bit_depth = crate::fmt::BitDepth::Eight;
+        NaluStream {
+            nalus: vec![
+                build_vps(16, 16, chroma, bit_depth, true),
+                build_sps(
+                    16,
+                    16,
+                    chroma,
+                    bit_depth,
+                    true,
+                    Some(&crate::color::Cicp::srgb()),
+                ),
+                build_pps(30, true),
+            ],
+        }
     }
 
     #[test]
@@ -1657,6 +1679,26 @@ mod tests {
         .unwrap();
         assert_eq!(&b[4..8], b"ftyp");
         assert_eq!(&b[8..12], b"heic", "4:2:0 8-bit must use heic brand");
+    }
+
+    #[test]
+    fn ftyp_heix_for_lossless_420_rext() {
+        let b = wrap_hevc_image(
+            &make_lossless_stream(),
+            16,
+            16,
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &crate::metadata::Metadata::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &b[8..12],
+            b"heix",
+            "implicit-RDPCM lossless streams advertise an RExt profile"
+        );
     }
 
     #[test]

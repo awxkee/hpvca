@@ -158,6 +158,7 @@ pub(crate) fn predict_dc_into(
 /// Positive-angle modes read their main reference directly; only negative-angle
 /// modes build the extended reference, and they copy just N positive samples.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_angular_into(
     corner: u16,
     above: &[u16],
@@ -215,6 +216,7 @@ pub(crate) fn predict_angular_into(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn predict_angular_n<const N: usize>(
     corner: u16,
     above: &[u16],
@@ -246,7 +248,13 @@ fn predict_angular_n<const N: usize>(
                 let value = left[0] as i32 + ((above as i32 - corner as i32) >> 1);
                 *dst = value.clamp(0, max_val) as u16;
             }
-            for (row, &sample) in pred.as_chunks_mut::<N>().0.iter_mut().skip(1).zip(&left[1..N]) {
+            for (row, &sample) in pred
+                .as_chunks_mut::<N>()
+                .0
+                .iter_mut()
+                .skip(1)
+                .zip(&left[1..N])
+            {
                 row.fill(sample);
             }
         } else {
@@ -388,10 +396,8 @@ fn predict_angular_n<const N: usize>(
     }
 }
 
-/// Predict an N×N block for any chroma mode into reusable storage. Chroma
-/// references are already prepared by the caller and never use the luma-only
-/// DC/H/V boundary filter.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_chroma_tb_into(
     mode: u8,
     corner: u16,

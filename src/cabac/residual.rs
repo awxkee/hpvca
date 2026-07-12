@@ -482,6 +482,7 @@ fn sign_is_hidden(sig_pos: &[usize], enabled: bool) -> bool {
 /// Encode coeff_abs_level_greater1, greater2, sign flags, and remaining levels
 /// for one sub-block. `sig_pos` is in high→low scan order. Mirrors libde265/zune
 /// (and HM) exactly, including the cross-sub-block context carry.
+#[allow(clippy::too_many_arguments)]
 fn encode_coeff_levels<W: CabacWriter>(
     enc: &mut W,
     ctx: &mut ContextSet,
