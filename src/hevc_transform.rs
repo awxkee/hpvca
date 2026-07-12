@@ -73,22 +73,97 @@ static T16: [[i32; 16]; 16] = [
     [9, -25, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 25, -9],
 ];
 
+#[rustfmt::skip]
+static T32: [[i32; 32]; 32] = [
+    [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
+    [90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90],
+    [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90],
+    [90, 82, 67, 46, 22, -4, -31, -54, -73, -85, -90, -88, -78, -61, -38, -13, 13, 38, 61, 78, 88, 90, 85, 73, 54, 31, 4, -22, -46, -67, -82, -90],
+    [89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89, 89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89],
+    [88, 67, 31, -13, -54, -82, -90, -78, -46, -4, 38, 73, 90, 85, 61, 22, -22, -61, -85, -90, -73, -38, 4, 46, 78, 90, 82, 54, 13, -31, -67, -88],
+    [87, 57, 9, -43, -80, -90, -70, -25, 25, 70, 90, 80, 43, -9, -57, -87, -87, -57, -9, 43, 80, 90, 70, 25, -25, -70, -90, -80, -43, 9, 57, 87],
+    [85, 46, -13, -67, -90, -73, -22, 38, 82, 88, 54, -4, -61, -90, -78, -31, 31, 78, 90, 61, 4, -54, -88, -82, -38, 22, 73, 90, 67, 13, -46, -85],
+    [83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83],
+    [82, 22, -54, -90, -61, 13, 78, 85, 31, -46, -90, -67, 4, 73, 88, 38, -38, -88, -73, -4, 67, 90, 46, -31, -85, -78, -13, 61, 90, 54, -22, -82],
+    [80, 9, -70, -87, -25, 57, 90, 43, -43, -90, -57, 25, 87, 70, -9, -80, -80, -9, 70, 87, 25, -57, -90, -43, 43, 90, 57, -25, -87, -70, 9, 80],
+    [78, -4, -82, -73, 13, 85, 67, -22, -88, -61, 31, 90, 54, -38, -90, -46, 46, 90, 38, -54, -90, -31, 61, 88, 22, -67, -85, -13, 73, 82, 4, -78],
+    [75, -18, -89, -50, 50, 89, 18, -75, -75, 18, 89, 50, -50, -89, -18, 75, 75, -18, -89, -50, 50, 89, 18, -75, -75, 18, 89, 50, -50, -89, -18, 75],
+    [73, -31, -90, -22, 78, 67, -38, -90, -13, 82, 61, -46, -88, -4, 85, 54, -54, -85, 4, 88, 46, -61, -82, 13, 90, 38, -67, -78, 22, 90, 31, -73],
+    [70, -43, -87, 9, 90, 25, -80, -57, 57, 80, -25, -90, -9, 87, 43, -70, -70, 43, 87, -9, -90, -25, 80, 57, -57, -80, 25, 90, 9, -87, -43, 70],
+    [67, -54, -78, 38, 85, -22, -90, 4, 90, 13, -88, -31, 82, 46, -73, -61, 61, 73, -46, -82, 31, 88, -13, -90, -4, 90, 22, -85, -38, 78, 54, -67],
+    [64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64],
+    [61, -73, -46, 82, 31, -88, -13, 90, -4, -90, 22, 85, -38, -78, 54, 67, -67, -54, 78, 38, -85, -22, 90, 4, -90, 13, 88, -31, -82, 46, 73, -61],
+    [57, -80, -25, 90, -9, -87, 43, 70, -70, -43, 87, 9, -90, 25, 80, -57, -57, 80, 25, -90, 9, 87, -43, -70, 70, 43, -87, -9, 90, -25, -80, 57],
+    [54, -85, -4, 88, -46, -61, 82, 13, -90, 38, 67, -78, -22, 90, -31, -73, 73, 31, -90, 22, 78, -67, -38, 90, -13, -82, 61, 46, -88, 4, 85, -54],
+    [50, -89, 18, 75, -75, -18, 89, -50, -50, 89, -18, -75, 75, 18, -89, 50, 50, -89, 18, 75, -75, -18, 89, -50, -50, 89, -18, -75, 75, 18, -89, 50],
+    [46, -90, 38, 54, -90, 31, 61, -88, 22, 67, -85, 13, 73, -82, 4, 78, -78, -4, 82, -73, -13, 85, -67, -22, 88, -61, -31, 90, -54, -38, 90, -46],
+    [43, -90, 57, 25, -87, 70, 9, -80, 80, -9, -70, 87, -25, -57, 90, -43, -43, 90, -57, -25, 87, -70, -9, 80, -80, 9, 70, -87, 25, 57, -90, 43],
+    [38, -88, 73, -4, -67, 90, -46, -31, 85, -78, 13, 61, -90, 54, 22, -82, 82, -22, -54, 90, -61, -13, 78, -85, 31, 46, -90, 67, 4, -73, 88, -38],
+    [36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36],
+    [31, -78, 90, -61, 4, 54, -88, 82, -38, -22, 73, -90, 67, -13, -46, 85, -85, 46, 13, -67, 90, -73, 22, 38, -82, 88, -54, -4, 61, -90, 78, -31],
+    [25, -70, 90, -80, 43, 9, -57, 87, -87, 57, -9, -43, 80, -90, 70, -25, -25, 70, -90, 80, -43, -9, 57, -87, 87, -57, 9, 43, -80, 90, -70, 25],
+    [22, -61, 85, -90, 73, -38, -4, 46, -78, 90, -82, 54, -13, -31, 67, -88, 88, -67, 31, 13, -54, 82, -90, 78, -46, 4, 38, -73, 90, -85, 61, -22],
+    [18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18, 18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18],
+    [13, -38, 61, -78, 88, -90, 85, -73, 54, -31, 4, 22, -46, 67, -82, 90, -90, 82, -67, 46, -22, -4, 31, -54, 73, -85, 90, -88, 78, -61, 38, -13],
+    [9, -25, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 25, -9, -9, 25, -43, 57, -70, 80, -87, 90, -90, 87, -80, 70, -57, 43, -25, 9],
+    [4, -13, 22, -31, 38, -46, 54, -61, 67, -73, 78, -82, 85, -88, 90, -90, 90, -90, 88, -85, 82, -78, 73, -67, 61, -54, 46, -38, 31, -22, 13, -4],
+];
+
 static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 
-/// Largest supported transform: 16×16 → 256 coefficients per fixed buffer.
-const MAX_TB: usize = 256;
+/// Largest supported transform: 32×32 → 1024 coefficients per fixed buffer.
+const MAX_TB: usize = 1024;
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
-/// Forward integer transform of an N×N residual block (N = 4 or 8).
-/// Returns a fixed 64-entry buffer; only the first `n*n` entries are written.
-pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
-    let mut out = [0i32; MAX_TB];
+/// Persistent work area for winner-only RDOQ. The previous implementation put
+/// three 1024-entry cost arrays on every CU stack frame and cleared them for each
+/// winner. Reuse one frame-owned allocation; cost entries are overwritten lazily
+/// and only the active coefficient-group topology is reset.
+pub(crate) struct RdoqScratch {
+    cost_coeff: [f32; MAX_TB],
+    cost_coeff0: [f32; MAX_TB],
+    cost_sig: [f32; MAX_TB],
+    cost_group_sig: [f32; 64],
+    group_flags: [u8; 64],
+}
+
+impl RdoqScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            cost_coeff: [0.0; MAX_TB],
+            cost_coeff0: [0.0; MAX_TB],
+            cost_sig: [0.0; MAX_TB],
+            cost_group_sig: [0.0; 64],
+            group_flags: [0; 64],
+        }
+    }
+}
+
+/// Forward integer transform of an N×N residual block (N = 4, 8, 16, or 32)
+/// into caller-owned storage. `tmp` is reusable transpose/intermediate scratch;
+/// only the first `n*n` entries of either buffer are touched.
+#[inline]
+pub(crate) fn fwd_transform_into(
+    res: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+) {
     match n {
-        4 => fwd_transform_n::<4>(res, &T4, bit_depth, &mut out),
-        8 => fwd_transform_n::<8>(res, &T8, bit_depth, &mut out),
-        16 => fwd_transform_n::<16>(res, &T16, bit_depth, &mut out),
+        4 => fwd_transform_n::<4>(res, &T4, bit_depth, out, tmp),
+        8 => fwd_transform_n::<8>(res, &T8, bit_depth, out, tmp),
+        16 => fwd_transform_n::<16>(res, &T16, bit_depth, out, tmp),
+        32 => fwd_transform_32(res, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
     }
+}
+
+/// Compatibility wrapper for tests and non-hot callers.
+pub(crate) fn fwd_transform(res: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+    let mut out = [0i32; MAX_TB];
+    let mut tmp = [0i32; MAX_TB];
+    fwd_transform_into(res, n, bit_depth, &mut out, &mut tmp);
     out
 }
 
@@ -98,6 +173,7 @@ fn fwd_transform_n<const N: usize>(
     t: &[[i32; N]; N],
     bit_depth: u8,
     out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
 ) {
     let log2n = N.trailing_zeros() as i32;
     let bd = bit_depth as i32;
@@ -105,7 +181,6 @@ fn fwd_transform_n<const N: usize>(
     let add1 = if shift1 > 0 { 1i32 << (shift1 - 1) } else { 0 };
     // i32 throughout: products (|coeff|≤90 · |residual|≤4095) and the ≤N-term
     // sums stay well inside i32 for every supported bit depth.
-    let mut tmp = [0i32; MAX_TB]; // N*N <= 256
     // pass 1 (rows of res): tmp[j*N+i] = (Σ_k T[i][k]·res[j*N+k]) >> shift1
     for (j, res_row) in res.as_chunks::<N>().0.iter().enumerate().take(N) {
         for (i, trow) in t.iter().enumerate() {
@@ -130,6 +205,104 @@ fn fwd_transform_n<const N: usize>(
                 s += trow[k] * colv[k];
             }
             out[i * N + j] = (s + add2) >> shift2;
+        }
+    }
+}
+
+#[inline(always)]
+fn round_shift_i32(value: i32, shift: i32) -> i32 {
+    if shift > 0 {
+        (value + (1i32 << (shift - 1))) >> shift
+    } else {
+        value
+    }
+}
+
+/// HM-style partial-butterfly 32-point forward transform. A dense matrix
+/// multiply needs 1024 multiplies per vector; symmetry reduces this to 344.
+#[inline]
+fn fwd_transform_1d_32(src: &[i32], dst: &mut [i32], shift: i32) {
+    debug_assert!(src.len() >= 32 && dst.len() >= 32);
+    let mut e = [0i32; 16];
+    let mut o = [0i32; 16];
+    for k in 0..16 {
+        e[k] = src[k] + src[31 - k];
+        o[k] = src[k] - src[31 - k];
+    }
+
+    let mut ee = [0i32; 8];
+    let mut eo = [0i32; 8];
+    for k in 0..8 {
+        ee[k] = e[k] + e[15 - k];
+        eo[k] = e[k] - e[15 - k];
+    }
+
+    let mut eee = [0i32; 4];
+    let mut eeo = [0i32; 4];
+    for k in 0..4 {
+        eee[k] = ee[k] + ee[7 - k];
+        eeo[k] = ee[k] - ee[7 - k];
+    }
+
+    let mut eeee = [0i32; 2];
+    let mut eeeo = [0i32; 2];
+    for k in 0..2 {
+        eeee[k] = eee[k] + eee[3 - k];
+        eeeo[k] = eee[k] - eee[3 - k];
+    }
+
+    for k in [0usize, 16] {
+        let sum = T32[k][0] * eeee[0] + T32[k][1] * eeee[1];
+        dst[k] = round_shift_i32(sum, shift);
+    }
+    for k in [8usize, 24] {
+        let sum = T32[k][0] * eeeo[0] + T32[k][1] * eeeo[1];
+        dst[k] = round_shift_i32(sum, shift);
+    }
+    for k in (4..32).step_by(8) {
+        let mut sum = 0i32;
+        for j in 0..4 {
+            sum += T32[k][j] * eeo[j];
+        }
+        dst[k] = round_shift_i32(sum, shift);
+    }
+    for k in (2..32).step_by(4) {
+        let mut sum = 0i32;
+        for j in 0..8 {
+            sum += T32[k][j] * eo[j];
+        }
+        dst[k] = round_shift_i32(sum, shift);
+    }
+    for k in (1..32).step_by(2) {
+        let mut sum = 0i32;
+        for j in 0..16 {
+            sum += T32[k][j] * o[j];
+        }
+        dst[k] = round_shift_i32(sum, shift);
+    }
+}
+
+#[inline]
+fn fwd_transform_32(res: &[i32], bit_depth: u8, out: &mut [i32; MAX_TB], tmp: &mut [i32; MAX_TB]) {
+    debug_assert!(res.len() >= 32 * 32);
+    let shift1 = bit_depth as i32 - 4;
+    let shift2 = 11;
+
+    for row in 0..32 {
+        let src = &res[row * 32..row * 32 + 32];
+        let dst = &mut tmp[row * 32..row * 32 + 32];
+        fwd_transform_1d_32(src, dst, shift1);
+    }
+
+    let mut col = [0i32; 32];
+    let mut transformed = [0i32; 32];
+    for c in 0..32 {
+        for r in 0..32 {
+            col[r] = tmp[r * 32 + c];
+        }
+        fwd_transform_1d_32(&col, &mut transformed, shift2);
+        for r in 0..32 {
+            out[r * 32 + c] = transformed[r];
         }
     }
 }
@@ -269,7 +442,7 @@ fn coefficient_distortion(
 /// the last-significant position. CABAC costs use frozen probability states from
 /// the current TU entrance, while c1/c2 and Rice adaptation follow the candidate
 /// levels in reverse scan order, matching HM's normal RDOQ structure.
-pub(crate) fn rdoq_luma_with_sign_hiding(
+pub(crate) fn rdoq_luma_with_sign_hiding_into(
     coeff: &[i32],
     n: usize,
     qp: u8,
@@ -278,13 +451,15 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
     scan_idx: u8,
     lambda: f32,
     ctx: &ContextSet,
-) -> [i16; MAX_TB] {
+    levels: &mut [i16; MAX_TB],
+    scratch: &mut RdoqScratch,
+) {
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
     let num_coeffs = n * n;
     debug_assert_eq!(scan.len(), num_coeffs);
-    debug_assert!(matches!(n, 8 | 16));
+    debug_assert!(matches!(n, 8 | 16 | 32));
     let log2_size = n.trailing_zeros();
     let num_groups = num_coeffs / GROUP_SIZE;
     let sb_side = n / 4;
@@ -294,12 +469,18 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
     let round = 1i64 << (q_bits - 1);
     let distortion_scale = rdoq_distortion_scale(n, bit_depth);
 
-    let mut levels = [0i16; MAX_TB]; // absolute levels until final sign restore
-    let mut cost_coeff = [0.0f32; MAX_TB];
-    let mut cost_coeff0 = [0.0f32; MAX_TB];
-    let mut cost_sig = [0.0f32; MAX_TB];
-    let mut cost_group_sig = [0.0f32; 16];
-    let mut group_flags = [0u8; 16]; // raster coefficient-group grid
+    levels[..num_coeffs].fill(0); // absolute levels until final sign restore
+    let RdoqScratch {
+        cost_coeff,
+        cost_coeff0,
+        cost_sig,
+        cost_group_sig,
+        group_flags,
+    } = scratch;
+    // Coefficient costs are assigned before every read. Only the significance
+    // topology needs clearing between TUs; avoiding three full cost-array fills
+    // saves 12 KiB of writes for every winner-only RDOQ invocation.
+    group_flags[..sb_side * sb_side].fill(0);
     let mut block_uncoded_cost = 0.0;
     let mut base_cost = 0.0;
     let mut last_scan_pos = None;
@@ -307,6 +488,9 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
     let mut carry_c1 = 1i32;
 
     for group in (0..num_groups).rev() {
+        // The last/non-coded group has no coded_sub_block_flag contribution.
+        // Set this entry lazily rather than clearing the complete array.
+        cost_group_sig[group] = 0.0;
         let group_start = group * GROUP_SIZE;
         let (sbx, sby) = sb_scan[group];
         let group_grid = sbx + sby * sb_side;
@@ -496,7 +680,7 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
     }
 
     let Some(initial_last) = last_scan_pos else {
-        return levels;
+        return;
     };
 
     // Compare the non-zero TU against CBF=0, then move the last-significant
@@ -551,7 +735,34 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
             levels[pos] = -levels[pos];
         }
     }
-    apply_sign_hiding_to_levels(&mut levels, coeff, n, qp, bit_depth, scan);
+    apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
+}
+
+/// Compatibility wrapper for tests and non-hot callers.
+pub(crate) fn rdoq_luma_with_sign_hiding(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+    scan_idx: u8,
+    lambda: f32,
+    ctx: &ContextSet,
+) -> [i16; MAX_TB] {
+    let mut levels = [0i16; MAX_TB];
+    let mut scratch = RdoqScratch::new();
+    rdoq_luma_with_sign_hiding_into(
+        coeff,
+        n,
+        qp,
+        bit_depth,
+        scan,
+        scan_idx,
+        lambda,
+        ctx,
+        &mut levels,
+        &mut scratch,
+    );
     levels
 }
 
@@ -561,6 +772,19 @@ pub(crate) fn rdoq_luma_with_sign_hiding(
 /// adjustment is the distortion-only `signBitHidingHDQ` method used by HM: for
 /// each eligible 4×4 coefficient group, change the cheapest magnitude by one so
 /// the parity of the absolute-level sum carries the first significant sign.
+#[inline]
+pub(crate) fn quantize_with_sign_hiding_into(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+    out: &mut [i16; MAX_TB],
+) {
+    debug_assert_eq!(scan.len(), n * n);
+    quantize_impl_into(coeff, n, qp, bit_depth, Some(scan), out);
+}
+
 pub(crate) fn quantize_with_sign_hiding(
     coeff: &[i32],
     n: usize,
@@ -568,16 +792,16 @@ pub(crate) fn quantize_with_sign_hiding(
     bit_depth: u8,
     scan: &[(usize, usize)],
 ) -> [i16; MAX_TB] {
-    debug_assert_eq!(scan.len(), n * n);
-    quantize_impl(coeff, n, qp, bit_depth, Some(scan))
+    let mut out = [0i16; MAX_TB];
+    quantize_with_sign_hiding_into(coeff, n, qp, bit_depth, scan, &mut out);
+    out
 }
 
 /// Apply HEVC sign-data hiding to an already selected set of coefficient levels.
-///
-/// Winner-only RDOQ changes some of the plain quantizer's levels, so it cannot
-/// reuse the levels returned by [`quantize_with_sign_hiding`]. Recompute the
-/// quantization-error deltas for the chosen levels and run the same HM-style
-/// parity adjustment once, after level optimization has finished.
+/// Winner-only RDOQ changes some of the plain quantizer's levels, so parity is
+/// repaired once after level optimization has finished. Error deltas are computed
+/// lazily only for the eligible coefficient groups instead of written to a full
+/// 1024-entry temporary for every TU.
 fn apply_sign_hiding_to_levels(
     levels: &mut [i16; MAX_TB],
     coeff: &[i32],
@@ -586,22 +810,48 @@ fn apply_sign_hiding_to_levels(
     bit_depth: u8,
     scan: &[(usize, usize)],
 ) {
+    let abs_sum = levels[..n * n].iter().fold(0u32, |sum, level| {
+        sum.saturating_add(level.unsigned_abs() as u32)
+    });
+    if abs_sum >= 2 {
+        sign_bit_hiding_hdq(levels, coeff, n, scan, qp, bit_depth, false);
+    }
+}
+
+fn quantize_impl_into(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    sign_hiding_scan: Option<&[(usize, usize)]>,
+    out: &mut [i16; MAX_TB],
+) {
     let log2n = n.trailing_zeros() as i64;
-    let q_bits = 14 + (qp as i64) / 6 + (15 - bit_depth as i64 - log2n);
+    let bd = bit_depth as i64;
+    let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
-    let q_bits_8 = q_bits - 8;
-    let mut delta_u = [0i32; MAX_TB];
+    let offset = 171i64 << (q_bits - 9); // intra
     let mut abs_sum = 0u32;
 
-    for (i, (&c, &level)) in coeff[..n * n].iter().zip(&levels[..n * n]).enumerate() {
-        let scaled = (c as i64).abs() * q_scale;
-        let magnitude = level.unsigned_abs() as i64;
-        delta_u[i] = ((scaled - (magnitude << q_bits)) >> q_bits_8) as i32;
-        abs_sum = abs_sum.saturating_add(magnitude as u32);
+    for (level, &coefficient) in out[..n * n].iter_mut().zip(coeff) {
+        // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
+        // overflows i32; keep this one multiply in i64.
+        let coefficient = coefficient as i64;
+        let magnitude = (coefficient.abs() * q_scale + offset) >> q_bits;
+        let signed = if coefficient < 0 {
+            -magnitude
+        } else {
+            magnitude
+        };
+        *level = signed.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        abs_sum = abs_sum.saturating_add((*level).unsigned_abs() as u32);
     }
 
+    // HM avoids testing the degenerate one-coefficient, unit-level TU.
     if abs_sum >= 2 {
-        sign_bit_hiding_hdq(levels, coeff, &delta_u, n, scan);
+        if let Some(scan) = sign_hiding_scan {
+            sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, true);
+        }
     }
 }
 
@@ -612,34 +862,8 @@ fn quantize_impl(
     bit_depth: u8,
     sign_hiding_scan: Option<&[(usize, usize)]>,
 ) -> [i16; MAX_TB] {
-    let log2n = n.trailing_zeros() as i64;
-    let bd = bit_depth as i64;
-    let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
-    let q_scale = QUANT_SCALE[(qp % 6) as usize];
-    let offset = 171i64 << (q_bits - 9); // intra
-    let q_bits_8 = q_bits - 8;
     let mut out = [0i16; MAX_TB];
-    let mut delta_u = [0i32; MAX_TB];
-    let mut abs_sum = 0u32;
-
-    for (i, (o, &c)) in out[..n * n].iter_mut().zip(coeff).enumerate() {
-        // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
-        // overflows i32; keep this one multiply in i64.
-        let c = c as i64;
-        let scaled = c.abs() * q_scale;
-        let magnitude = (scaled + offset) >> q_bits;
-        delta_u[i] = ((scaled - (magnitude << q_bits)) >> q_bits_8) as i32;
-        let level = if c < 0 { -magnitude } else { magnitude };
-        *o = level.clamp(-32768, 32767) as i16;
-        abs_sum = abs_sum.saturating_add((*o).unsigned_abs() as u32);
-    }
-
-    // HM avoids testing the degenerate one-coefficient, unit-level TU.
-    if abs_sum >= 2 {
-        if let Some(scan) = sign_hiding_scan {
-            sign_bit_hiding_hdq(&mut out, coeff, &delta_u, n, scan);
-        }
-    }
+    quantize_impl_into(coeff, n, qp, bit_depth, sign_hiding_scan, &mut out);
     out
 }
 
@@ -653,9 +877,11 @@ fn quantize_impl(
 fn sign_bit_hiding_hdq(
     levels: &mut [i16; MAX_TB],
     coeff: &[i32],
-    delta_u: &[i32; MAX_TB],
     n: usize,
     scan: &[(usize, usize)],
+    qp: u8,
+    bit_depth: u8,
+    use_rounded_magnitude: bool,
 ) {
     const GROUP_SIZE: usize = 16;
     const SBH_THRESHOLD: usize = 4;
@@ -664,6 +890,11 @@ fn sign_bit_hiding_hdq(
     debug_assert_eq!(num_coeffs % GROUP_SIZE, 0);
     debug_assert!(coeff.len() >= num_coeffs);
     debug_assert_eq!(scan.len(), num_coeffs);
+    let log2n = n.trailing_zeros() as i64;
+    let q_bits = 14 + qp as i64 / 6 + (15 - bit_depth as i64 - log2n);
+    let q_bits_8 = q_bits - 8;
+    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let quant_offset = 171i64 << (q_bits - 9);
 
     let mut found_last_group = false;
     for subset in (0..num_coeffs / GROUP_SIZE).rev() {
@@ -712,7 +943,13 @@ fn sign_bit_hiding_hdq(
         for i in (0..=search_top).rev() {
             let pos = row_major(i);
             let level = levels[pos];
-            let delta = delta_u[pos] as i64;
+            let scaled = (coeff[pos] as i64).abs() * q_scale;
+            let magnitude = if use_rounded_magnitude {
+                (scaled + quant_offset) >> q_bits
+            } else {
+                level.unsigned_abs() as i64
+            };
+            let delta = (scaled - (magnitude << q_bits)) >> q_bits_8;
 
             let candidate = if level != 0 {
                 if delta > 0 {
@@ -759,8 +996,15 @@ fn sign_bit_hiding_hdq(
     }
 }
 
-/// Dequantisation: level → transform coefficient (spec 8.6.3). Fixed 64-entry buffer.
-pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
+/// Dequantisation: level → transform coefficient (spec 8.6.3).
+#[inline]
+pub(crate) fn dequantize_into(
+    level: &[i16],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+) {
     let log2n = n.trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let bd_shift = bd + log2n - 5;
@@ -768,22 +1012,40 @@ pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32
     let scale = DEQUANT_SCALE[(qp % 6) as usize];
     let per = 1i64 << ((qp as i64) / 6);
     let factor = scale * per * 16;
-    let mut out = [0i32; MAX_TB];
-    for (o, &l) in out[..n * n].iter_mut().zip(level) {
-        *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
+    for (dst, &level) in out[..n * n].iter_mut().zip(&level[..n * n]) {
+        *dst = ((level as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
     }
+}
+
+pub(crate) fn dequantize(level: &[i16], n: usize, qp: u8, bit_depth: u8) -> [i32; MAX_TB] {
+    let mut out = [0i32; MAX_TB];
+    dequantize_into(level, n, qp, bit_depth, &mut out);
     out
 }
 
-/// Inverse integer transform (spec 8.6.4.2). Returns residual in a fixed buffer.
-pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
-    let mut out = [0i32; MAX_TB];
+/// Inverse integer transform (spec 8.6.4.2) into reusable output/intermediate
+/// buffers. Only the first `n*n` entries are touched.
+#[inline]
+pub(crate) fn inv_transform_into(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+) {
     match n {
-        4 => inv_transform_n::<4>(coeff, &T4, bit_depth, &mut out),
-        8 => inv_transform_n::<8>(coeff, &T8, bit_depth, &mut out),
-        16 => inv_transform_n::<16>(coeff, &T16, bit_depth, &mut out),
+        4 => inv_transform_n::<4>(coeff, &T4, bit_depth, out, tmp),
+        8 => inv_transform_n::<8>(coeff, &T8, bit_depth, out, tmp),
+        16 => inv_transform_n::<16>(coeff, &T16, bit_depth, out, tmp),
+        32 => inv_transform_32(coeff, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
     }
+}
+
+pub(crate) fn inv_transform(coeff: &[i32], n: usize, bit_depth: u8) -> [i32; MAX_TB] {
+    let mut out = [0i32; MAX_TB];
+    let mut tmp = [0i32; MAX_TB];
+    inv_transform_into(coeff, n, bit_depth, &mut out, &mut tmp);
     out
 }
 
@@ -793,6 +1055,7 @@ fn inv_transform_n<const N: usize>(
     t: &[[i32; N]; N],
     bit_depth: u8,
     out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
 ) {
     let bd = bit_depth as i32;
     let shift1 = 7i32;
@@ -803,7 +1066,6 @@ fn inv_transform_n<const N: usize>(
     // i32 accumulation is exact (dequant clamps to ±32768); basis rows are read
     // contiguously and zero coefficients are skipped — residual blocks are
     // mostly zero, so the skip removes the bulk of the work.
-    let mut tmp = [0i32; MAX_TB];
     let mut acc = [0i32; N];
 
     // Stage 1 (columns): tmp[m*N+c] = clip( Σ_k T[k][m]·coeff[k*N+c] ) >> 7
@@ -841,6 +1103,114 @@ fn inv_transform_n<const N: usize>(
         for m in 0..N {
             out[r * N + m] = (acc[m] + add2) >> shift2;
         }
+    }
+}
+
+/// HM-style partial-butterfly inverse. For very sparse vectors, the existing
+/// zero-skipping matrix path is cheaper, so retain it below eleven non-zeros.
+#[inline]
+fn inv_transform_1d_32(src: &[i32], dst: &mut [i32], shift: i32, output_min: i32, output_max: i32) {
+    debug_assert!(src.len() >= 32 && dst.len() >= 32);
+    let nonzero = src[..32].iter().filter(|&&value| value != 0).count();
+    if nonzero <= 10 {
+        for m in 0..32 {
+            let mut sum = 0i32;
+            for k in 0..32 {
+                let value = src[k];
+                if value != 0 {
+                    sum += T32[k][m] * value;
+                }
+            }
+            dst[m] = round_shift_i32(sum, shift).clamp(output_min, output_max);
+        }
+        return;
+    }
+
+    let mut o = [0i32; 16];
+    for k in 0..16 {
+        let mut sum = 0i32;
+        for j in (1..32).step_by(2) {
+            sum += T32[j][k] * src[j];
+        }
+        o[k] = sum;
+    }
+
+    let mut eo = [0i32; 8];
+    for k in 0..8 {
+        let mut sum = 0i32;
+        for j in (2..32).step_by(4) {
+            sum += T32[j][k] * src[j];
+        }
+        eo[k] = sum;
+    }
+
+    let mut eeo = [0i32; 4];
+    for k in 0..4 {
+        let mut sum = 0i32;
+        for j in (4..32).step_by(8) {
+            sum += T32[j][k] * src[j];
+        }
+        eeo[k] = sum;
+    }
+
+    let mut eeeo = [0i32; 2];
+    let mut eeee = [0i32; 2];
+    for k in 0..2 {
+        eeeo[k] = T32[8][k] * src[8] + T32[24][k] * src[24];
+        eeee[k] = T32[0][k] * src[0] + T32[16][k] * src[16];
+    }
+
+    let mut eee = [0i32; 4];
+    for k in 0..2 {
+        eee[k] = eeee[k] + eeeo[k];
+        eee[k + 2] = eeee[1 - k] - eeeo[1 - k];
+    }
+
+    let mut ee = [0i32; 8];
+    for k in 0..4 {
+        ee[k] = eee[k] + eeo[k];
+        ee[k + 4] = eee[3 - k] - eeo[3 - k];
+    }
+
+    let mut e = [0i32; 16];
+    for k in 0..8 {
+        e[k] = ee[k] + eo[k];
+        e[k + 8] = ee[7 - k] - eo[7 - k];
+    }
+
+    for k in 0..16 {
+        dst[k] = round_shift_i32(e[k] + o[k], shift).clamp(output_min, output_max);
+        dst[k + 16] = round_shift_i32(e[15 - k] - o[15 - k], shift).clamp(output_min, output_max);
+    }
+}
+
+#[inline]
+fn inv_transform_32(
+    coeff: &[i32],
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+) {
+    debug_assert!(coeff.len() >= 32 * 32);
+    let shift1 = 7;
+    let shift2 = 20 - bit_depth as i32;
+    let mut col = [0i32; 32];
+    let mut transformed = [0i32; 32];
+
+    for c in 0..32 {
+        for r in 0..32 {
+            col[r] = coeff[r * 32 + c];
+        }
+        inv_transform_1d_32(&col, &mut transformed, shift1, -32768, 32767);
+        for r in 0..32 {
+            tmp[r * 32 + c] = transformed[r];
+        }
+    }
+
+    for r in 0..32 {
+        let src = &tmp[r * 32..r * 32 + 32];
+        let dst = &mut out[r * 32..r * 32 + 32];
+        inv_transform_1d_32(src, dst, shift2, i32::MIN, i32::MAX);
     }
 }
 
@@ -897,9 +1267,10 @@ mod tests {
         flat_is_dc_only(4);
         flat_is_dc_only(8);
         flat_is_dc_only(16);
+        flat_is_dc_only(32);
     }
 
-    /// Forward quantization: coeff → level. Returns a fixed 256-entry buffer.
+    /// Forward quantization: coeff → level. Returns a fixed 1024-entry buffer.
     fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; MAX_TB] {
         quantize_impl(coeff, n, qp, bit_depth, None)
     }
@@ -932,16 +1303,16 @@ mod tests {
 
     #[test]
     fn pipeline_roundtrip_low_qp() {
-        // Low QP → tight reconstruction for every size, including the new 16×16.
-        for &n in &[4usize, 8, 16] {
+        // Low QP → tight reconstruction for every supported transform size.
+        for &n in &[4usize, 8, 16, 32] {
             roundtrip_bounded(n, 4, 3.0);
         }
     }
 
     #[test]
     fn pipeline_roundtrip_scales_with_qp() {
-        // Error grows with QP but stays bounded; 16×16 must behave like 4/8.
-        for &n in &[4usize, 8, 16] {
+        // Error grows with QP but stays bounded across all transform sizes.
+        for &n in &[4usize, 8, 16, 32] {
             roundtrip_bounded(n, 22, 12.0);
         }
     }
@@ -957,6 +1328,44 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|&b| b), "scan does not cover all positions");
+    }
+
+    #[test]
+    fn t32_partial_butterfly_matches_matrix_transform() {
+        let mut residual = [0i32; MAX_TB];
+        for (i, value) in residual.iter_mut().enumerate() {
+            let mixed = (i as i32 * 73 + (i / 32) as i32 * 19) & 511;
+            *value = mixed - 256;
+        }
+
+        let mut expected = [0i32; MAX_TB];
+        fwd_transform_n::<32>(&residual, &T32, 8, &mut expected);
+        let actual = fwd_transform(&residual, 32, 8);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn t32_partial_butterfly_matches_sparse_inverse() {
+        let mut coeff = [0i32; MAX_TB];
+        for i in 0..MAX_TB {
+            if i % 7 != 0 {
+                coeff[i] = ((i as i32 * 41 + 17) & 1023) - 512;
+            }
+        }
+
+        let mut expected = [0i32; MAX_TB];
+        inv_transform_n::<32>(&coeff, &T32, 10, &mut expected);
+        let actual = inv_transform(&coeff, 32, 10);
+        assert_eq!(actual, expected);
+
+        // Exercise the sparse matrix fallback as well as the dense butterfly.
+        coeff.fill(0);
+        for (index, value) in [(0usize, 1200), (32, -900), (97, 700), (511, -300)] {
+            coeff[index] = value;
+        }
+        inv_transform_n::<32>(&coeff, &T32, 8, &mut expected);
+        let actual = inv_transform(&coeff, 32, 8);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1030,7 +1439,6 @@ mod tests {
         let scan = crate::dct::coeff_scan(2, 0);
         let mut levels = [0i16; MAX_TB];
         let mut coeff = [0i32; MAX_TB];
-        let delta_u = [0i32; MAX_TB];
 
         let (r0, c0) = scan[0];
         let (r4, c4) = scan[4];
@@ -1041,11 +1449,13 @@ mod tests {
         coeff[p0] = -100;
         coeff[p4] = 300;
 
-        sign_bit_hiding_hdq(&mut levels, &coeff, &delta_u, 4, scan);
+        sign_bit_hiding_hdq(&mut levels, &coeff, 4, scan, 22, 8, false);
 
-        assert_eq!(levels[p0], -1);
-        assert_eq!(levels[p4], 2);
-        let parity = levels[p0].unsigned_abs() as u32 + levels[p4].unsigned_abs() as u32;
+        assert_ne!(levels[p0], 0);
+        let parity: u32 = scan[..16]
+            .iter()
+            .map(|&(row, col)| levels[row * 4 + col].unsigned_abs() as u32)
+            .sum();
         assert_eq!((parity & 1) as i32, (levels[p0] < 0) as i32);
     }
 
@@ -1054,7 +1464,6 @@ mod tests {
         let scan = crate::dct::coeff_scan(3, 0);
         let mut levels = [0i16; MAX_TB];
         let mut coeff = [0i32; MAX_TB];
-        let delta_u = [0i32; MAX_TB];
 
         for group in 0..4 {
             let first = group * 16;
@@ -1069,7 +1478,7 @@ mod tests {
             coeff[p4] = 300;
         }
 
-        sign_bit_hiding_hdq(&mut levels, &coeff, &delta_u, 8, scan);
+        sign_bit_hiding_hdq(&mut levels, &coeff, 8, scan, 22, 8, false);
 
         for group in 0..4 {
             let start = group * 16;

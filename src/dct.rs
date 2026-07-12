@@ -168,6 +168,7 @@ pub(crate) fn coeff_scan(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize)
             2 => &DIAG_SCAN_4X4,
             3 => &ZIGZAG,
             4 => &ZIGZAG_16X16,
+            5 => &COEFF_SCAN_32_D,
             _ => panic!("unsupported transform size log2={log2_ts}"),
         };
     }
@@ -193,12 +194,13 @@ pub(crate) fn sb_scan_for(log2_ts: u32, scan_idx: u8) -> &'static [(usize, usize
         (4, 0) => &SB_SCAN_4_D,
         (4, 1) => &SB_SCAN_4_H,
         (4, 2) => &SB_SCAN_4_V,
+        (5, 0) => &SB_SCAN_8_D,
         _ => panic!("unsupported sb scan log2={log2_ts} idx={scan_idx}"),
     }
 }
 
-const fn raw_scan_const(blk: usize, scan_idx: u8) -> ([(usize, usize); 16], usize) {
-    let mut v = [(0usize, 0usize); 16];
+const fn raw_scan_const(blk: usize, scan_idx: u8) -> ([(usize, usize); 64], usize) {
+    let mut v = [(0usize, 0usize); 64];
     let mut i = 0;
     match scan_idx {
         1 => {
@@ -301,6 +303,7 @@ static COEFF_SCAN_8_H: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 1)
 static COEFF_SCAN_8_V: [(usize, usize); 64] = build_coeff_scan_const::<64>(3, 2);
 static COEFF_SCAN_16_H: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 1);
 static COEFF_SCAN_16_V: [(usize, usize); 256] = build_coeff_scan_const::<256>(4, 2);
+static COEFF_SCAN_32_D: [(usize, usize); 1024] = build_coeff_scan_const::<1024>(5, 0);
 
 static SB_SCAN_1: [(usize, usize); 1] = build_sb_scan_const::<1>(2, 0);
 static SB_SCAN_2_D: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 0);
@@ -309,6 +312,7 @@ static SB_SCAN_2_V: [(usize, usize); 4] = build_sb_scan_const::<4>(3, 2);
 static SB_SCAN_4_D: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 0);
 static SB_SCAN_4_H: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 1);
 static SB_SCAN_4_V: [(usize, usize); 16] = build_sb_scan_const::<16>(4, 2);
+static SB_SCAN_8_D: [(usize, usize); 64] = build_sb_scan_const::<64>(5, 0);
 
 #[cfg(test)]
 fn build_coeff_scan(log2_ts: u32, scan_idx: u8) -> Vec<(usize, usize)> {
@@ -361,6 +365,7 @@ mod scan_tests {
         assert_eq!(&COEFF_SCAN_8_V[..], &build_coeff_scan(3, 2)[..]);
         assert_eq!(&COEFF_SCAN_16_H[..], &build_coeff_scan(4, 1)[..]);
         assert_eq!(&COEFF_SCAN_16_V[..], &build_coeff_scan(4, 2)[..]);
+        assert_eq!(&COEFF_SCAN_32_D[..], &build_coeff_scan(5, 0)[..]);
         assert_eq!(&SB_SCAN_1[..], &build_sb_scan(2, 0)[..]);
         assert_eq!(&SB_SCAN_2_D[..], &build_sb_scan(3, 0)[..]);
         assert_eq!(&SB_SCAN_2_H[..], &build_sb_scan(3, 1)[..]);
@@ -368,6 +373,7 @@ mod scan_tests {
         assert_eq!(&SB_SCAN_4_D[..], &build_sb_scan(4, 0)[..]);
         assert_eq!(&SB_SCAN_4_H[..], &build_sb_scan(4, 1)[..]);
         assert_eq!(&SB_SCAN_4_V[..], &build_sb_scan(4, 2)[..]);
+        assert_eq!(&SB_SCAN_8_D[..], &build_sb_scan(5, 0)[..]);
     }
     #[test]
     fn scan_idx_selection() {
@@ -375,6 +381,7 @@ mod scan_tests {
         assert_eq!(scan_idx_for(6, 3, true, false), 2); // mode 6 vertical (8x8 luma)
         assert_eq!(scan_idx_for(26, 3, true, false), 1); // mode 26 horizontal
         assert_eq!(scan_idx_for(6, 4, true, false), 0); // 16x16 always diagonal
+        assert_eq!(scan_idx_for(26, 5, true, false), 0); // 32x32 always diagonal
         assert_eq!(scan_idx_for(26, 2, false, false), 1); // 4x4 chroma mode-dependent
         assert_eq!(scan_idx_for(6, 3, false, false), 0); // 8x8 chroma non-444: diagonal
         assert_eq!(scan_idx_for(6, 3, false, true), 2); // 8x8 chroma 4:4:4: mode-dependent

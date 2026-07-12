@@ -177,7 +177,7 @@ pub(crate) trait CabacWriter {
 /// Fast fractional-bit CABAC sink. It updates context states exactly like the
 /// arithmetic coder, but bypass bins simply add one bit and no output is
 /// generated. This is the normal hot-path model for encoder mode RDO.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct CabacEstimator {
     bits: f32,
 }

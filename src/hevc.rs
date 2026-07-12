@@ -29,8 +29,8 @@
 
 use crate::{
     cabac::{
-        CabacEncoder, ContextSet, IntraModeContexts, encode_cbf_chroma, encode_cbf_luma,
-        encode_residual, estimate_residual_bits,
+        CabacEncoder, CabacWriter, ContextSet, IntraModeContexts, encode_cbf_chroma,
+        encode_cbf_luma, encode_residual, estimate_residual_bits,
     },
     dct,
     error::EncodeError,
@@ -378,9 +378,11 @@ pub(crate) fn build_sps(
     bw.write_bit(false); // long_term_ref_pics_present_flag
     bw.write_bit(true); // sps_temporal_mvp_enabled_flag = 1 (matches x265; no effect
     // on I-slice parsing but kept identical to x265's SPS)
-    bw.write_bit(true); // strong_intra_smoothing_enabled_flag = 1 (matches x265;
-    // only affects 32×32 intra which we don't use, so output
-    // is unchanged)
+    // Keep strong intra smoothing disabled: the encoder's 32×32 predictor uses
+    // the normative regular [1 2 1] reference filter, so the decoder must do
+    // the same. Enabling this flag without the strong-smoothing eligibility test
+    // would make encoder and decoder predictions diverge.
+    bw.write_bit(false); // strong_intra_smoothing_enabled_flag
 
     // VUI parameters: colour info so decoders display correctly
     bw.write_bit(true); // vui_parameters_present_flag
@@ -551,12 +553,6 @@ fn build_idr_slice(
     // by sub_w horizontally and sub_h vertically (4:2:0 → /2,/2; 4:2:2 → /2,/1).
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
-    // Per 16×16 node, choose between one 16×16 CU and four 8×8 CUs by RD cost.
-    // Offered for 4:2:0 only (the validated chroma TB → 8×8 path).
-    let rd16 = matches!(
-        yuv.chroma,
-        crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
-    );
     let w = ((width + 63) & !63) as usize;
     let h = ((height + 63) & !63) as usize;
     let cw = w / sub_w;
@@ -598,21 +594,23 @@ fn build_idr_slice(
     hdr.rbsp_trailing_bits();
     let header_bytes = hdr.finish();
 
-    // HEVC slice_segment_data(): for each CTU row-major:
-    //   coding_tree_unit()  → luma 8×8 CU + chroma 4×4 CU×2
-    //   end_of_slice_segment_flag (terminate = 0 or 1)
+    // HEVC slice_segment_data(): each CTU carries a recursively selected
+    // 32→16→8 intra CU tree followed by end_of_slice_segment_flag.
     let qp: u8 = qp_val;
     let mut cab = CabacEncoder::new();
     let mut ctx = ContextSet::init_islice(qp);
     let mut ictx = IntraModeContexts::init_islice(qp);
     // HM-style intra Lagrange multiplier for J = SSE + λ·R (R in bits).
     let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
-    // Per-8×8-block quadtree depth (2 = covered by a 16×16 CU, 3 = an 8×8 CU);
-    // drives the 16-level split_cu_flag context (depends on neighbour depths).
+    // Per-8×8-block quadtree depth (1/2/3 for 32/16/8 leaves); drives the
+    // split_cu_flag context from the depths of the left and above neighbours.
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
     // Per-8×8-block luma intra mode (for neighbour MPM derivation).
     let blk_stride = w / 8;
     let mut mode_map = vec![0u8; (w / 8) * (h / 8)];
+    // One reusable work area per independently encoded slice/tile. Boxing the
+    // aggregate keeps the large 32×32 buffers out of the call stack.
+    let mut scratch = Box::new(CompressionContext::new());
 
     // Padded reconstruction buffers (prediction uses coded dimensions). Monochrome
     // has no chroma planes.
@@ -626,290 +624,74 @@ fn build_idr_slice(
         )
     };
 
-    // CTB grid: full 64×64 CTBs over the 64-multiple coded picture (no partial
-    // boundary CTBs — the SPS declares the 64-multiple size and the conformance
-    // window crops the padding). Each CTB: 64→32→16→8 quadtree, 64 leaf 8×8 CUs.
+    // CTB grid: full 64×64 CTBs over the padded coded picture. The 64×64
+    // root is necessarily split because this encoder currently maps one TU to
+    // each leaf CU and HEVC limits a TU to 32×32. The representable 32→16→8
+    // subtree is selected by a QP-aware source proxy and then encoded once.
     let ctb_size_y = 64usize;
-    let ctb_size_c = 32usize;
-    let cu_size_y = 8usize;
-    let cu_size_c = 4usize;
     let ctus_x = w / ctb_size_y;
     let ctus_y = h / ctb_size_y;
     let total_ctus = ctus_x * ctus_y;
+    let strides = PlaneStrides {
+        w,
+        src_yw,
+        src_yh,
+        cw,
+        src_cw,
+        src_ch,
+        sub_w,
+        sub_h,
+    };
     let mut ctu_idx = 0usize;
 
     for ctu_row in 0..ctus_y {
         for ctu_col in 0..ctus_x {
             let lu_row0 = ctu_row * ctb_size_y;
             let lu_col0 = ctu_col * ctb_size_y;
-            let ch_row0 = ctu_row * ctb_size_c;
-            let ch_col0 = ctu_col * ctb_size_c;
 
-            // ── sao() — SPS enables SAO and the slice SAO flags are set, so each
-            // CTB must carry SAO syntax. We signal SAO OFF everywhere:
-            //   sao_merge_left_flag = 0 (when left CTB available)
-            //   sao_merge_up_flag   = 0 (when up CTB available, not merged left)
-            //   then sao_type_idx_luma = 0 and sao_type_idx_chroma = 0 (both OFF).
-            // sao_type_idx is coded as: first bin context-coded, and value 0 means
-            // "not applied" (a single 0 bin). With type_idx=0 no further SAO syntax
-            // follows, so reconstruction is identical to SAO-disabled.
+            // SAO is enabled in the SPS/slice but explicitly disabled per CTU.
             if ctu_col > 0 {
-                cab.encode_bin(0, &mut ctx.sao_merge_flag); // sao_merge_left_flag = 0
+                cab.encode_bin(0, &mut ctx.sao_merge_flag);
             }
             if ctu_row > 0 {
-                cab.encode_bin(0, &mut ctx.sao_merge_flag); // sao_merge_up_flag = 0
+                cab.encode_bin(0, &mut ctx.sao_merge_flag);
             }
-            // sao_type_idx_luma = 0 (OFF): single context-coded 0 bin.
             cab.encode_bin(0, &mut ctx.sao_type_idx);
-            // sao_type_idx_chroma — only present when ChromaArrayType != 0.
             if !yuv.chroma.is_monochrome() {
-                cab.encode_bin(0, &mut ctx.sao_type_idx); // sao_type_idx_chroma = 0 (OFF)
+                cab.encode_bin(0, &mut ctx.sao_type_idx);
             }
 
-            let cl0 = if ctu_col > 0 { 1 } else { 0 };
-            let ca0 = if ctu_row > 0 { 1 } else { 0 };
-            cab.encode_bin(1, &mut ctx.split_cu_flag[cl0 + ca0]);
+            // The 64×64 root cannot be a leaf until the encoder has a 64-CU /
+            // four-32-TU transform-tree path, so signal the root split and select
+            // a fast 32→16→8 plan for each representable child.
+            let root_ctx = (ctu_col > 0) as usize + (ctu_row > 0) as usize;
+            cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
 
-            for (q1y, q1x) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                let l1_lu_r = lu_row0 + q1y * 32;
-                let l1_lu_c = lu_col0 + q1x * 32;
-                let l1_ch_r = ch_row0 + q1y * 16;
-                let l1_ch_c = ch_col0 + q1x * 16;
-
-                let cl1 = if q1x > 0 || ctu_col > 0 { 1 } else { 0 };
-                let ca1 = if q1y > 0 || ctu_row > 0 { 1 } else { 0 };
-                cab.encode_bin(1, &mut ctx.split_cu_flag[cl1 + ca1]);
-
-                for (q2y, q2x) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                    let l2_lu_r = l1_lu_r + q2y * 16;
-                    let l2_lu_c = l1_lu_c + q2x * 16;
-                    let l2_ch_r = l1_ch_r + q2y * 8;
-                    let l2_ch_c = l1_ch_c + q2x * 8;
-
-                    let cl2 = if q2x > 0 || q1x > 0 || ctu_col > 0 {
-                        1
-                    } else {
-                        0
-                    };
-                    let ca2 = if q2y > 0 || q1y > 0 || ctu_row > 0 {
-                        1
-                    } else {
-                        0
-                    };
-                    let _ = (cl2, ca2, l2_ch_r, l2_ch_c, cu_size_c); // superseded by RD + depth ctx
-                    // split_cu_flag ctxInc = (left CU deeper than this depth-2 node)
-                    // + (above CU deeper), read from the per-block depth map.
-                    let bx = w / cu_size_y;
-                    let cond_l = l2_lu_c > 0
-                        && cu_depth[(l2_lu_r / cu_size_y) * bx + (l2_lu_c - 1) / cu_size_y] > 2;
-                    let cond_a = l2_lu_r > 0
-                        && cu_depth[((l2_lu_r - 1) / cu_size_y) * bx + l2_lu_c / cu_size_y] > 2;
-                    let split_ctx = cond_l as usize + cond_a as usize;
-
-                    let strides8 = PlaneStrides {
-                        w,
-                        src_yw,
-                        src_yh,
-                        cw,
-                        src_cw,
-                        src_ch,
-                        sub_w,
-                        sub_h,
-                    };
-                    let l2_ch_rr = l2_lu_r / sub_h;
-                    let l2_ch_cc = l2_lu_c / sub_w;
-
-                    // Choose 16×16 vs four 8×8 by RD cost J = SSE + λ·bits. Both
-                    // trials run in place on the real coder using cheap snapshots
-                    // (scalar state + output length) rather than cloning the whole
-                    // CABAC output buffer. Trial A's appended output bytes are saved
-                    // so the region can be restored if the 16×16 trial wins (trial B
-                    // rolls back to the pre-trial state and overwrites the region).
-                    let mut chose_16 = false;
-                    if rd16 {
-                        // RD trials run in place on the real coder. The CABAC
-                        // output buffer only grows by appending, so each trial is
-                        // bounded by a cheap snapshot (scalar state + buffer length)
-                        // and rolled back by truncating — no output-buffer clone.
-                        // The context sets are small fixed stack arrays, so cloning
-                        // them per trial costs no heap traffic.
-                        let base_bits = cab.flushed_bits();
-                        let base_snap = cab.snapshot();
-                        let base_ctx = ctx.clone();
-                        let base_ictx = ictx.clone();
-
-                        // Trial A — single 16×16 CU (encoded in place).
-                        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
-                        code_one_cu(
-                            Entropy {
-                                enc: &mut cab,
-                                ctx: &mut ctx,
-                                ictx: &mut ictx,
-                            },
-                            yuv,
-                            &mut rec_y,
-                            &mut rec_cb,
-                            &mut rec_cr,
-                            l2_lu_r,
-                            l2_lu_c,
-                            16,
-                            strides8,
-                            qp,
-                            lambda,
-                            &mut mode_map,
-                            blk_stride,
-                            lossless,
-                        );
-                        let d_a = region_sse(
-                            yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
-                            strides8,
-                        );
-                        let bits_a = cab.flushed_bits().saturating_sub(base_bits) as f32;
-
-                        // Snapshot trial A's coder + context so the winner can be
-                        // restored after trial B overwrites them. Trial B is encoded
-                        // by rolling the coder back to `base_snap` and re-running in
-                        // place, which truncates away the output bytes trial A
-                        // appended. Those bytes cannot be recovered by a later
-                        // truncate (trial B may be shorter), so save trial A's
-                        // output tail (one CU's worth) to splice back if A wins.
-                        let a_snap = cab.snapshot();
-                        let a_ctx = ctx.clone();
-                        let a_ictx = ictx.clone();
-                        let a_tail: Vec<u8> = cab.output[base_snap.output_len()..].to_vec();
-
-                        // Snapshot trial A's reconstruction + mode_map for the region
-                        // (16×16 luma, 8×8 chroma, 2×2 mode-map blocks).
-                        let mut sa_y = [0u16; 256];
-                        let mut sa_cb = [0u16; 64];
-                        let mut sa_cr = [0u16; 64];
-                        let mut sa_mode = [0u8; 4];
-                        for r in 0..16 {
-                            let o = (l2_lu_r + r) * w + l2_lu_c;
-                            sa_y[r * 16..r * 16 + 16].copy_from_slice(&rec_y[o..o + 16]);
-                        }
-                        if !yuv.chroma.is_monochrome() {
-                            for r in 0..8 {
-                                let o = (l2_ch_rr + r) * cw + l2_ch_cc;
-                                sa_cb[r * 8..r * 8 + 8].copy_from_slice(&rec_cb[o..o + 8]);
-                                sa_cr[r * 8..r * 8 + 8].copy_from_slice(&rec_cr[o..o + 8]);
-                            }
-                        }
-                        for br in 0..2 {
-                            for bc in 0..2 {
-                                sa_mode[br * 2 + bc] = mode_map
-                                    [((l2_lu_r / 8) + br) * blk_stride + (l2_lu_c / 8) + bc];
-                            }
-                        }
-
-                        // Trial B — four 8×8 CUs. Roll the coder + contexts back to
-                        // the pre-trial state and re-encode in place.
-                        cab.restore(&base_snap);
-                        ctx = base_ctx;
-                        ictx = base_ictx;
-                        cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
-                        for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                            code_one_cu(
-                                Entropy {
-                                    enc: &mut cab,
-                                    ctx: &mut ctx,
-                                    ictx: &mut ictx,
-                                },
-                                yuv,
-                                &mut rec_y,
-                                &mut rec_cb,
-                                &mut rec_cr,
-                                l2_lu_r + dy * cu_size_y,
-                                l2_lu_c + dx * cu_size_y,
-                                8,
-                                strides8,
-                                qp,
-                                lambda,
-                                &mut mode_map,
-                                blk_stride,
-                                lossless,
-                            );
-                        }
-                        let d_b = region_sse(
-                            yuv, &rec_y, &rec_cb, &rec_cr, l2_lu_r, l2_lu_c, l2_ch_rr, l2_ch_cc,
-                            strides8,
-                        );
-                        let bits_b = cab.flushed_bits().saturating_sub(base_bits) as f32;
-
-                        chose_16 = d_a + lambda * bits_a <= d_b + lambda * bits_b;
-                        if chose_16 {
-                            // Restore trial A's reconstruction + mode_map (trial B
-                            // overwrote the region) and adopt trial A's coder state.
-                            for r in 0..16 {
-                                let o = (l2_lu_r + r) * w + l2_lu_c;
-                                rec_y[o..o + 16].copy_from_slice(&sa_y[r * 16..r * 16 + 16]);
-                            }
-                            if !yuv.chroma.is_monochrome() {
-                                for r in 0..8 {
-                                    let o = (l2_ch_rr + r) * cw + l2_ch_cc;
-                                    rec_cb[o..o + 8].copy_from_slice(&sa_cb[r * 8..r * 8 + 8]);
-                                    rec_cr[o..o + 8].copy_from_slice(&sa_cr[r * 8..r * 8 + 8]);
-                                }
-                            }
-                            for br in 0..2 {
-                                for bc in 0..2 {
-                                    mode_map
-                                        [((l2_lu_r / 8) + br) * blk_stride + (l2_lu_c / 8) + bc] =
-                                        sa_mode[br * 2 + bc];
-                                    cu_depth[((l2_lu_r / cu_size_y) + br) * bx
-                                        + (l2_lu_c / cu_size_y)
-                                        + bc] = 2;
-                                }
-                            }
-                            cab.reinstate_tail(&base_snap, &a_tail);
-                            cab.restore(&a_snap);
-                            ctx = a_ctx;
-                            ictx = a_ictx;
-                        } else {
-                            // Trial B's reconstruction + mode_map + coder already in place.
-                            for br in 0..2 {
-                                for bc in 0..2 {
-                                    cu_depth[((l2_lu_r / cu_size_y) + br) * bx
-                                        + (l2_lu_c / cu_size_y)
-                                        + bc] = 3;
-                                }
-                            }
-                        }
-                    } else {
-                        // 4:2:2 / 4:4:4: always four 8×8 CUs (no 16×16 trial).
-                        cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
-                        for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                            code_one_cu(
-                                Entropy {
-                                    enc: &mut cab,
-                                    ctx: &mut ctx,
-                                    ictx: &mut ictx,
-                                },
-                                yuv,
-                                &mut rec_y,
-                                &mut rec_cb,
-                                &mut rec_cr,
-                                l2_lu_r + dy * cu_size_y,
-                                l2_lu_c + dx * cu_size_y,
-                                8,
-                                strides8,
-                                qp,
-                                lambda,
-                                &mut mode_map,
-                                blk_stride,
-                                lossless,
-                            );
-                        }
-                        for br in 0..2 {
-                            for bc in 0..2 {
-                                cu_depth[((l2_lu_r / cu_size_y) + br) * bx
-                                    + (l2_lu_c / cu_size_y)
-                                    + bc] = 3;
-                            }
-                        }
-                    }
-                    let _ = chose_16;
-                }
+            let mut tree = CuTreeState {
+                yuv,
+                rec_y: &mut rec_y,
+                rec_cb: &mut rec_cb,
+                rec_cr: &mut rec_cr,
+                strides,
+                qp,
+                lambda,
+                mode_map: &mut mode_map,
+                cu_depth: &mut cu_depth,
+                blk_stride,
+                lossless,
+                scratch: &mut *scratch,
+            };
+            for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                let row = lu_row0 + dy * 32;
+                let col = lu_col0 + dx * 32;
+                // Structural selection is intentionally source-only. The former
+                // reconstructed branch search encoded both alternatives with scalar
+                // quantization and then encoded the selected tree again, making the
+                // "fast" quadtree cost more than a second complete encode. This
+                // QP-aware proxy scans the source only and the chosen tree is coded
+                // exactly once with the normal mode RDO and winner-only RDOQ.
+                let plan = fast_cu32_plan(&tree, row, col);
+                commit_cu32_plan(&mut cab, &mut ctx, &mut ictx, &mut tree, row, col, 1, plan);
             }
 
             let is_last_ctu = ctu_idx == total_ctus - 1;
@@ -979,7 +761,7 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
     out
 }
 
-/// Encode one 8×8 luma CU + paired 4×4 chroma TUs (Cb+Cr).
+/// Encode one intra CU and its format-dependent chroma transform blocks.
 ///
 /// HEVC intra CU syntax per §7.3.8.5/8.6/8.11:
 ///   [luma intra mode] [chroma intra mode] [cbf_cb] [cbf_cr] [cbf_luma]
@@ -990,48 +772,56 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
 /// Sum of absolute 4×4 Hadamard-transformed differences over an N×N block —
 /// the standard fast distortion proxy for intra mode decision (correlates with
 /// post-transform coded cost far better than raw SAD).
+#[inline]
 fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     let mut total = 0u32;
-    let mut d = [0i32; 16];
-    for by in (0..n).step_by(4) {
+    let mut diff = [0i32; 16];
+    let active = n * n;
+
+    for (orig_band, pred_band) in orig[..active]
+        .chunks_exact(n * 4)
+        .zip(pred[..active].chunks_exact(n * 4))
+    {
         for bx in (0..n).step_by(4) {
-            for r in 0..4 {
-                let row = (by + r) * n + bx;
-                let o = &orig[row..row + 4];
-                let p = &pred[row..row + 4];
-                let dr = &mut d[r * 4..r * 4 + 4];
-                for c in 0..4 {
-                    dr[c] = o[c] as i32 - p[c] as i32;
+            for ((dst_row, orig_row), pred_row) in diff
+                .chunks_exact_mut(4)
+                .zip(orig_band.chunks_exact(n))
+                .zip(pred_band.chunks_exact(n))
+            {
+                for ((dst, &orig), &pred) in dst_row
+                    .iter_mut()
+                    .zip(&orig_row[bx..bx + 4])
+                    .zip(&pred_row[bx..bx + 4])
+                {
+                    *dst = orig as i32 - pred as i32;
                 }
             }
-            // rows
-            for r in 0..4 {
-                let o = r * 4;
-                let a0 = d[o] + d[o + 2];
-                let a1 = d[o + 1] + d[o + 3];
-                let a2 = d[o] - d[o + 2];
-                let a3 = d[o + 1] - d[o + 3];
-                d[o] = a0 + a1;
-                d[o + 1] = a0 - a1;
-                d[o + 2] = a2 + a3;
-                d[o + 3] = a2 - a3;
+
+            for row in diff.chunks_exact_mut(4) {
+                let a0 = row[0] + row[2];
+                let a1 = row[1] + row[3];
+                let a2 = row[0] - row[2];
+                let a3 = row[1] - row[3];
+                row[0] = a0 + a1;
+                row[1] = a0 - a1;
+                row[2] = a2 + a3;
+                row[3] = a2 - a3;
             }
-            // cols
-            for c in 0..4 {
-                let a0 = d[c] + d[8 + c];
-                let a1 = d[4 + c] + d[12 + c];
-                let a2 = d[c] - d[8 + c];
-                let a3 = d[4 + c] - d[12 + c];
-                d[c] = a0 + a1;
-                d[4 + c] = a0 - a1;
-                d[8 + c] = a2 + a3;
-                d[12 + c] = a2 - a3;
+            for col in 0..4 {
+                let a0 = diff[col] + diff[8 + col];
+                let a1 = diff[4 + col] + diff[12 + col];
+                let a2 = diff[col] - diff[8 + col];
+                let a3 = diff[4 + col] - diff[12 + col];
+                diff[col] = a0 + a1;
+                diff[4 + col] = a0 - a1;
+                diff[8 + col] = a2 + a3;
+                diff[12 + col] = a2 - a3;
             }
-            let mut s = 0u32;
-            for &v in d.iter() {
-                s += v.unsigned_abs();
-            }
-            total += s.div_ceil(2);
+            total += diff
+                .iter()
+                .map(|value| value.unsigned_abs())
+                .sum::<u32>()
+                .div_ceil(2);
         }
     }
     total
@@ -1056,7 +846,9 @@ fn update_intra_candidate(candidates: &mut [IntraModeCandidate], mode: u8, cost:
     else {
         return;
     };
-    candidates.copy_within(pos..candidates.len() - 1, pos + 1);
+    for index in (pos + 1..candidates.len()).rev() {
+        candidates[index] = candidates[index - 1];
+    }
     candidates[pos] = IntraModeCandidate { mode, cost };
 }
 
@@ -1085,6 +877,7 @@ fn push_sorted_unique_candidate(
     len: &mut usize,
     candidate: IntraModeCandidate,
 ) {
+    debug_assert!(*len < candidates.len());
     if candidates[..*len]
         .iter()
         .any(|entry| entry.mode == candidate.mode)
@@ -1095,7 +888,9 @@ fn push_sorted_unique_candidate(
         .iter()
         .position(|entry| candidate.cost < entry.cost)
         .unwrap_or(*len);
-    candidates.copy_within(pos..*len, pos + 1);
+    for index in (pos..*len).rev() {
+        candidates[index + 1] = candidates[index];
+    }
     candidates[pos] = candidate;
     *len += 1;
 }
@@ -1118,7 +913,12 @@ fn full_rdo_candidate_count(candidates: &[IntraModeCandidate], lu: usize) -> usi
     count
 }
 
-fn encode_luma_mode(enc: &mut CabacEncoder, ictx: &mut IntraModeContexts, mode: u8, mpm: &[u8; 3]) {
+fn encode_luma_mode<W: CabacWriter>(
+    enc: &mut W,
+    ictx: &mut IntraModeContexts,
+    mode: u8,
+    mpm: &[u8; 3],
+) {
     if let Some(idx) = mpm.iter().position(|&candidate| candidate == mode) {
         enc.encode_bin(1, &mut ictx.prev_intra_luma_pred_flag);
         // mpm_idx TR(cMax=2) bypass: 0→"0", 1→"10", 2→"11".
@@ -1268,8 +1068,8 @@ struct CuGeometry {
 /// coding functions take one argument instead of three. Holds mutable borrows
 /// so callers keep ownership (the RD trials clone the underlying objects and
 /// build a fresh bundle per trial).
-struct Entropy<'a> {
-    enc: &'a mut CabacEncoder,
+struct Entropy<'a, W: CabacWriter> {
+    enc: &'a mut W,
     ctx: &'a mut ContextSet,
     ictx: &'a mut IntraModeContexts,
 }
@@ -1291,7 +1091,7 @@ struct CuParams {
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    /// Luma CU/TU size: 8 (the min CB) or 16. Drives part_mode presence, the
+    /// Luma CU/TU size: 8, 16, or 32. Drives part_mode presence, the
     /// luma scan/transform size, and the chroma TB size.
     lu: usize,
     /// Frame-constant intra RD multiplier, precomputed once from the slice QP.
@@ -1299,6 +1099,71 @@ struct CuParams {
     /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`
     /// and store the prediction residual verbatim (no transform/quantization).
     lossless: bool,
+}
+
+struct ChromaTb {
+    cb_zz: [i16; 1024],
+    cb_nz: bool,
+    cr_zz: [i16; 1024],
+    cr_nz: bool,
+}
+
+impl ChromaTb {
+    const fn new() -> Self {
+        Self {
+            cb_zz: [0; 1024],
+            cb_nz: false,
+            cr_zz: [0; 1024],
+            cr_nz: false,
+        }
+    }
+}
+
+/// Per-slice reusable working set for CU prediction, transform and RDO. Keeping
+/// the largest 32×32 buffers in one heap allocation removes repeated stack
+/// zeroing and return-value memmoves from every mode/CU while remaining safe and
+/// naturally private to each parallel tile encoder.
+#[repr(align(64))]
+struct CompressionContext {
+    orig: [u16; 1024],
+    pred: [u16; 1024],
+    best_pred: [u16; 1024],
+    reconstructed: [u16; 1024],
+    residual: [i32; 1024],
+    best_residual: [i32; 1024],
+    coeff: [i32; 1024],
+    best_coeff: [i32; 1024],
+    dequant: [i32; 1024],
+    inverse: [i32; 1024],
+    transform_tmp: [i32; 1024],
+    levels: [i16; 1024],
+    scanned: [i16; 1024],
+    angular: intra::AngularScratch,
+    chroma_tbs: [ChromaTb; 2],
+    rdoq: crate::hevc_transform::RdoqScratch,
+}
+
+impl CompressionContext {
+    fn new() -> Self {
+        Self {
+            orig: [0; 1024],
+            pred: [0; 1024],
+            best_pred: [0; 1024],
+            reconstructed: [0; 1024],
+            residual: [0; 1024],
+            best_residual: [0; 1024],
+            coeff: [0; 1024],
+            best_coeff: [0; 1024],
+            dequant: [0; 1024],
+            inverse: [0; 1024],
+            transform_tmp: [0; 1024],
+            levels: [0; 1024],
+            scanned: [0; 1024],
+            angular: intra::AngularScratch::new(),
+            chroma_tbs: [ChromaTb::new(), ChromaTb::new()],
+            rdoq: crate::hevc_transform::RdoqScratch::new(),
+        }
+    }
 }
 
 /// Coded and source plane dimensions for a frame, shared by the per-CU coding
@@ -1317,13 +1182,316 @@ struct PlaneStrides {
     sub_h: usize,
 }
 
-fn encode_cu(
-    ent: Entropy<'_>,
+/// Mutable picture state shared by recursive CU decisions. All maps are indexed
+/// on the SPS minimum-CU (8×8 luma) grid.
+struct CuTreeState<'a> {
+    yuv: &'a Yuv,
+    rec_y: &'a mut [u16],
+    rec_cb: &'a mut [u16],
+    rec_cr: &'a mut [u16],
+    strides: PlaneStrides,
+    qp: u8,
+    lambda: f32,
+    mode_map: &'a mut [u8],
+    cu_depth: &'a mut [u8],
+    blk_stride: usize,
+    lossless: bool,
+    scratch: &'a mut CompressionContext,
+}
+
+#[inline]
+fn split_cu_context(depths: &[u8], row: usize, col: usize, depth: u8, stride: usize) -> usize {
+    let br = row / 8;
+    let bc = col / 8;
+    let left_deeper = bc > 0 && depths[br * stride + bc - 1] > depth;
+    let above_deeper = br > 0 && depths[(br - 1) * stride + bc] > depth;
+    left_deeper as usize + above_deeper as usize
+}
+
+#[inline]
+fn fill_cu_depth(depths: &mut [u8], row: usize, col: usize, size: usize, depth: u8, stride: usize) {
+    let side = size / 8;
+    let br0 = row / 8;
+    let bc0 = col / 8;
+    for r in 0..side {
+        depths[(br0 + r) * stride + bc0..(br0 + r) * stride + bc0 + side].fill(depth);
+    }
+}
+
+#[inline]
+fn encode_cu_leaf(
+    cab: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    state: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    size: usize,
+    depth: u8,
+) {
+    code_one_cu(
+        Entropy {
+            enc: cab,
+            ctx,
+            ictx,
+        },
+        state.yuv,
+        &mut *state.rec_y,
+        &mut *state.rec_cb,
+        &mut *state.rec_cr,
+        row,
+        col,
+        size,
+        state.strides,
+        state.qp,
+        state.lambda,
+        &mut *state.mode_map,
+        state.blk_stride,
+        state.lossless,
+        &mut *state.scratch,
+    );
+    fill_cu_depth(
+        &mut *state.cu_depth,
+        row,
+        col,
+        size,
+        depth,
+        state.blk_stride,
+    );
+}
+
+/// Source-only split proxy. `score >= 1` means the expected prediction
+/// improvement is large enough to pay for the extra CU syntax at the current QP.
+/// It is deliberately not a second encoder: no prediction buffers, transforms,
+/// quantization, reconstruction, CABAC contexts, or rollback are touched here.
+#[inline]
+fn fast_cu_split_score(state: &CuTreeState<'_>, row: usize, col: usize, size: usize) -> f32 {
+    let shift = state.yuv.bit_depth.bits().saturating_sub(8) as u32;
+    let half = size / 2;
+    let mut sum = 0u64;
+    let mut sum_sq = 0u64;
+    let mut q_sum = [0u64; 4];
+    let mut q_sum_sq = [0u64; 4];
+    let mut min_sample = u16::MAX;
+    let mut max_sample = 0u16;
+    let mut grad_sum = 0u64;
+    let mut signed_grad_x = 0i64;
+    let mut signed_grad_y = 0i64;
+    let mut midline_sse = 0u64;
+
+    for r in 0..size {
+        let sy = (row + r).min(state.strides.src_yh - 1);
+        for c in 0..size {
+            let sx = (col + c).min(state.strides.src_yw - 1);
+            let sample = state.yuv.y[sy * state.strides.src_yw + sx] >> shift;
+            let v = sample as u64;
+            sum += v;
+            sum_sq += v * v;
+            min_sample = min_sample.min(sample);
+            max_sample = max_sample.max(sample);
+            let q = (r >= half) as usize * 2 + (c >= half) as usize;
+            q_sum[q] += v;
+            q_sum_sq[q] += v * v;
+
+            if c > 0 {
+                let left_x = (col + c - 1).min(state.strides.src_yw - 1);
+                let left = state.yuv.y[sy * state.strides.src_yw + left_x] >> shift;
+                let diff = sample as i32 - left as i32;
+                grad_sum += diff.unsigned_abs() as u64;
+                signed_grad_x += diff as i64;
+                if c == half {
+                    midline_sse += (diff * diff) as u64;
+                }
+            }
+            if r > 0 {
+                let above_y = (row + r - 1).min(state.strides.src_yh - 1);
+                let above = state.yuv.y[above_y * state.strides.src_yw + sx] >> shift;
+                let diff = sample as i32 - above as i32;
+                grad_sum += diff.unsigned_abs() as u64;
+                signed_grad_y += diff as i64;
+                if r == half {
+                    midline_sse += (diff * diff) as u64;
+                }
+            }
+        }
+    }
+
+    let pixels = (size * size) as f32;
+    let mean = sum as f32 / pixels;
+    let variance = (sum_sq as f32 / pixels - mean * mean).max(0.0);
+    let q_pixels = (half * half) as f32;
+    let mut within_variance = 0.0f32;
+    for q in 0..4 {
+        let q_mean = q_sum[q] as f32 / q_pixels;
+        within_variance += (q_sum_sq[q] as f32 / q_pixels - q_mean * q_mean).max(0.0);
+    }
+    within_variance *= 0.25;
+
+    let range = max_sample - min_sample;
+    let qp = state.qp as f32;
+    let flat_range = 2 + (state.qp / 18) as u16;
+    let flat_variance = 1.5 + qp * 0.12;
+    if range <= flat_range && variance <= flat_variance {
+        return 0.0;
+    }
+
+    // Splitting can mainly recover the energy between quadrant means. Uniform
+    // ramps also have large between-quadrant energy, but a single angular mode
+    // predicts them well; gradient coherence discounts that false split signal.
+    // A sharp edge crossing the split boundary is handled separately by the
+    // midline term, so coherent step edges are not incorrectly suppressed.
+    let between_energy = (variance - within_variance).max(0.0) * pixels;
+    let coherence = if grad_sum == 0 {
+        1.0
+    } else {
+        ((signed_grad_x.unsigned_abs() + signed_grad_y.unsigned_abs()) as f32 / grad_sum as f32)
+            .min(1.0)
+    };
+    let incoherent = 1.0 - coherence;
+    let predicted_gain = between_energy * incoherent * incoherent
+        + midline_sse as f32 * if size == 32 { 0.35 } else { 0.50 };
+
+    // Four children add three extra CU headers/modes plus more CBF/residual
+    // signalling. Lambda already carries the QP dependence, while the larger
+    // penalty at 16×16 avoids exploding into 8×8 CUs for mild texture.
+    let extra_bits = if size == 32 { 52.0 } else { 76.0 };
+    // Measurements above are normalized to 8-bit. Scale the rate term into
+    // that same domain; the committed encoder compares raw-domain SSE, whose
+    // magnitude grows by 4^shift for every extra source bit.
+    let distortion_scale = (1u32 << (2 * shift)) as f32;
+    let lambda = (if state.lossless {
+        state.lambda.max(1.0)
+    } else {
+        state.lambda
+    }) / distortion_scale;
+    let rate_penalty = (lambda * extra_bits).max(1.0 / distortion_scale);
+    let mut score = predicted_gain / rate_penalty;
+
+    // Strong incoherent local texture is a reliable split signal even when its
+    // four quadrant means happen to be similar (between_energy is then small).
+    let avg_gradient = grad_sum as f32 / (2 * size * (size - 1)).max(1) as f32;
+    let texture_limit = if size == 32 {
+        48.0 + qp * 2.0
+    } else {
+        96.0 + qp * 2.8
+    };
+    let gradient_limit = if size == 32 {
+        6.0 + qp * 0.10
+    } else {
+        9.0 + qp * 0.12
+    };
+    if within_variance >= texture_limit && avg_gradient >= gradient_limit && coherence < 0.55 {
+        score = score.max(1.25);
+    }
+    score
+}
+
+/// Build the complete representable 32→16→8 CU plan without coding either
+/// branch. Five source scans (one 32×32 and four 16×16) replace up to 21
+/// transform/quantize/reconstruct leaf trials from the previous implementation.
+fn fast_cu32_plan(state: &CuTreeState<'_>, row: usize, col: usize) -> Cu32Plan {
+    let parent_score = fast_cu_split_score(state, row, col, 32);
+    // Flat/coherent 32×32 nodes dominate natural images. Avoid even the four
+    // child scans when the parent is nowhere near the split threshold.
+    if parent_score < 0.20 {
+        return Cu32Plan::default();
+    }
+
+    let mut child_scores = [0.0f32; 4];
+    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        child_scores[index] = fast_cu_split_score(state, row + dy * 16, col + dx * 16, 16);
+    }
+
+    let split_children = child_scores.iter().filter(|&&score| score >= 1.0).count();
+    let strongest_child = child_scores.iter().copied().fold(0.0f32, f32::max);
+    let split_32 = parent_score >= 1.0
+        || split_children >= 2
+        || (strongest_child >= 2.0 && parent_score >= 0.45);
+    if !split_32 {
+        return Cu32Plan::default();
+    }
+
+    Cu32Plan {
+        split_32: true,
+        split_16: child_scores.map(|score| score >= 1.0),
+    }
+}
+
+/// Compact plan for one representable 32×32 subtree. `split_32 == false`
+/// ignores `split_16`; otherwise each bit selects four 8×8 children for the
+/// corresponding 16×16 quadrant in Z order.
+#[derive(Clone, Copy, Default)]
+struct Cu32Plan {
+    split_32: bool,
+    split_16: [bool; 4],
+}
+
+/// Encode a preselected 32×32 subtree with no speculative branches. Every leaf
+/// gets the normal winner-only RDOQ exactly once.
+fn commit_cu32_plan(
+    cab: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    state: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    depth: u8,
+    plan: Cu32Plan,
+) {
+    let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.blk_stride);
+    if !plan.split_32 {
+        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
+        encode_cu_leaf(cab, ctx, ictx, state, row, col, 32, depth);
+        return;
+    }
+
+    cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
+    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let child_row = row + dy * 16;
+        let child_col = col + dx * 16;
+        let child_depth = depth + 1;
+        let child_ctx = split_cu_context(
+            state.cu_depth,
+            child_row,
+            child_col,
+            child_depth,
+            state.blk_stride,
+        );
+        if plan.split_16[index] {
+            cab.encode_bin(1, &mut ctx.split_cu_flag[child_ctx]);
+            for (cy, cx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                encode_cu_leaf(
+                    cab,
+                    ctx,
+                    ictx,
+                    state,
+                    child_row + cy * 8,
+                    child_col + cx * 8,
+                    8,
+                    child_depth + 1,
+                );
+            }
+        } else {
+            cab.encode_bin(0, &mut ctx.split_cu_flag[child_ctx]);
+            encode_cu_leaf(cab, ctx, ictx, state, child_row, child_col, 16, child_depth);
+        }
+    }
+}
+
+fn encode_cu<W: CabacWriter>(
+    ent: Entropy<'_, W>,
     src: &CuSrcPlanes<'_>,
     rec: &mut CuRecPlanes<'_>,
     geo: &CuGeometry,
     par: &CuParams,
     mode_map: &mut [u8],
+    scratch: &mut CompressionContext,
 ) {
     // destructure so the rest of the body is unchanged
     let Entropy { enc, ctx, ictx } = ent;
@@ -1423,27 +1591,36 @@ fn encode_cu(
     //
     // The selected winner alone enters RDOQ. Its prediction, residual, and forward
     // transform are cached here so committing the CU does not repeat that work.
-    let y_orig = match lu {
-        16 => extract_block_n::<16>(src_y, src_yw, src_yh, lu_row, lu_col),
-        _ => extract_block_n::<8>(src_y, src_yw, src_yh, lu_row, lu_col),
-    };
+    let num_luma = lu * lu;
+    match lu {
+        32 => extract_block_n_into::<32>(src_y, src_yw, src_yh, lu_row, lu_col, &mut scratch.orig),
+        16 => extract_block_n_into::<16>(src_y, src_yw, src_yh, lu_row, lu_col, &mut scratch.orig),
+        _ => extract_block_n_into::<8>(src_y, src_yw, src_yh, lu_row, lu_col, &mut scratch.orig),
+    }
     let lambda_mode = lambda.sqrt();
     // The smoothed references depend only on the block, not the mode.
     let (fa, fl) = intra::filter_references(yc0, &ya, &yl, lu);
     let cf = ((ya[0] as i32 + 2 * yc0 as i32 + yl[0] as i32 + 2) >> 2) as u16;
-    let predict_luma = |mode| {
-        if intra::should_filter_refs(mode, lu) {
-            match mode {
-                PLANAR => intra::predict_planar(&fa, &fl, lu),
-                DC => intra::predict_dc(&fa, &fl, lu, true),
-                _ => intra::predict_angular(cf, &fa, &fl, lu, mode, true, max_val as i32),
-            }
+    let predict_luma = |mode: u8, pred: &mut [u16; 1024], angular: &mut intra::AngularScratch| {
+        let (corner, above, left) = if intra::should_filter_refs(mode, lu) {
+            (cf, &fa[..], &fl[..])
         } else {
-            match mode {
-                PLANAR => intra::predict_planar(&ya, &yl, lu),
-                DC => intra::predict_dc(&ya, &yl, lu, true),
-                _ => intra::predict_angular(yc0, &ya, &yl, lu, mode, true, max_val as i32),
-            }
+            (yc0, &ya[..], &yl[..])
+        };
+        match mode {
+            PLANAR => intra::predict_planar_into(above, left, lu, pred),
+            DC => intra::predict_dc_into(above, left, lu, true, pred),
+            _ => intra::predict_angular_into(
+                corner,
+                above,
+                left,
+                lu,
+                mode,
+                true,
+                max_val as i32,
+                pred,
+                angular,
+            ),
         }
     };
 
@@ -1455,9 +1632,12 @@ fn encode_cu(
         cost: f32::MAX,
     }; MAX_RMD_MODES];
     let mut mode_costs = [f32::MAX; 35];
+
+    // Every mode is visited exactly once, so avoid the tested-mode bitmap and
+    // closure dispatch from the previous implementation.
     for mode in 0u8..35 {
-        let pred = predict_luma(mode);
-        let satd = satd_block(&y_orig, &pred, lu) as f32;
+        predict_luma(mode, &mut scratch.pred, &mut scratch.angular);
+        let satd = satd_block(&scratch.orig[..num_luma], &scratch.pred[..num_luma], lu) as f32;
         let cost = satd + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
         mode_costs[mode as usize] = cost;
         update_intra_candidate(&mut rmd[..fast_mode_count], mode, cost);
@@ -1482,12 +1662,9 @@ fn encode_cu(
         );
     }
     let full_rd_count = full_rdo_candidate_count(&rd_candidates[..rd_mode_count], lu);
-    let luma_log2_ts = if lu == 16 { 4 } else { 3 };
+    let luma_log2_ts = lu.trailing_zeros();
     let mut luma_mode = rd_candidates[0].mode;
     let mut best_rd_cost = f32::MAX;
-    let mut best_pred = [0u16; 256];
-    let mut best_residual = [0i32; 256];
-    let mut best_tcoeff = [0i32; 256];
 
     for candidate in &rd_candidates[..full_rd_count] {
         let mode = candidate.mode;
@@ -1503,32 +1680,48 @@ fn encode_cu(
         }
         rate += estimate_luma_mode_bits(&mut trial_ictx, mode, &mpm);
 
-        let pred = predict_luma(mode);
-        let residual = intra::compute_residual_i32(&y_orig, &pred, lu);
+        predict_luma(mode, &mut scratch.pred, &mut scratch.angular);
+        intra::compute_residual_i32_into(
+            &scratch.orig[..num_luma],
+            &scratch.pred[..num_luma],
+            lu,
+            &mut scratch.residual,
+        );
         let scan_idx = dct::scan_idx_for(mode, luma_log2_ts, true, false);
         let scan = dct::coeff_scan(luma_log2_ts, scan_idx);
-        let mut coeff = [0i32; 256];
-        let levels = if lossless {
-            let mut out = [0i16; 256];
-            for (dst, &src) in out[..lu * lu].iter_mut().zip(&residual[..lu * lu]) {
+        if lossless {
+            for (dst, &src) in scratch.levels[..num_luma]
+                .iter_mut()
+                .zip(&scratch.residual[..num_luma])
+            {
                 *dst = src as i16;
             }
-            out
         } else {
-            coeff =
-                crate::hevc_transform::fwd_transform(&residual[..lu * lu], lu, bit_depth.bits());
-            crate::hevc_transform::quantize_with_sign_hiding(&coeff, lu, qp, bit_depth.bits(), scan)
-        };
-        let mut scanned = [0i16; 256];
-        for (dst, &(row, col)) in scanned.iter_mut().zip(scan) {
-            *dst = levels[row * lu + col];
+            crate::hevc_transform::fwd_transform_into(
+                &scratch.residual[..num_luma],
+                lu,
+                bit_depth.bits(),
+                &mut scratch.coeff,
+                &mut scratch.transform_tmp,
+            );
+            crate::hevc_transform::quantize_with_sign_hiding_into(
+                &scratch.coeff,
+                lu,
+                qp,
+                bit_depth.bits(),
+                scan,
+                &mut scratch.levels,
+            );
         }
-        let nonzero = scanned[..lu * lu].iter().any(|&level| level != 0);
+        for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(scan) {
+            *dst = scratch.levels[row * lu + col];
+        }
+        let nonzero = scratch.scanned[..num_luma].iter().any(|&level| level != 0);
         rate += trial_ctx.cbf_luma[1].estimate_and_update(nonzero as u8);
         if nonzero {
             rate += estimate_residual_bits(
                 &mut trial_ctx,
-                &scanned[..lu * lu],
+                &scratch.scanned[..num_luma],
                 luma_log2_ts,
                 true,
                 scan_idx,
@@ -1536,25 +1729,63 @@ fn encode_cu(
             );
         }
 
-        let rec_block = if lossless {
-            intra::reconstruct(&pred, &residual, lu, max_val)
+        let rate_cost = lambda * rate;
+        // Distortion is non-negative. Once the complete syntax estimate alone
+        // loses to the current winner, inverse transform and reconstruction cannot
+        // recover the candidate. This is exact pruning, not a heuristic.
+        if rate_cost >= best_rd_cost {
+            continue;
+        }
+        if lossless {
+            intra::reconstruct_into(
+                &scratch.pred[..num_luma],
+                &scratch.residual[..num_luma],
+                lu,
+                max_val,
+                &mut scratch.reconstructed,
+            );
         } else {
-            let dequantized = crate::hevc_transform::dequantize(&levels, lu, qp, bit_depth.bits());
-            let rec_residual =
-                crate::hevc_transform::inv_transform(&dequantized, lu, bit_depth.bits());
-            intra::reconstruct(&pred, &rec_residual, lu, max_val)
-        };
-        let cost = block_sse(&y_orig, &rec_block, lu) + lambda * rate;
+            crate::hevc_transform::dequantize_into(
+                &scratch.levels,
+                lu,
+                qp,
+                bit_depth.bits(),
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::inv_transform_into(
+                &scratch.dequant,
+                lu,
+                bit_depth.bits(),
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+            );
+            intra::reconstruct_into(
+                &scratch.pred[..num_luma],
+                &scratch.inverse[..num_luma],
+                lu,
+                max_val,
+                &mut scratch.reconstructed,
+            );
+        }
+        let cost = block_sse(
+            &scratch.orig[..num_luma],
+            &scratch.reconstructed[..num_luma],
+            lu,
+        ) + rate_cost;
         if cost < best_rd_cost {
             best_rd_cost = cost;
             luma_mode = mode;
-            best_pred = pred;
-            best_residual = residual;
-            best_tcoeff = coeff;
+            // Current and best buffers form a two-slot cache. Swapping ownership
+            // is constant-time and avoids copying 2–6 KiB every time the winner
+            // changes; the old winner is simply overwritten by the next trial.
+            core::mem::swap(&mut scratch.pred, &mut scratch.best_pred);
+            if lossless {
+                core::mem::swap(&mut scratch.residual, &mut scratch.best_residual);
+            } else {
+                core::mem::swap(&mut scratch.coeff, &mut scratch.best_coeff);
+            }
         }
     }
-
-    let y_pred = best_pred;
 
     // ── cu_transquant_bypass_flag ────────────────────────────────────────────
     // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
@@ -1607,7 +1838,7 @@ fn encode_cu(
     // Chroma TB size derives from the luma CU size and subsampling: LU/sub_w.
     // For LU=8 this reproduces chroma_tb_size() (4:2:0/4:2:2→4, 4:4:4→8); for
     // LU=16 in 4:2:0 it gives an 8×8 chroma TB.
-    let ctb = lu / sub_w; // chroma TB side (4, or 8 for 16×16-luma 4:2:0)
+    let ctb = lu / sub_w; // chroma TB side: 4 through 32
     let log2_ctb = ctb.trailing_zeros(); // 2 or 3
     // Mode-dependent scan for chroma TBs: 4×4 chroma uses vertical/horizontal for
     // chroma modes 6..=14 / 22..=30 (else diagonal); 8×8 chroma (4:4:4) is always
@@ -1616,25 +1847,8 @@ fn encode_cu(
     let chroma_tb_scan_idx = dct::scan_idx_for(chroma_mode, log2_ctb, false, is_444);
     let chroma_scan: &[(usize, usize)] = dct::coeff_scan(log2_ctb, chroma_tb_scan_idx);
 
-    #[derive(Clone, Copy)]
-    struct ChromaTb {
-        cb_zz: [i16; 64],
-        cb_nz: bool,
-        cr_zz: [i16; 64],
-        cr_nz: bool,
-    }
-
-    // n_chroma_tb is 1 (4:2:0 / 4:4:4) or 2 (4:2:2) — keep the TBs on the stack.
-    let mut tbs = [ChromaTb {
-        cb_zz: [0i16; 64],
-        cb_nz: false,
-        cr_zz: [0i16; 64],
-        cr_nz: false,
-    }; 2];
-    for (t, tbs) in tbs[..n_chroma_tb].iter_mut().enumerate() {
+    for t in 0..n_chroma_tb {
         let sub_ch_row = ch_row + t * ctb;
-        // Predict this chroma TB (DM_CHROMA → chroma_mode). 4:4:4 (8×8) smooths
-        // references like luma when the mode calls for it; 4:2:0/4:2:2 (4×4) do not.
         let filt = ctb > 4 && intra::should_filter_refs(chroma_mode, ctb);
         let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
             rec_cb,
@@ -1655,9 +1869,6 @@ fn encode_cu(
                 neutral,
             },
         );
-        // When chroma references are smoothed (4:4:4, 8×8), libde265 filters the
-        // corner too (pF[0] = (above[0]+2·corner+left[0]+2)>>2), so pass the
-        // filtered corner — matching the luma path.
         let (baf, blf) = if filt {
             intra::filter_references(bc0, &ba, &bl, ctb)
         } else {
@@ -1668,7 +1879,6 @@ fn encode_cu(
         } else {
             bc0
         };
-        let cb_pred = intra::predict_chroma_tb(chroma_mode, bcf, &baf, &blf, ctb, max_val as i32);
         let (raf, rlf) = if filt {
             intra::filter_references(rc0, &ra, &rl, ctb)
         } else {
@@ -1679,128 +1889,135 @@ fn encode_cu(
         } else {
             rc0
         };
-        let cr_pred = intra::predict_chroma_tb(chroma_mode, rcf, &raf, &rlf, ctb, max_val as i32);
-        let b_orig = extract_block_dyn(src_cb, src_cw, src_ch, sub_ch_row, ch_col, ctb);
-        let r_orig = extract_block_dyn(src_cr, src_cw, src_ch, sub_ch_row, ch_col, ctb);
         let n_ch = ctb * ctb;
-        let mut b_res = [0i32; 64];
-        let mut r_res = [0i32; 64];
-        for (d, (&o, &p)) in b_res[..n_ch]
-            .iter_mut()
-            .zip(b_orig[..n_ch].iter().zip(&cb_pred[..n_ch]))
-        {
-            *d = o as i32 - p as i32;
-        }
-        for (d, (&o, &p)) in r_res[..n_ch]
-            .iter_mut()
-            .zip(r_orig[..n_ch].iter().zip(&cr_pred[..n_ch]))
-        {
-            *d = o as i32 - p as i32;
-        }
-        // Row-major chroma "levels": quantized coefficients (lossy) or the raw
-        // residual stored verbatim (lossless / transquant bypass).
-        let (cb_level, cr_level): ([i16; 256], [i16; 256]) = if lossless {
-            let mut cbl = [0i16; 256];
-            let mut crl = [0i16; 256];
-            for i in 0..n_ch {
-                cbl[i] = b_res[i] as i16;
-                crl[i] = r_res[i] as i16;
-            }
-            (cbl, crl)
-        } else {
-            let cb_coeff = crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits());
-            let cr_coeff = crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits());
-            (
-                crate::hevc_transform::quantize_with_sign_hiding(
-                    &cb_coeff,
-                    ctb,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    chroma_scan,
-                ),
-                crate::hevc_transform::quantize_with_sign_hiding(
-                    &cr_coeff,
-                    ctb,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    chroma_scan,
-                ),
-            )
-        };
-        let mut cb_zz = [0i16; 64];
-        let mut cr_zz = [0i16; 64];
-        for (&(r, c), dst) in chroma_scan.iter().zip(cb_zz.iter_mut()) {
-            *dst = cb_level[r * ctb + c];
-        }
-        for (&(r, c), dst) in chroma_scan.iter().zip(cr_zz.iter_mut()) {
-            *dst = cr_level[r * ctb + c];
-        }
-        let cb_nz = cb_zz.iter().any(|&x| x != 0);
-        let cr_nz = cr_zz.iter().any(|&x| x != 0);
 
-        // Reconstruct this TB so the next stacked TB (4:2:2) sees it as a reference.
-        // Lossless: residual is the row-major level itself. Lossy: dequant + inverse.
-        let (b_rec, r_rec) = if lossless {
-            let mut b_res_rec = [0i32; 64];
-            let mut r_res_rec = [0i32; 64];
-            for i in 0..n_ch {
-                b_res_rec[i] = cb_level[i] as i32;
-                r_res_rec[i] = cr_level[i] as i32;
-            }
-            (
-                intra::reconstruct(&cb_pred, &b_res_rec, ctb, max_val),
-                intra::reconstruct(&cr_pred, &r_res_rec, ctb, max_val),
-            )
-        } else {
-            let b_dq =
-                crate::hevc_transform::dequantize(&cb_level, ctb, chroma_qp, bit_depth.bits());
-            let b_inv = crate::hevc_transform::inv_transform(&b_dq, ctb, bit_depth.bits());
-            let r_dq =
-                crate::hevc_transform::dequantize(&cr_level, ctb, chroma_qp, bit_depth.bits());
-            let r_inv = crate::hevc_transform::inv_transform(&r_dq, ctb, bit_depth.bits());
-            (
-                intra::reconstruct(&cb_pred, &b_inv, ctb, max_val),
-                intra::reconstruct(&cr_pred, &r_inv, ctb, max_val),
-            )
-        };
-        for r in 0..ctb {
-            for c in 0..ctb {
-                let (row, col) = (sub_ch_row + r, ch_col + c);
-                if row < coded_ch_h && col < cw_stride {
-                    rec_cb[row * cw_stride + col] = b_rec[r * ctb + c];
-                    rec_cr[row * cw_stride + col] = r_rec[r * ctb + c];
+        // Process Cb and Cr sequentially through the same persistent buffers.
+        // Their predictions are independent, while each reconstructed plane is
+        // committed before a possible lower 4:2:2 TB gathers its references.
+        for component in 0..2 {
+            let (src_plane, rec_plane, corner, above, left) = if component == 0 {
+                (&src_cb[..], &mut rec_cb[..], bcf, &baf[..], &blf[..])
+            } else {
+                (&src_cr[..], &mut rec_cr[..], rcf, &raf[..], &rlf[..])
+            };
+
+            intra::predict_chroma_tb_into(
+                chroma_mode,
+                corner,
+                above,
+                left,
+                ctb,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            );
+            extract_block_dyn_into(
+                src_plane,
+                src_cw,
+                src_ch,
+                sub_ch_row,
+                ch_col,
+                ctb,
+                &mut scratch.orig,
+            );
+            intra::compute_residual_i32_into(
+                &scratch.orig[..n_ch],
+                &scratch.pred[..n_ch],
+                ctb,
+                &mut scratch.residual,
+            );
+
+            if lossless {
+                for (dst, &residual) in scratch.levels[..n_ch]
+                    .iter_mut()
+                    .zip(&scratch.residual[..n_ch])
+                {
+                    *dst = residual as i16;
                 }
+            } else {
+                crate::hevc_transform::fwd_transform_into(
+                    &scratch.residual[..n_ch],
+                    ctb,
+                    bit_depth.bits(),
+                    &mut scratch.coeff,
+                    &mut scratch.transform_tmp,
+                );
+                crate::hevc_transform::quantize_with_sign_hiding_into(
+                    &scratch.coeff,
+                    ctb,
+                    chroma_qp,
+                    bit_depth.bits(),
+                    chroma_scan,
+                    &mut scratch.levels,
+                );
+            }
+
+            let tb = &mut scratch.chroma_tbs[t];
+            let (zigzag, nonzero) = if component == 0 {
+                (&mut tb.cb_zz, &mut tb.cb_nz)
+            } else {
+                (&mut tb.cr_zz, &mut tb.cr_nz)
+            };
+            for (dst, &(row, col)) in zigzag[..n_ch].iter_mut().zip(chroma_scan) {
+                *dst = scratch.levels[row * ctb + col];
+            }
+            *nonzero = zigzag[..n_ch].iter().any(|&level| level != 0);
+
+            if lossless {
+                for (dst, &level) in scratch.inverse[..n_ch]
+                    .iter_mut()
+                    .zip(&scratch.levels[..n_ch])
+                {
+                    *dst = level as i32;
+                }
+            } else {
+                crate::hevc_transform::dequantize_into(
+                    &scratch.levels,
+                    ctb,
+                    chroma_qp,
+                    bit_depth.bits(),
+                    &mut scratch.dequant,
+                );
+                crate::hevc_transform::inv_transform_into(
+                    &scratch.dequant,
+                    ctb,
+                    bit_depth.bits(),
+                    &mut scratch.inverse,
+                    &mut scratch.transform_tmp,
+                );
+            }
+            intra::reconstruct_into(
+                &scratch.pred[..n_ch],
+                &scratch.inverse[..n_ch],
+                ctb,
+                max_val,
+                &mut scratch.reconstructed,
+            );
+            for (src_row, dst_row) in scratch.reconstructed[..n_ch]
+                .chunks_exact(ctb)
+                .zip(rec_plane[sub_ch_row * cw_stride + ch_col..].chunks_mut(cw_stride))
+            {
+                dst_row[..ctb].copy_from_slice(src_row);
             }
         }
-
-        *tbs = ChromaTb {
-            cb_zz,
-            cb_nz,
-            cr_zz,
-            cr_nz,
-        };
     }
 
     // ── HEVC integer transform + quantize: luma LU×LU ─────────────────────
-    let y_res = best_residual;
     // Mode-dependent scan for residual_coding. 8×8 luma uses a vertical/horizontal
-    // scan for modes 6..=14 / 22..=30 (else diagonal); 16×16 is always diagonal
-    // (HEVC §6.5).
-    let luma_log2_ts: u32 = if lu == 16 { 4 } else { 3 };
+    // scan for modes 6..=14 / 22..=30 (else diagonal); larger TUs are diagonal.
+    let luma_log2_ts = lu.trailing_zeros();
     let luma_scan_idx = dct::scan_idx_for(luma_mode, luma_log2_ts, true, false);
     let luma_scan = dct::coeff_scan(luma_log2_ts, luma_scan_idx);
-    // Row-major "levels". Lossy: quantized forward-transform coefficients. Lossless
-    // (transquant bypass): the prediction residual stored verbatim — the decoder
-    // reads these back as the residual directly (HEVC §8.6.5, no scaling/transform).
-    let y_level: [i16; 256] = if lossless {
-        let mut lv = [0i16; 256];
-        for (d, &r) in lv[..lu * lu].iter_mut().zip(y_res[..lu * lu].iter()) {
-            *d = r as i16;
+    if lossless {
+        for (dst, &residual) in scratch.levels[..num_luma]
+            .iter_mut()
+            .zip(&scratch.best_residual[..num_luma])
+        {
+            *dst = residual as i16;
         }
-        lv
     } else {
-        crate::hevc_transform::rdoq_luma_with_sign_hiding(
-            &best_tcoeff,
+        crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
+            &scratch.best_coeff,
             lu,
             qp,
             bit_depth.bits(),
@@ -1808,14 +2025,14 @@ fn encode_cu(
             luma_scan_idx,
             lambda,
             ctx,
-        )
-    };
-    // Reorder row-major levels into the mode-dependent scan for residual_coding.
-    let mut y_zigzag = [0i16; 256];
-    for (dst, &(r, c)) in y_zigzag.iter_mut().zip(luma_scan) {
-        *dst = y_level[r * lu + c];
+            &mut scratch.levels,
+            &mut scratch.rdoq,
+        );
     }
-    let y_nz = y_zigzag[..lu * lu].iter().any(|&x| x != 0);
+    for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(luma_scan) {
+        *dst = scratch.levels[row * lu + col];
+    }
+    let y_nz = scratch.scanned[..num_luma].iter().any(|&level| level != 0);
 
     // ── CABAC: transform_tree() syntax ─────────────────────────────────────
     // split_transform_flag is inferred 0 (max_transform_hierarchy_depth_intra = 0),
@@ -1824,10 +2041,10 @@ fn encode_cu(
     // cbf order (HEVC §7.3.8.8): for ChromaArrayType==2 (4:2:2) the two stacked
     // chroma TBs each have their own cbf, signalled cb[0],cb[1] then cr[0],cr[1],
     // before cbf_luma. For 4:2:0 there is one of each.
-    for t in &tbs[..n_chroma_tb] {
+    for t in &scratch.chroma_tbs[..n_chroma_tb] {
         encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
     }
-    for t in &tbs[..n_chroma_tb] {
+    for t in &scratch.chroma_tbs[..n_chroma_tb] {
         encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
     }
     encode_cbf_luma(enc, ctx, y_nz, 0);
@@ -1839,7 +2056,7 @@ fn encode_cu(
         encode_residual(
             enc,
             ctx,
-            &y_zigzag[..lu * lu],
+            &scratch.scanned[..num_luma],
             luma_log2_ts,
             true,
             luma_scan_idx,
@@ -1847,12 +2064,12 @@ fn encode_cu(
         );
     }
     let chroma_scan_idx = chroma_tb_scan_idx;
-    for t in &tbs[..n_chroma_tb] {
+    for t in &scratch.chroma_tbs[..n_chroma_tb] {
         if t.cb_nz {
             encode_residual(
                 enc,
                 ctx,
-                &t.cb_zz,
+                &t.cb_zz[..ctb * ctb],
                 log2_ctb,
                 false,
                 chroma_scan_idx,
@@ -1860,12 +2077,12 @@ fn encode_cu(
             );
         }
     }
-    for t in &tbs[..n_chroma_tb] {
+    for t in &scratch.chroma_tbs[..n_chroma_tb] {
         if t.cr_nz {
             encode_residual(
                 enc,
                 ctx,
-                &t.cr_zz,
+                &t.cr_zz[..ctb * ctb],
                 log2_ctb,
                 false,
                 chroma_scan_idx,
@@ -1875,40 +2092,51 @@ fn encode_cu(
     }
 
     // ── Reconstruct luma ────────────────────────────────────────────────────
-    // Lossless: the residual is the row-major `y_level` itself (pred + residual
-    // recovers the source exactly). Lossy: integer dequant + inverse transform.
-    let y_rec = if lossless {
-        let mut y_res_rec = [0i32; 256];
-        for (d, &l) in y_res_rec[..lu * lu]
+    if lossless {
+        for (dst, &level) in scratch.inverse[..num_luma]
             .iter_mut()
-            .zip(y_level[..lu * lu].iter())
+            .zip(&scratch.levels[..num_luma])
         {
-            *d = l as i32;
+            *dst = level as i32;
         }
-        intra::reconstruct(&y_pred, &y_res_rec, lu, max_val)
     } else {
-        let y_dq = crate::hevc_transform::dequantize(&y_level, lu, qp, bit_depth.bits());
-        let y_res_rec = crate::hevc_transform::inv_transform(&y_dq, lu, bit_depth.bits());
-        intra::reconstruct(&y_pred, &y_res_rec, lu, max_val)
-    };
-    for r in 0..lu {
-        for c in 0..lu {
-            let (row, col) = (lu_row + r, lu_col + c);
-            if row < coded_yh && col < yw_stride {
-                rec_y[row * yw_stride + col] = y_rec[r * lu + c];
-            }
-        }
+        crate::hevc_transform::dequantize_into(
+            &scratch.levels,
+            lu,
+            qp,
+            bit_depth.bits(),
+            &mut scratch.dequant,
+        );
+        crate::hevc_transform::inv_transform_into(
+            &scratch.dequant,
+            lu,
+            bit_depth.bits(),
+            &mut scratch.inverse,
+            &mut scratch.transform_tmp,
+        );
+    }
+    intra::reconstruct_into(
+        &scratch.best_pred[..num_luma],
+        &scratch.inverse[..num_luma],
+        lu,
+        max_val,
+        &mut scratch.reconstructed,
+    );
+    for (src_row, dst_row) in scratch.reconstructed[..num_luma]
+        .chunks_exact(lu)
+        .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
+    {
+        dst_row[..lu].copy_from_slice(src_row);
     }
     // Chroma was already reconstructed into rec_cb/rec_cr inside the per-sub-TB loop
     // above (so each stacked sub-TB could serve as the next one's intra reference).
 }
 
-/// Encode one intra CU (luma side `lu` = 8 or 16) at (lu_row,lu_col) into the
+/// Encode one intra CU (luma side `lu` = 8, 16, or 32) at (lu_row,lu_col) into the
 /// bitstream and reconstruction planes; chroma coords derive via subsampling.
-/// Shared by the RD trial and commit paths.
 #[allow(clippy::too_many_arguments)]
-fn code_one_cu(
-    ent: Entropy<'_>,
+fn code_one_cu<W: CabacWriter>(
+    ent: Entropy<'_, W>,
     yuv: &Yuv,
     rec_y: &mut [u16],
     rec_cb: &mut [u16],
@@ -1922,6 +2150,7 @@ fn code_one_cu(
     mode_map: &mut [u8],
     blk_stride: usize,
     lossless: bool,
+    scratch: &mut CompressionContext,
 ) {
     let PlaneStrides {
         w,
@@ -1966,100 +2195,59 @@ fn code_one_cu(
         lambda,
         lossless,
     };
-    encode_cu(ent, &src, &mut rec, &geo, &par, mode_map);
+    encode_cu(ent, &src, &mut rec, &geo, &par, mode_map, scratch);
 }
 
-/// RD distortion: SSE (luma 16×16 + chroma 8×8 Cb/Cr) between source and
-/// reconstruction over one 16×16-luma CU region, with the encoder's edge
-/// clamping for padded regions. Differences are integer-valued samples, so the
-/// sum of squares is computed exactly in `i64` (returned as `f32` for the
-/// caller's Lagrangian, which mixes it with λ·bits).
-#[allow(clippy::too_many_arguments)]
-fn region_sse(
-    yuv: &Yuv,
-    rec_y: &[u16],
-    rec_cb: &[u16],
-    rec_cr: &[u16],
-    lu_row: usize,
-    lu_col: usize,
-    ch_row: usize,
-    ch_col: usize,
-    strides: PlaneStrides,
-) -> f32 {
-    let PlaneStrides {
-        w,
-        src_yw,
-        src_yh,
-        cw,
-        src_cw,
-        src_ch,
-        ..
-    } = strides;
-    let mut sse: i64 = 0;
-    for r in 0..16 {
-        let sy = (lu_row + r).min(src_yh - 1);
-        for c in 0..16 {
-            let sx = (lu_col + c).min(src_yw - 1);
-            let s = yuv.y[sy * src_yw + sx] as i64;
-            let d = rec_y[(lu_row + r) * w + (lu_col + c)] as i64;
-            let e = s - d;
-            sse += e * e;
-        }
-    }
-    if !yuv.chroma.is_monochrome() {
-        for r in 0..8 {
-            let sy = (ch_row + r).min(src_ch - 1);
-            for c in 0..8 {
-                let sx = (ch_col + c).min(src_cw - 1);
-                let sb = yuv.cb[sy * src_cw + sx] as i64;
-                let db = rec_cb[(ch_row + r) * cw + (ch_col + c)] as i64;
-                let eb = sb - db;
-                sse += eb * eb;
-                let sr = yuv.cr[sy * src_cw + sx] as i64;
-                let dr = rec_cr[(ch_row + r) * cw + (ch_col + c)] as i64;
-                let er = sr - dr;
-                sse += er * er;
-            }
-        }
-    }
-    sse as f32
-}
-
-/// Extract an N×N block from a plane (compile-time N, so the copy is specialized
-/// per size). Returns a fixed 256-entry buffer (N up to 16); first N×N written.
-fn extract_block_n<const N: usize>(
+/// Extract an N×N block into reusable storage. Rows that lie fully inside the
+/// source are copied as slices; only the right/bottom edge needs scalar clamping.
+#[inline]
+fn extract_block_n_into<const N: usize>(
     plane: &[u16],
     src_w: usize,
     src_h: usize,
     row: usize,
     col: usize,
-) -> [u16; 256] {
-    let mut out = [128u16; 256];
-    for r in 0..N {
-        for c in 0..N {
-            out[r * N + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
+    out: &mut [u16],
+) {
+    debug_assert!(out.len() >= N * N);
+    for (r, dst) in out[..N * N].chunks_exact_mut(N).enumerate() {
+        let src_row = (row + r).min(src_h - 1);
+        let available = src_w.saturating_sub(col).min(N);
+        if available != 0 {
+            let start = src_row * src_w + col.min(src_w - 1);
+            dst[..available].copy_from_slice(&plane[start..start + available]);
+            let last = dst[available - 1];
+            dst[available..].fill(last);
+        } else {
+            dst.fill(plane[src_row * src_w + src_w - 1]);
         }
     }
-    out
 }
 
-/// Extract an n×n block from a plane (runtime size). Used for chroma where the TB
-/// side is 4 (4:2:0/4:2:2) or 8 (4:4:4).
-fn extract_block_dyn(
+/// Runtime-sized variant used by chroma TBs.
+#[inline]
+fn extract_block_dyn_into(
     plane: &[u16],
     src_w: usize,
     src_h: usize,
     row: usize,
     col: usize,
     n: usize,
-) -> [u16; 256] {
-    let mut out = [128u16; 256];
-    for r in 0..n {
-        for c in 0..n {
-            out[r * n + c] = plane[(row + r).min(src_h - 1) * src_w + (col + c).min(src_w - 1)];
+    out: &mut [u16],
+) {
+    debug_assert!(out.len() >= n * n);
+    for (r, dst) in out[..n * n].chunks_exact_mut(n).enumerate() {
+        let src_row = (row + r).min(src_h - 1);
+        let available = src_w.saturating_sub(col).min(n);
+        if available != 0 {
+            let start = src_row * src_w + col.min(src_w - 1);
+            dst[..available].copy_from_slice(&plane[start..start + available]);
+            let last = dst[available - 1];
+            dst[available..].fill(last);
+        } else {
+            dst.fill(plane[src_row * src_w + src_w - 1]);
         }
     }
-    out
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -2126,6 +2314,18 @@ mod tests {
             },
         ];
         assert_eq!(full_rdo_candidate_count(&separated, 8), 2);
+    }
+
+    #[test]
+    fn cu_depth_map_drives_split_context() {
+        let stride = 8;
+        let mut depths = [0u8; 64];
+        fill_cu_depth(&mut depths, 0, 0, 32, 1, stride);
+        assert!(depths[..4].iter().all(|&depth| depth == 1));
+
+        fill_cu_depth(&mut depths, 0, 0, 16, 2, stride);
+        assert_eq!(split_cu_context(&depths, 0, 16, 1, stride), 1);
+        assert_eq!(split_cu_context(&depths, 16, 0, 1, stride), 1);
     }
 
     #[test]

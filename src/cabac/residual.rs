@@ -28,15 +28,15 @@
  */
 use super::{
     contexts::ContextSet,
-    engine::{CabacEncoder, CabacEstimator, CabacWriter},
+    engine::{CabacEstimator, CabacWriter},
 };
 
 /// Encode cbf_luma (trafo_depth 0 or 1).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_LUMA] + !trafo_depth)
 /// cbf_luma[0] = trafo_depth != 0, cbf_luma[1] = trafo_depth == 0 (i.e. root TU).
 /// We always call at trafo_depth=0 (root), so use cbf_luma[1].
-pub(crate) fn encode_cbf_luma(
-    enc: &mut CabacEncoder,
+pub(crate) fn encode_cbf_luma<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     flag: bool,
     trafo_depth: usize,
@@ -47,8 +47,8 @@ pub(crate) fn encode_cbf_luma(
 
 /// Encode cbf_cb or cbf_cr at given trafo_depth (0..4).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_CB_CR] + trafo_depth)
-pub(crate) fn encode_cbf_chroma(
-    enc: &mut CabacEncoder,
+pub(crate) fn encode_cbf_chroma<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     flag: bool,
     trafo_depth: usize,
@@ -60,13 +60,13 @@ pub(crate) fn encode_cbf_chroma(
 /// Encode a coefficient block using HEVC CABAC residual_coding() syntax.
 ///
 /// `coeffs`  — coefficients in HEVC sub-block-major diagonal scan order
-///             (64 for 8×8, 16 for 4×4); `coeffs[sb*16 + k]` is scan position
+///             (16/64/256/1024 for 4/8/16/32); `coeffs[sb*16 + k]` is scan position
 ///             `k` within sub-block `sb`.
-/// `log2_ts` — log2 of the TU size (3 = 8×8, 2 = 4×4)
+/// `log2_ts` — log2 of the TU size (2..=5 for 4×4 through 32×32)
 /// `is_luma` — selects luma vs chroma contexts
 /// `sign_data_hiding` — omit the inferred first-significant sign in eligible CGs
-pub(crate) fn encode_residual(
-    enc: &mut CabacEncoder,
+pub(crate) fn encode_residual<W: CabacWriter>(
+    enc: &mut W,
     ctx: &mut ContextSet,
     coeffs: &[i16],
     log2_ts: u32,
@@ -140,9 +140,9 @@ fn write_residual<W: CabacWriter>(
         encode_last_sig(enc, ctx, last_col as u32, last_row as u32, log2_ts, is_luma);
     }
 
-    let tu_side = 1usize << log2_ts; // 8 or 4
-    let sb_side = (tu_side / 4).max(1); // sub-blocks per side (2 or 1)
-    let num_sb = sb_side * sb_side; // 4 or 1
+    let tu_side = 1usize << log2_ts;
+    let sb_side = (tu_side / 4).max(1);
+    let num_sb = sb_side * sb_side;
     let last_sb = last_scan_pos / 16;
 
     // Sub-block scan over the sb_side×sb_side grid (same scanIdx as coefficients).
@@ -151,8 +151,8 @@ fn write_residual<W: CabacWriter>(
     // coded_sub_block_neighbors[idx] holds the 2-bit prev_csbf code for each
     // sub-block: bit0 (=1) means the sub-block to the RIGHT is coded, bit1 (=2)
     // means the sub-block BELOW is coded. Filled in as we walk (last → DC), exactly
-    // as libde265/zune do. num_sb <= 16 (16×16 TU), so this stays on the stack.
-    let mut csbf_storage = [0u8; 16];
+    // as libde265/zune do. num_sb <= 64 (32×32 TU), so this stays on the stack.
+    let mut csbf_storage = [0u8; 64];
     let csbf_neighbors = &mut csbf_storage[..num_sb];
 
     // Helper: TU-position (col,row) for an absolute scan position.
@@ -369,7 +369,7 @@ pub(crate) fn sig_coeff_ctx(
     is_luma: bool,
 ) -> usize {
     static CTX_IDX_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 99];
-    let sb_width = 1usize << (log2_ts - 2); // sub-blocks per side (1 for 4×4, 2 for 8×8)
+    let sb_width = 1usize << (log2_ts - 2); // sub-blocks per side (1, 2, 4, or 8)
 
     let mut sig_ctx: i32;
     if sb_width == 1 {
@@ -607,7 +607,7 @@ fn encode_coeff_remaining<W: CabacWriter>(enc: &mut W, value: u32, rice_k: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cabac::contexts::ContextSet;
+    use crate::cabac::{CabacEncoder, ContextSet};
 
     fn make_coeffs(vals: &[(usize, i16)], len: usize) -> Vec<i16> {
         let mut c = vec![0i16; len];

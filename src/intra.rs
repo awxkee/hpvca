@@ -27,35 +27,45 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! HEVC intra prediction for 8×8 luma and 4×4/8×8 chroma blocks.
+//! HEVC intra prediction for 4×4 through 32×32 luma/chroma blocks.
 //!
-//! HEVC spec §8.4.4. The encoder uses PLANAR mode everywhere (mode 0), which keeps
-//! the most-probable-mode derivation trivial and gives good results for both flat
-//! and gradient regions in still images.
+//! Implements planar, DC, and all 33 angular modes with decode-order-aware
+//! reference substitution and mode/size-dependent reference smoothing.
 
 /// Predict an N×N block using Planar mode (HEVC §8.4.4.2.4).
 ///
 /// `above[0..n]` = row above (above[0] is sample at x=0), `above[n]` = top-right.
-/// `left[0..n]`  = column left, `left[n]` = bottom-left.
+/// `left[0..n]`  = column left, `left[n]`  = bottom-left.
+///
+/// The hot encoder path supplies reusable output storage. Only `n*n` samples are
+/// written, so small CUs do not clear or copy the unused tail of a 32×32 buffer.
 #[inline]
-pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 256] {
-    let mut pred = [0u16; 256];
+pub(crate) fn predict_planar_into(above: &[u16], left: &[u16], n: usize, pred: &mut [u16]) {
+    debug_assert!(pred.len() >= n * n);
     let top_right = above[n] as i32;
     let bottom_left = left[n] as i32;
     let log2 = n.trailing_zeros();
 
-    for (row, &left) in left[..n].iter().enumerate() {
+    for (row, (&left, pred_row)) in left[..n]
+        .iter()
+        .zip(pred[..n * n].chunks_exact_mut(n))
+        .enumerate()
+    {
         let lr = left as i32;
         let v_w = (n - 1 - row) as i32;
         let v_b = (row + 1) as i32 * bottom_left;
-        let arow = &above[..n];
-        let prow = &mut pred[row * n..row * n + n];
-        for (col, (prow, &arow)) in prow[..n].iter_mut().zip(arow.iter()).enumerate() {
+        for (col, (dst, &top)) in pred_row.iter_mut().zip(&above[..n]).enumerate() {
             let h = (n - 1 - col) as i32 * lr + (col + 1) as i32 * top_right;
-            let v = v_w * arow as i32 + v_b;
-            *prow = ((h + v + n as i32) >> (log2 + 1)) as u16;
+            let v = v_w * top as i32 + v_b;
+            *dst = ((h + v + n as i32) >> (log2 + 1)) as u16;
         }
     }
+}
+
+#[inline]
+pub(crate) fn predict_planar(above: &[u16], left: &[u16], n: usize) -> [u16; 1024] {
+    let mut pred = [0u16; 1024];
+    predict_planar_into(above, left, n, &mut pred);
     pred
 }
 
@@ -94,35 +104,67 @@ static INV_ANGLE: [i32; 35] = [
 pub(crate) const PLANAR: u8 = 0;
 pub(crate) const DC: u8 = 1;
 
+/// Reusable state for angular prediction. Horizontal modes cache their projected
+/// index/fraction pairs so output can be written in contiguous rows without
+/// rebuilding or clearing temporary arrays for every candidate.
+pub(crate) struct AngularScratch {
+    refs: [i32; 193],
+    indices: [i32; 32],
+    fractions: [i32; 32],
+}
+
+impl AngularScratch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            refs: [0; 193],
+            indices: [0; 32],
+            fractions: [0; 32],
+        }
+    }
+}
+
 /// Predict an N×N block with DC mode (HEVC §8.4.4.2.5). `filter_boundary`
 /// applies the luma edge smoothing of the top row / left column / corner
 /// (skipped for chroma and for n == 32).
+#[inline]
+pub(crate) fn predict_dc_into(
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    filter_boundary: bool,
+    pred: &mut [u16],
+) {
+    debug_assert!(pred.len() >= n * n);
+    let sum = above[..n]
+        .iter()
+        .zip(&left[..n])
+        .fold(0i32, |sum, (&above, &left)| {
+            sum + above as i32 + left as i32
+        });
+    let log2 = n.trailing_zeros();
+    let dc = (sum + n as i32) >> (log2 + 1);
+    pred[..n * n].fill(dc as u16);
+    if filter_boundary && n < 32 {
+        // Corner, first row and first column get a 3:1 / 2:1:1 blend with the refs.
+        pred[0] = ((left[0] as i32 + 2 * dc + above[0] as i32 + 2) >> 2) as u16;
+        for (dst, &above) in pred[1..n].iter_mut().zip(&above[1..n]) {
+            *dst = ((above as i32 + 3 * dc + 2) >> 2) as u16;
+        }
+        for (row, &left) in pred[..n * n].chunks_exact_mut(n).skip(1).zip(&left[1..n]) {
+            row[0] = ((left as i32 + 3 * dc + 2) >> 2) as u16;
+        }
+    }
+}
+
+#[inline]
 pub(crate) fn predict_dc(
     above: &[u16],
     left: &[u16],
     n: usize,
     filter_boundary: bool,
-) -> [u16; 256] {
-    let mut sum = 0i32;
-    for (&above, &left) in above[..n].iter().zip(left[..n].iter()) {
-        sum += above as i32 + left as i32;
-    }
-    let log2 = n.trailing_zeros();
-    let dc = (sum + n as i32) >> (log2 + 1);
-    let mut pred = [0u16; 256];
-    for v in pred[..n * n].iter_mut() {
-        *v = dc as u16;
-    }
-    if filter_boundary && n < 32 {
-        // Corner, first row and first column get a 3:1 / 2:1:1 blend with the refs.
-        pred[0] = ((left[0] as i32 + 2 * dc + above[0] as i32 + 2) >> 2) as u16;
-        for (pred, &above) in pred[1..n].iter_mut().zip(above[1..n].iter()) {
-            *pred = ((above as i32 + 3 * dc + 2) >> 2) as u16;
-        }
-        for (y, &left) in (1..n).zip(left[1..n].iter()) {
-            pred[y * n] = ((left as i32 + 3 * dc + 2) >> 2) as u16;
-        }
-    }
+) -> [u16; 1024] {
+    let mut pred = [0u16; 1024];
+    predict_dc_into(above, left, n, filter_boundary, &mut pred);
     pred
 }
 
@@ -130,6 +172,243 @@ pub(crate) fn predict_dc(
 /// `corner` = p[-1][-1]; `above`/`left` hold p[x][-1] / p[-1][y] for x,y = 0..2n-1.
 /// `filter_boundary` applies the pure-vertical (26) / horizontal (10) luma edge
 /// filter (skipped for chroma and n == 32).
+///
+/// The size dispatch monomorphises the hot loops for every legal HEVC TU size.
+/// Positive-angle modes read their main reference directly; only negative-angle
+/// modes build the extended reference, and they copy just N positive samples.
+#[inline]
+pub(crate) fn predict_angular_into(
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    mode: u8,
+    filter_boundary: bool,
+    max_val: i32,
+    pred: &mut [u16],
+    scratch: &mut AngularScratch,
+) {
+    match n {
+        4 => predict_angular_n::<4>(
+            corner,
+            above,
+            left,
+            mode,
+            filter_boundary,
+            max_val,
+            pred,
+            scratch,
+        ),
+        8 => predict_angular_n::<8>(
+            corner,
+            above,
+            left,
+            mode,
+            filter_boundary,
+            max_val,
+            pred,
+            scratch,
+        ),
+        16 => predict_angular_n::<16>(
+            corner,
+            above,
+            left,
+            mode,
+            filter_boundary,
+            max_val,
+            pred,
+            scratch,
+        ),
+        32 => predict_angular_n::<32>(
+            corner,
+            above,
+            left,
+            mode,
+            filter_boundary,
+            max_val,
+            pred,
+            scratch,
+        ),
+        _ => panic!("unsupported intra prediction size {n}"),
+    }
+}
+
+#[inline]
+fn predict_angular_n<const N: usize>(
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    mode: u8,
+    filter_boundary: bool,
+    max_val: i32,
+    pred: &mut [u16],
+    scratch: &mut AngularScratch,
+) {
+    debug_assert!(pred.len() >= N * N);
+    let pred = &mut pred[..N * N];
+    let angle = INTRA_PRED_ANGLE[mode as usize];
+    let vertical = mode >= 18;
+
+    // Pure vertical/horizontal are common MPMs and need neither interpolation
+    // nor an extended reference array. Write contiguous rows directly.
+    if angle == 0 {
+        if vertical {
+            for (row, &left) in pred.chunks_exact_mut(N).zip(&left[..N]) {
+                row.copy_from_slice(&above[..N]);
+                if filter_boundary && N < 32 {
+                    let value = above[0] as i32 + ((left as i32 - corner as i32) >> 1);
+                    row[0] = value.clamp(0, max_val) as u16;
+                }
+            }
+        } else if filter_boundary && N < 32 {
+            for (dst, &above) in pred[..N].iter_mut().zip(&above[..N]) {
+                let value = left[0] as i32 + ((above as i32 - corner as i32) >> 1);
+                *dst = value.clamp(0, max_val) as u16;
+            }
+            for (row, &sample) in pred.chunks_exact_mut(N).skip(1).zip(&left[1..N]) {
+                row.fill(sample);
+            }
+        } else {
+            for (row, &sample) in pred.chunks_exact_mut(N).zip(&left[..N]) {
+                row.fill(sample);
+            }
+        }
+        return;
+    } else {
+        let (main, side): (&[u16], &[u16]) = if vertical {
+            (above, left)
+        } else {
+            (left, above)
+        };
+
+        if angle > 0 {
+            // The ±32 projection lands exactly on integer references. Both
+            // positive extreme modes become one contiguous row copy.
+            if angle == 32 {
+                for (offset, row) in pred.chunks_exact_mut(N).enumerate() {
+                    row.copy_from_slice(&main[offset + 1..offset + N + 1]);
+                }
+                return;
+            }
+
+            // No inverse projection is needed. Reading `main` directly avoids
+            // copying up to 64 references for roughly half of all angular modes.
+            if vertical {
+                for (outer, row) in pred.chunks_exact_mut(N).enumerate() {
+                    let pos = (outer as i32 + 1) * angle;
+                    let index = (pos >> 5) as usize;
+                    let fraction = pos & 31;
+                    if fraction == 0 {
+                        row.copy_from_slice(&main[index..index + N]);
+                    } else {
+                        for (dst, pair) in row.iter_mut().zip(main[index..index + N + 1].windows(2))
+                        {
+                            *dst = (((32 - fraction) * pair[0] as i32
+                                + fraction * pair[1] as i32
+                                + 16)
+                                >> 5) as u16;
+                        }
+                    }
+                }
+            } else {
+                for (outer, (index, fraction)) in scratch.indices[..N]
+                    .iter_mut()
+                    .zip(scratch.fractions[..N].iter_mut())
+                    .enumerate()
+                {
+                    let pos = (outer as i32 + 1) * angle;
+                    *index = pos >> 5;
+                    *fraction = pos & 31;
+                }
+                for (inner, row) in pred.chunks_exact_mut(N).enumerate() {
+                    for (dst, (&index, &fraction)) in row
+                        .iter_mut()
+                        .zip(scratch.indices[..N].iter().zip(&scratch.fractions[..N]))
+                    {
+                        let base = inner + index as usize;
+                        let a = main[base] as i32;
+                        *dst = if fraction == 0 {
+                            a as u16
+                        } else {
+                            (((32 - fraction) * a + fraction * main[base + 1] as i32 + 16) >> 5)
+                                as u16
+                        };
+                    }
+                }
+            }
+        } else {
+            // refs[OFF + i] = ref[i]. Negative projection is needed only for
+            // modes 11..25; positive entries beyond N are never addressed.
+            const OFF: usize = 64;
+            scratch.refs[OFF] = corner as i32;
+            for (dst, &src) in scratch.refs[OFF + 1..OFF + 1 + N]
+                .iter_mut()
+                .zip(&main[..N])
+            {
+                *dst = src as i32;
+            }
+            let inv = INV_ANGLE[mode as usize];
+            let last = (N as i32 * angle) >> 5;
+            for x in (last..=-1).rev() {
+                let index = (x * inv + 128) >> 8;
+                scratch.refs[(OFF as i32 + x) as usize] = if index <= 0 {
+                    corner as i32
+                } else {
+                    side[(index - 1) as usize] as i32
+                };
+            }
+
+            if vertical {
+                for (outer, row) in pred.chunks_exact_mut(N).enumerate() {
+                    let pos = (outer as i32 + 1) * angle;
+                    let index = pos >> 5;
+                    let fraction = pos & 31;
+                    let start = (OFF as i32 + index + 1) as usize;
+                    if fraction == 0 {
+                        for (dst, &src) in row.iter_mut().zip(&scratch.refs[start..start + N]) {
+                            *dst = src as u16;
+                        }
+                    } else {
+                        for (dst, pair) in row
+                            .iter_mut()
+                            .zip(scratch.refs[start..start + N + 1].windows(2))
+                        {
+                            *dst =
+                                (((32 - fraction) * pair[0] + fraction * pair[1] + 16) >> 5) as u16;
+                        }
+                    }
+                }
+            } else {
+                for (outer, (index, fraction)) in scratch.indices[..N]
+                    .iter_mut()
+                    .zip(scratch.fractions[..N].iter_mut())
+                    .enumerate()
+                {
+                    let pos = (outer as i32 + 1) * angle;
+                    *index = pos >> 5;
+                    *fraction = pos & 31;
+                }
+                for (inner, row) in pred.chunks_exact_mut(N).enumerate() {
+                    for (dst, (&index, &fraction)) in row
+                        .iter_mut()
+                        .zip(scratch.indices[..N].iter().zip(&scratch.fractions[..N]))
+                    {
+                        let base = (OFF as i32 + inner as i32 + index + 1) as usize;
+                        let a = scratch.refs[base];
+                        *dst = if fraction == 0 {
+                            a as u16
+                        } else {
+                            (((32 - fraction) * a + fraction * scratch.refs[base + 1] + 16) >> 5)
+                                as u16
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
 pub(crate) fn predict_angular(
     corner: u16,
     above: &[u16],
@@ -138,90 +417,45 @@ pub(crate) fn predict_angular(
     mode: u8,
     filter_boundary: bool,
     max_val: i32,
-) -> [u16; 256] {
-    let angle = INTRA_PRED_ANGLE[mode as usize];
-    let mut pred = [0u16; 256];
-
-    // Build the main reference array `ref[i]`, i in 0..=2n, indexed from a base
-    // offset so negative projections (angle < 0) are representable.
-    // For vertical modes (>=18) the main reference is the above row; for
-    // horizontal modes (<18) it is the left column (block predicted transposed).
-    let vertical = mode >= 18;
-    let (main, side): (&[u16], &[u16]) = if vertical {
-        (above, left)
-    } else {
-        (left, above)
-    };
-
-    // r[OFF + i] = ref[i]; OFF lets i go negative down to -n.
-    const OFF: usize = 32;
-    let mut r = [0i32; OFF + 64 + 1];
-    r[OFF] = corner as i32;
-    r[OFF + 1..=OFF + 2 * n]
-        .iter_mut()
-        .zip(main[..2 * n].iter())
-        .for_each(|(dst, &src)| *dst = src as i32);
-    if angle < 0 {
-        let inv = INV_ANGLE[mode as usize];
-        let last = (n as i32 * angle) >> 5; // most-negative index needed
-        let mut x = -1;
-        while x >= last {
-            let idx = (x * inv + 128) >> 8; // project onto the side array
-            // ref[x] = p[-1][-1 + idx]: corner if idx==0, else side[idx-1].
-            r[(OFF as i32 + x) as usize] = if idx <= 0 {
-                corner as i32
-            } else {
-                side[(idx - 1) as usize] as i32
-            };
-            x -= 1;
-        }
-    }
-
-    // Primary axis = rows for vertical modes, columns for horizontal modes. For
-    // horizontal modes HEVC swaps the roles of x and y: iIdx/iFact derive from
-    // the primary index, the reference index uses the secondary index.
-    for p_outer in 0..n {
-        let pos = (p_outer as i32 + 1) * angle;
-        let i_idx = pos >> 5;
-        let i_fact = pos & 31;
-        for p_inner in 0..n {
-            let base = OFF as i32 + p_inner as i32 + i_idx + 1;
-            let a = r[base as usize];
-            let b = r[(base + 1) as usize];
-            let val = (((32 - i_fact) * a + i_fact * b + 16) >> 5) as u16;
-            if vertical {
-                pred[p_outer * n + p_inner] = val; // [row y][col x]
-            } else {
-                pred[p_inner * n + p_outer] = val; // [row y][col x], transposed
-            }
-        }
-    }
-
-    if filter_boundary && n < 32 {
-        let max = max_val;
-        if mode == 26 {
-            // pure vertical: first column blended with the left reference
-            for y in 0..n {
-                let v = above[0] as i32 + ((left[y] as i32 - corner as i32) >> 1);
-                pred[y * n] = v.clamp(0, max) as u16;
-            }
-        } else if mode == 10 {
-            // pure horizontal: first row blended with the above reference
-            for (pred, &above) in pred[..n].iter_mut().zip(above[..n].iter()) {
-                let v = left[0] as i32 + ((above as i32 - corner as i32) >> 1);
-                *pred = v.clamp(0, max) as u16;
-            }
-        }
-    }
+) -> [u16; 1024] {
+    let mut pred = [0u16; 1024];
+    let mut scratch = AngularScratch::new();
+    predict_angular_into(
+        corner,
+        above,
+        left,
+        n,
+        mode,
+        filter_boundary,
+        max_val,
+        &mut pred,
+        &mut scratch,
+    );
     pred
 }
 
-/// Predict an N×N block for any luma mode (0=PLANAR, 1=DC, 2..=34 angular),
-/// given raw (unfiltered) references. Applies mode-dependent reference smoothing
-/// internally. `boundary_filter` enables the DC/H/V luma edge filters.
-/// Predict a chroma TB with `mode`, from references already prepared by the
-/// caller (4:4:4 pre-filters them; 4:2:0/4:2:2 do not). Chroma never applies the
-/// DC/H/V boundary edge filter (cIdx > 0).
+/// Predict an N×N block for any chroma mode into reusable storage. Chroma
+/// references are already prepared by the caller and never use the luma-only
+/// DC/H/V boundary filter.
+#[inline]
+pub(crate) fn predict_chroma_tb_into(
+    mode: u8,
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    max_val: i32,
+    pred: &mut [u16],
+    scratch: &mut AngularScratch,
+) {
+    match mode {
+        PLANAR => predict_planar_into(above, left, n, pred),
+        DC => predict_dc_into(above, left, n, false, pred),
+        _ => predict_angular_into(corner, above, left, n, mode, false, max_val, pred, scratch),
+    }
+}
+
+/// Compatibility wrapper used by tests and non-hot callers.
 pub(crate) fn predict_chroma_tb(
     mode: u8,
     corner: u16,
@@ -229,12 +463,20 @@ pub(crate) fn predict_chroma_tb(
     left: &[u16],
     n: usize,
     max_val: i32,
-) -> [u16; 256] {
-    match mode {
-        PLANAR => predict_planar(above, left, n),
-        DC => predict_dc(above, left, n, false),
-        _ => predict_angular(corner, above, left, n, mode, false, max_val),
-    }
+) -> [u16; 1024] {
+    let mut pred = [0u16; 1024];
+    let mut scratch = AngularScratch::new();
+    predict_chroma_tb_into(
+        mode,
+        corner,
+        above,
+        left,
+        n,
+        max_val,
+        &mut pred,
+        &mut scratch,
+    );
+    pred
 }
 
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
@@ -247,15 +489,15 @@ pub(crate) fn filter_references(
     above: &[u16],
     left: &[u16],
     n: usize,
-) -> ([u16; 33], [u16; 33]) {
+) -> ([u16; 65], [u16; 65]) {
     // `above` and `left` have length 2n+1 (indices 0..2n). The HEVC [1 2 1]/4
     // filter (§8.4.4.2.3) is applied to every interior reference sample; only the
     // two extreme endpoints (corner and the farthest above-right / below-left,
     // index 2n) are left unfiltered. predict_planar reads indices 0..=n, so we
     // need filtered values at 0..=n, which requires unfiltered neighbours up to
     // index n+1 — present because we gathered 2n samples.
-    let mut fa = [0u16; 33];
-    let mut fl = [0u16; 33];
+    let mut fa = [0u16; 65];
+    let mut fl = [0u16; 65];
     let ext = 2 * n; // = 2n; derived from n (not array len) so larger buffers are safe
     fa[..=ext].copy_from_slice(&above[..=ext]);
     fl[..=ext].copy_from_slice(&left[..=ext]);
@@ -358,22 +600,22 @@ pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
 #[allow(clippy::too_many_arguments)]
 fn substitute_refs(
     mut corner: u16,
-    mut above: [u16; 33],
-    mut left: [u16; 33],
+    mut above: [u16; 65],
+    mut left: [u16; 65],
     avail_corner: bool,
-    avail_above: &[bool; 33],
-    avail_left: &[bool; 33],
+    avail_above: &[bool; 65],
+    avail_left: &[bool; 65],
     ext: usize,
     neutral: u16,
-) -> (u16, [u16; 33], [u16; 33]) {
+) -> (u16, [u16; 65], [u16; 65]) {
     let any = avail_corner
         || avail_above[..=ext].iter().any(|&a| a)
         || avail_left[..=ext].iter().any(|&a| a);
     if !any {
-        return (neutral, [neutral; 33], [neutral; 33]);
+        return (neutral, [neutral; 65], [neutral; 65]);
     }
     let total = (ext + 1) + 1 + (ext + 1);
-    const MAXT: usize = 67;
+    const MAXT: usize = 131;
     let mut vals = [0u16; MAXT];
     let mut av = [false; MAXT];
     for i in 0..=ext {
@@ -439,7 +681,7 @@ pub(crate) fn get_reference_samples_chroma_pair(
     plane_cb: &[u16],
     plane_cr: &[u16],
     geo: ChromaRefGeometry,
-) -> ((u16, [u16; 33], [u16; 33]), (u16, [u16; 33], [u16; 33])) {
+) -> ((u16, [u16; 65], [u16; 65]), (u16, [u16; 65], [u16; 65])) {
     let ChromaRefGeometry {
         stride,
         block_row,
@@ -457,7 +699,7 @@ pub(crate) fn get_reference_samples_chroma_pair(
     } = geo;
     let width = stride;
     let ext = 2 * n;
-    const MAXE: usize = 33;
+    const MAXE: usize = 65;
     let mut cb_above = [0u16; MAXE];
     let mut cb_left = [0u16; MAXE];
     let mut cr_above = [0u16; MAXE];
@@ -561,7 +803,7 @@ pub(crate) struct LumaRefGeometry {
 pub(crate) fn get_reference_samples(
     plane: &[u16],
     geo: LumaRefGeometry,
-) -> (u16, [u16; 33], [u16; 33]) {
+) -> (u16, [u16; 65], [u16; 65]) {
     let LumaRefGeometry {
         stride,
         block_row,
@@ -574,8 +816,8 @@ pub(crate) fn get_reference_samples(
     } = geo;
     let width = stride;
     let ext = 2 * n; // gather 2N samples per side so the filter can process index N.
-    // ext <= 16 (n <= 8); reference rows live entirely on the stack.
-    const MAXE: usize = 33; // ext+1 <= 33 (n<=16)
+    // ext <= 64 (n <= 32); reference rows live entirely on the stack.
+    const MAXE: usize = 65; // ext+1 <= 65 (n<=32)
     let mut above = [0u16; MAXE]; // above[0..2n] (returned)
     let mut left = [0u16; MAXE]; // left[0..2n]  (returned)
     let mut avail_above = [false; MAXE];
@@ -587,7 +829,7 @@ pub(crate) fn get_reference_samples(
     {
         let nr = block_row as i64 - 1;
         let nc = block_col as i64 - 1;
-        if is_available(nr, nc, block_row, block_col, n, ctu, ctus_x, width, height) {
+        if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
             corner = plane[(nr as usize) * stride + nc as usize];
             avail_corner = true;
         }
@@ -597,7 +839,7 @@ pub(crate) fn get_reference_samples(
         let nr = block_row as i64 - 1;
         for i in 0..=ext {
             let nc = block_col as i64 + i as i64;
-            if is_available(nr, nc, block_row, block_col, n, ctu, ctus_x, width, height) {
+            if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
                 above[i] = plane[(nr as usize) * stride + nc as usize];
                 avail_above[i] = true;
             }
@@ -608,7 +850,7 @@ pub(crate) fn get_reference_samples(
         let nc = block_col as i64 - 1;
         for i in 0..=ext {
             let nr = block_row as i64 + i as i64;
-            if is_available(nr, nc, block_row, block_col, n, ctu, ctus_x, width, height) {
+            if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
                 left[i] = plane[(nr as usize) * stride + nc as usize];
                 avail_left[i] = true;
             }
@@ -617,13 +859,13 @@ pub(crate) fn get_reference_samples(
 
     let any = avail_corner || avail_above.iter().any(|&a| a) || avail_left.iter().any(|&a| a);
     if !any {
-        return (neutral, [neutral; 33], [neutral; 33]);
+        return (neutral, [neutral; 65], [neutral; 65]);
     }
 
     // Ordered scan: bottom-most left (left[2n]) up to left[0], corner, above[0..2n].
-    // total = 2*(ext+1)+1 <= 35; keep the scratch on the stack.
+    // total = 2*(ext+1)+1 <= 131; keep the scratch on the stack.
     let total = (ext + 1) + 1 + (ext + 1);
-    const MAXT: usize = 67;
+    const MAXT: usize = 131;
     let mut vals = [0u16; MAXT];
     let mut av = [false; MAXT];
     for i in 0..=ext {
@@ -659,31 +901,53 @@ pub(crate) fn get_reference_samples(
     (corner, above, left)
 }
 
-/// Integer residual `orig[i] - pred[i]` as `i32`, written directly into a stack
-/// buffer. The HEVC forward transform is integer-domain, so the previous
-/// f32 residual + per-block `Vec<i32>` round-trip was pure overhead — this
-/// avoids both the float conversion and the heap allocation.
-pub(crate) fn compute_residual_i32(orig: &[u16], pred: &[u16], n: usize) -> [i32; 256] {
-    let mut res = [0i32; 256];
-    for (r, (&o, &p)) in res[..n * n].iter_mut().zip(orig.iter().zip(pred.iter())) {
-        *r = o as i32 - p as i32;
+/// Integer residual `orig[i] - pred[i]` as `i32` into reusable storage.
+#[inline]
+pub(crate) fn compute_residual_i32_into(
+    orig: &[u16],
+    pred: &[u16],
+    n: usize,
+    residual: &mut [i32],
+) {
+    let len = n * n;
+    debug_assert!(orig.len() >= len && pred.len() >= len && residual.len() >= len);
+    for (dst, (&orig, &pred)) in residual[..len]
+        .iter_mut()
+        .zip(orig[..len].iter().zip(&pred[..len]))
+    {
+        *dst = orig as i32 - pred as i32;
     }
-    res
 }
 
-/// Reconstruct pixels: clamp(pred[i] + residual[i]) to [0, max_val] → u16.
-/// `max_val` is (1<<bit_depth)-1 (255 for 8-bit, 1023 for 10-bit). The residual
-/// from the inverse transform is integer-valued, so this is exact integer math
-/// (the previous `(p as f32 + r).round()` was a no-op round on integers).
-pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 256] {
-    let mut out = [0u16; 256];
-    let mx = max_val as i32;
-    for (o, (&p, &r)) in out[..n * n]
+pub(crate) fn compute_residual_i32(orig: &[u16], pred: &[u16], n: usize) -> [i32; 1024] {
+    let mut residual = [0i32; 1024];
+    compute_residual_i32_into(orig, pred, n, &mut residual);
+    residual
+}
+
+/// Reconstruct pixels into reusable storage: clamp(pred + residual).
+#[inline]
+pub(crate) fn reconstruct_into(
+    pred: &[u16],
+    residual: &[i32],
+    n: usize,
+    max_val: u16,
+    out: &mut [u16],
+) {
+    let len = n * n;
+    debug_assert!(pred.len() >= len && residual.len() >= len && out.len() >= len);
+    let max_val = max_val as i32;
+    for (dst, (&pred, &residual)) in out[..len]
         .iter_mut()
-        .zip(pred.iter().zip(residual.iter()))
+        .zip(pred[..len].iter().zip(&residual[..len]))
     {
-        *o = (p as i32 + r).clamp(0, mx) as u16;
+        *dst = (pred as i32 + residual).clamp(0, max_val) as u16;
     }
+}
+
+pub(crate) fn reconstruct(pred: &[u16], residual: &[i32], n: usize, max_val: u16) -> [u16; 1024] {
+    let mut out = [0u16; 1024];
+    reconstruct_into(pred, residual, n, max_val, &mut out);
     out
 }
 
@@ -710,6 +974,16 @@ mod tests {
             70, 60, 50, 5, // y=3
         ];
         assert_eq!(&p[..16], &expect, "mode-18 negative diagonal");
+    }
+
+    #[test]
+    fn planar_and_dc_32_flat_are_flat() {
+        let above = [777u16; 65];
+        let left = [777u16; 65];
+        let planar = predict_planar(&above, &left, 32);
+        let dc = predict_dc(&above, &left, 32, false);
+        assert!(planar[..1024].iter().all(|&v| v == 777));
+        assert!(dc[..1024].iter().all(|&v| v == 777));
     }
 
     #[test]
