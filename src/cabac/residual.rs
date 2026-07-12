@@ -61,6 +61,7 @@ pub(crate) fn encode_cbf_chroma(
 ///             `k` within sub-block `sb`.
 /// `log2_ts` — log2 of the TU size (3 = 8×8, 2 = 4×4)
 /// `is_luma` — selects luma vs chroma contexts
+/// `sign_data_hiding` — omit the inferred first-significant sign in eligible CGs
 pub(crate) fn encode_residual(
     enc: &mut CabacEncoder,
     ctx: &mut ContextSet,
@@ -68,6 +69,7 @@ pub(crate) fn encode_residual(
     log2_ts: u32,
     is_luma: bool,
     scan_idx: u8,
+    sign_data_hiding: bool,
 ) {
     let n_coeffs = (1usize << log2_ts) * (1usize << log2_ts);
     debug_assert!(coeffs.len() >= n_coeffs);
@@ -221,6 +223,7 @@ pub(crate) fn encode_residual(
             &sig_positions[..sig_len],
             sb,
             is_luma,
+            sign_data_hiding,
             &mut level_state,
         );
     }
@@ -395,6 +398,17 @@ struct LevelState {
     first_subblock: bool,
 }
 
+#[inline]
+fn sign_is_hidden(sig_pos: &[usize], enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    match (sig_pos.first(), sig_pos.last()) {
+        (Some(&last), Some(&first)) => last - first >= 4,
+        _ => false,
+    }
+}
+
 /// Encode coeff_abs_level_greater1, greater2, sign flags, and remaining levels
 /// for one sub-block. `sig_pos` is in high→low scan order. Mirrors libde265/zune
 /// (and HM) exactly, including the cross-sub-block context carry.
@@ -405,6 +419,7 @@ fn encode_coeff_levels(
     sig_pos: &[usize],
     sb: usize,
     is_luma: bool,
+    sign_data_hiding: bool,
     st: &mut LevelState,
 ) {
     let n = sig_pos.len();
@@ -462,8 +477,17 @@ fn encode_coeff_levels(
         has_max_base[c] = gr2;
     }
 
-    // Signs (bypass), high→low scan order. (sign_data_hiding disabled in our PPS.)
-    for &pos in sig_pos.iter() {
+    // Signs are bypass-coded in high→low scan order. With sign-data hiding,
+    // the sign of the first significant coefficient in scan order (the final
+    // entry here) is inferred from the coefficient-group absolute-sum parity.
+    // HEVC hides it only when lastSigScanPos - firstSigScanPos >= 4.
+    let hide_first_sign = sign_is_hidden(sig_pos, sign_data_hiding);
+    let explicit_signs = if hide_first_sign {
+        &sig_pos[..n - 1]
+    } else {
+        sig_pos
+    };
+    for &pos in explicit_signs {
         enc.encode_bypass((coeffs[pos] < 0) as u8);
     }
 
@@ -551,7 +575,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 8)], 64);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0, false);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -562,7 +586,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 5)], 16);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 2, false, 0);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 2, false, 0, false);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -573,7 +597,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = make_coeffs(&[(0, 12), (1, -3), (2, 1), (8, 5)], 64);
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0, false);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(!out.is_empty());
@@ -584,9 +608,17 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(26);
         let coeffs = vec![0i16; 64];
-        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0);
+        encode_residual(&mut enc, &mut ctx, &coeffs, 3, true, 0, false);
         enc.encode_terminate(1);
         let out = enc.finish();
         assert!(out.len() < 4); // only the terminate flush
+    }
+
+    #[test]
+    fn sign_hiding_threshold_is_four_scan_positions() {
+        assert!(!sign_is_hidden(&[3, 0], true));
+        assert!(sign_is_hidden(&[4, 0], true));
+        assert!(sign_is_hidden(&[15, 11, 4], true));
+        assert!(!sign_is_hidden(&[15, 4], false));
     }
 }

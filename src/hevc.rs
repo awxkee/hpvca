@@ -464,7 +464,9 @@ pub(crate) fn build_pps(qp: u8, lossless: bool) -> Nalu {
     bw.write_bit(false); // dependent_slice_segments_enabled_flag
     bw.write_bit(false); // output_flag_present_flag
     bw.write_bits(0, 3); // num_extra_slice_header_bits
-    bw.write_bit(false); // sign_data_hiding_enabled_flag
+    // Sign-data hiding saves one bypass-coded sign in each eligible 4×4
+    // coefficient group. It is disabled for transquant-bypass/lossless CUs.
+    bw.write_bit(!lossless); // sign_data_hiding_enabled_flag
     bw.write_bit(false); // cabac_init_present_flag
     bw.write_ue(0); // num_ref_idx_l0_default_active_minus1
     bw.write_ue(0); // num_ref_idx_l1_default_active_minus1
@@ -1520,18 +1522,22 @@ fn encode_cu(
             }
             (cbl, crl)
         } else {
+            let cb_coeff = crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits());
+            let cr_coeff = crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits());
             (
-                crate::hevc_transform::quantize(
-                    &crate::hevc_transform::fwd_transform(&b_res, ctb, bit_depth.bits()),
+                crate::hevc_transform::quantize_with_sign_hiding(
+                    &cb_coeff,
                     ctb,
                     chroma_qp,
                     bit_depth.bits(),
+                    chroma_scan,
                 ),
-                crate::hevc_transform::quantize(
-                    &crate::hevc_transform::fwd_transform(&r_res, ctb, bit_depth.bits()),
+                crate::hevc_transform::quantize_with_sign_hiding(
+                    &cr_coeff,
                     ctb,
                     chroma_qp,
                     bit_depth.bits(),
+                    chroma_scan,
                 ),
             )
         };
@@ -1614,7 +1620,13 @@ fn encode_cu(
     } else {
         let y_tcoeff =
             crate::hevc_transform::fwd_transform(&y_res[..lu * lu], lu, bit_depth.bits());
-        crate::hevc_transform::quantize(&y_tcoeff, lu, qp, bit_depth.bits()) // row-major levels
+        crate::hevc_transform::quantize_with_sign_hiding(
+            &y_tcoeff,
+            lu,
+            qp,
+            bit_depth.bits(),
+            luma_scan,
+        ) // row-major levels
     };
     // Reorder row-major levels into the mode-dependent scan for residual_coding.
     let y_zigzag: Vec<i16> = luma_scan
@@ -1642,17 +1654,41 @@ fn encode_cu(
     // Order: luma, then all Cb chroma TBs, then all Cr chroma TBs (component-major).
     // Chroma TB size is log2_ctb (2 for 4:2:0/4:2:2, 3 for 4:4:4).
     if y_nz {
-        encode_residual(enc, ctx, &y_zigzag, luma_log2_ts, true, luma_scan_idx);
+        encode_residual(
+            enc,
+            ctx,
+            &y_zigzag,
+            luma_log2_ts,
+            true,
+            luma_scan_idx,
+            !lossless,
+        );
     }
     let chroma_scan_idx = chroma_tb_scan_idx;
     for t in &tbs[..n_chroma_tb] {
         if t.cb_nz {
-            encode_residual(enc, ctx, &t.cb_zz, log2_ctb, false, chroma_scan_idx);
+            encode_residual(
+                enc,
+                ctx,
+                &t.cb_zz,
+                log2_ctb,
+                false,
+                chroma_scan_idx,
+                !lossless,
+            );
         }
     }
     for t in &tbs[..n_chroma_tb] {
         if t.cr_nz {
-            encode_residual(enc, ctx, &t.cr_zz, log2_ctb, false, chroma_scan_idx);
+            encode_residual(
+                enc,
+                ctx,
+                &t.cr_zz,
+                log2_ctb,
+                false,
+                chroma_scan_idx,
+                !lossless,
+            );
         }
     }
 

@@ -1445,8 +1445,6 @@ fn extract_plane_tile(
     tile
 }
 
-// ── Validation helpers ────────────────────────────────────────────────────────
-
 pub(crate) fn validate_dims(width: u32, height: u32) -> Result<(), EncodeError> {
     if width < MIN_DIM || height < MIN_DIM || width > MAX_DIM || height > MAX_DIM {
         return Err(EncodeError::InvalidDimensions { width, height });
@@ -1522,8 +1520,6 @@ fn pad_buf<const N: usize>(src: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec
     }
     out
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

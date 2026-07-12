@@ -131,23 +131,175 @@ fn fwd_transform_n<const N: usize>(
     }
 }
 
-/// Forward quantization: coeff → level. Returns a fixed 64-entry buffer.
-pub(crate) fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; MAX_TB] {
+/// Forward quantization followed by HEVC sign-data hiding.
+///
+/// `scan` is the TU's coefficient scan in sub-block-major order. The level
+/// adjustment is the distortion-only `signBitHidingHDQ` method used by HM: for
+/// each eligible 4×4 coefficient group, change the cheapest magnitude by one so
+/// the parity of the absolute-level sum carries the first significant sign.
+pub(crate) fn quantize_with_sign_hiding(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+) -> [i16; MAX_TB] {
+    debug_assert_eq!(scan.len(), n * n);
+    quantize_impl(coeff, n, qp, bit_depth, Some(scan))
+}
+
+fn quantize_impl(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    sign_hiding_scan: Option<&[(usize, usize)]>,
+) -> [i16; MAX_TB] {
     let log2n = n.trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
     let q_scale = QUANT_SCALE[(qp % 6) as usize];
     let offset = 171i64 << (q_bits - 9); // intra
+    let q_bits_8 = q_bits - 8;
     let mut out = [0i16; MAX_TB];
-    for (o, &c) in out[..n * n].iter_mut().zip(coeff) {
+    let mut delta_u = [0i32; MAX_TB];
+    let mut abs_sum = 0u32;
+
+    for (i, (o, &c)) in out[..n * n].iter_mut().zip(coeff).enumerate() {
         // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
         // overflows i32; keep this one multiply in i64.
         let c = c as i64;
-        let level = (c.abs() * q_scale + offset) >> q_bits;
-        let level = if c < 0 { -level } else { level };
+        let scaled = c.abs() * q_scale;
+        let magnitude = (scaled + offset) >> q_bits;
+        delta_u[i] = ((scaled - (magnitude << q_bits)) >> q_bits_8) as i32;
+        let level = if c < 0 { -magnitude } else { magnitude };
         *o = level.clamp(-32768, 32767) as i16;
+        abs_sum = abs_sum.saturating_add((*o).unsigned_abs() as u32);
+    }
+
+    // HM avoids testing the degenerate one-coefficient, unit-level TU.
+    if abs_sum >= 2 {
+        if let Some(scan) = sign_hiding_scan {
+            sign_bit_hiding_hdq(&mut out, coeff, &delta_u, n, scan);
+        }
     }
     out
+}
+
+/// HEVC/HM signBitHidingHDQ, distortion-only variant (no rate term).
+///
+/// One sign may be hidden per 4×4 coefficient group when the distance between
+/// its first and last significant scan positions is at least four. If the
+/// current parity does not encode the first sign, choose the ±1 level change
+/// with the smallest quantization-error increase while preserving a decodable
+/// first-significant coefficient.
+fn sign_bit_hiding_hdq(
+    levels: &mut [i16; MAX_TB],
+    coeff: &[i32],
+    delta_u: &[i32; MAX_TB],
+    n: usize,
+    scan: &[(usize, usize)],
+) {
+    const GROUP_SIZE: usize = 16;
+    const SBH_THRESHOLD: usize = 4;
+
+    let num_coeffs = n * n;
+    debug_assert_eq!(num_coeffs % GROUP_SIZE, 0);
+    debug_assert!(coeff.len() >= num_coeffs);
+    debug_assert_eq!(scan.len(), num_coeffs);
+
+    let mut found_last_group = false;
+    for subset in (0..num_coeffs / GROUP_SIZE).rev() {
+        let sub_pos = subset * GROUP_SIZE;
+        let group = &scan[sub_pos..sub_pos + GROUP_SIZE];
+        let row_major = |scan_pos: usize| {
+            let (row, col) = group[scan_pos];
+            row * n + col
+        };
+
+        let Some(first_nz) = (0..GROUP_SIZE).find(|&i| levels[row_major(i)] != 0) else {
+            continue;
+        };
+        let last_nz = (0..GROUP_SIZE)
+            .rev()
+            .find(|&i| levels[row_major(i)] != 0)
+            .expect("non-empty coefficient group has a last coefficient");
+
+        let is_last_group = !found_last_group;
+        found_last_group = true;
+
+        if last_nz - first_nz < SBH_THRESHOLD {
+            continue;
+        }
+
+        // Signed and absolute sums have identical parity in two's-complement
+        // arithmetic, matching HM's signed pQCoef accumulation.
+        let sum: i32 = (first_nz..=last_nz)
+            .map(|i| levels[row_major(i)] as i32)
+            .sum();
+        let first_pos = row_major(first_nz);
+        let sign_bit = (levels[first_pos] < 0) as i32;
+        if sign_bit == (sum & 1) {
+            continue;
+        }
+
+        let search_top = if is_last_group {
+            last_nz
+        } else {
+            GROUP_SIZE - 1
+        };
+        let mut best_cost = i64::MAX;
+        let mut best_pos = None;
+        let mut best_change = 0i32;
+
+        for i in (0..=search_top).rev() {
+            let pos = row_major(i);
+            let level = levels[pos];
+            let delta = delta_u[pos] as i64;
+
+            let candidate = if level != 0 {
+                if delta > 0 {
+                    Some((-delta, 1))
+                } else if i == first_nz && level.unsigned_abs() == 1 {
+                    // Removing the coefficient whose sign is being hidden would
+                    // change which sign the decoder infers.
+                    None
+                } else {
+                    Some((delta, -1))
+                }
+            } else if i < first_nz {
+                // Creating a new first significant coefficient is legal only if
+                // its natural sign equals the sign currently being hidden.
+                let this_sign = (coeff[pos] < 0) as i32;
+                if this_sign == sign_bit {
+                    Some((-delta, 1))
+                } else {
+                    None
+                }
+            } else {
+                Some((-delta, 1))
+            };
+
+            if let Some((cost, change)) = candidate {
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_pos = Some(pos);
+                    best_change = change;
+                }
+            }
+        }
+
+        let pos = best_pos.expect("eligible sign-hiding group has a valid adjustment");
+        if levels[pos] == i16::MAX || levels[pos] == i16::MIN {
+            best_change = -1;
+        }
+        let adjusted = if coeff[pos] >= 0 {
+            levels[pos] as i32 + best_change
+        } else {
+            levels[pos] as i32 - best_change
+        };
+        levels[pos] = adjusted.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
 }
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3). Fixed 64-entry buffer.
@@ -290,6 +442,11 @@ mod tests {
         flat_is_dc_only(16);
     }
 
+    /// Forward quantization: coeff → level. Returns a fixed 256-entry buffer.
+    fn quantize(coeff: &[i32], n: usize, qp: u8, bit_depth: u8) -> [i16; MAX_TB] {
+        quantize_impl(coeff, n, qp, bit_depth, None)
+    }
+
     /// Full pipeline residual → fwd → quant → dequant → inv reconstructs the
     /// residual within the quantization error. At low QP the error is small;
     /// a gross T16/scan/buffer bug would blow this far past tolerance.
@@ -343,5 +500,83 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|&b| b), "scan does not cover all positions");
+    }
+
+    #[test]
+    fn sign_hiding_fixes_group_parity() {
+        let scan = crate::dct::coeff_scan(2, 0);
+        let mut levels = [0i16; MAX_TB];
+        let mut coeff = [0i32; MAX_TB];
+        let delta_u = [0i32; MAX_TB];
+
+        let (r0, c0) = scan[0];
+        let (r4, c4) = scan[4];
+        let p0 = r0 * 4 + c0;
+        let p4 = r4 * 4 + c4;
+        levels[p0] = -1;
+        levels[p4] = 3;
+        coeff[p0] = -100;
+        coeff[p4] = 300;
+
+        sign_bit_hiding_hdq(&mut levels, &coeff, &delta_u, 4, scan);
+
+        assert_eq!(levels[p0], -1);
+        assert_eq!(levels[p4], 2);
+        let parity = levels[p0].unsigned_abs() as u32 + levels[p4].unsigned_abs() as u32;
+        assert_eq!((parity & 1) as i32, (levels[p0] < 0) as i32);
+    }
+
+    #[test]
+    fn sign_hiding_uses_each_coefficient_group_independently() {
+        let scan = crate::dct::coeff_scan(3, 0);
+        let mut levels = [0i16; MAX_TB];
+        let mut coeff = [0i32; MAX_TB];
+        let delta_u = [0i32; MAX_TB];
+
+        for group in 0..4 {
+            let first = group * 16;
+            let last = first + 4;
+            let (r0, c0) = scan[first];
+            let (r4, c4) = scan[last];
+            let p0 = r0 * 8 + c0;
+            let p4 = r4 * 8 + c4;
+            levels[p0] = -1;
+            levels[p4] = 3;
+            coeff[p0] = -100;
+            coeff[p4] = 300;
+        }
+
+        sign_bit_hiding_hdq(&mut levels, &coeff, &delta_u, 8, scan);
+
+        for group in 0..4 {
+            let start = group * 16;
+            let group_scan = &scan[start..start + 16];
+            let first = (0..16)
+                .find(|&i| {
+                    let (r, c) = group_scan[i];
+                    levels[r * 8 + c] != 0
+                })
+                .unwrap();
+            let last = (0..16)
+                .rev()
+                .find(|&i| {
+                    let (r, c) = group_scan[i];
+                    levels[r * 8 + c] != 0
+                })
+                .unwrap();
+            assert!(last - first >= 4, "group {group}");
+            let sum: u32 = (first..=last)
+                .map(|i| {
+                    let (r, c) = group_scan[i];
+                    levels[r * 8 + c].unsigned_abs() as u32
+                })
+                .sum();
+            let (r, c) = group_scan[first];
+            assert_eq!(
+                (sum & 1) as i32,
+                (levels[r * 8 + c] < 0) as i32,
+                "group {group}"
+            );
+        }
     }
 }
