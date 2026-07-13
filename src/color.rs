@@ -27,14 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/// CICP colour primaries (ISO/IEC 23091-2 Table 2).
+/// CICP color primaries (ISO/IEC 23091-2 Table 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Primaries {
     /// For future use by ITU-T | ISO/IEC
     Reserved,
     /// Rec. ITU-R BT.709-6<br />
-    /// Rec. ITU-R BT.1361-0 conventional colour gamut system and extended colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 conventional color gamut system and extended color gamut system (historical)<br />
     /// IEC 61966-2-1 sRGB or sYCC IEC 61966-2-4<br />
     /// Society of Motion Picture and Television Engineers (MPTE) RP 177 (1993) Annex B<br />
     Bt709 = 1,
@@ -56,7 +56,7 @@ pub enum Primaries {
     Bt601 = 6,
     /// SMPTE 240M (1999) (historical) (functionally the same as the value 6)<br />
     Smpte240 = 7,
-    /// Generic film (colour filters using Illuminant C)<br />
+    /// Generic film (color filters using Illuminant C)<br />
     GenericFilm = 8,
     /// Rec. ITU-R BT.2020-2<br />
     /// Rec. ITU-R BT.2100-0<br />
@@ -79,7 +79,7 @@ pub enum TransferFunction {
     /// For future use by ITU-T | ISO/IEC
     Reserved,
     /// Rec. ITU-R BT.709-6<br />
-    /// Rec. ITU-R BT.1361-0 conventional colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 conventional color gamut system (historical)<br />
     /// (functionally the same as the values 6, 14 and 15)    <br />
     Bt709 = 1,
     /// Image characteristics are unknown or are determined by the application.<br />
@@ -106,7 +106,7 @@ pub enum TransferFunction {
     Log100sqrt10 = 10,
     /// IEC 61966-2-4<br />
     Iec61966 = 11,
-    /// Rec. ITU-R BT.1361-0 extended colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 extended color gamut system (historical)<br />
     Bt1361 = 12,
     /// IEC 61966-2-1 sRGB or sYCC<br />
     Srgb = 13,
@@ -160,7 +160,7 @@ pub struct Cicp {
 
 impl Cicp {
     /// sRGB: BT.709 primaries, sRGB transfer, BT.709 matrix, full range. This is the
-    /// encoder's working colour space (full-range BT.709 RGB→YCbCr).
+    /// encoder's working color space (full-range BT.709 RGB→YCbCr).
     pub const fn srgb() -> Self {
         Cicp {
             primaries: Primaries::Bt709,
@@ -190,12 +190,6 @@ impl Cicp {
         }
     }
 
-    /// Unspecified colorimetry (CICP value 2 for primaries/transfer/matrix),
-    /// full range. Use this — or simply leave the CICP unset — when the color
-    /// space should not be asserted in the file. Note the encoder always
-    /// performs the RGB→YCbCr conversion with full-range BT.709 math regardless,
-    /// so "unspecified" signals only the *display* interpretation; a decoder may
-    /// fall back to its own default matrix.
     pub const fn unspecified() -> Self {
         Cicp {
             primaries: Primaries::Unspecified,
@@ -206,7 +200,7 @@ impl Cicp {
     }
 
     /// The `nclx` payload for a HEIF `colr` box (without the box header):
-    /// `colour_type` ('nclx') + the four CICP fields. The `full_range_flag` occupies
+    /// `color_type` ('nclx') + the four CICP fields. The `full_range_flag` occupies
     /// the top bit of the final byte; the low 7 bits are reserved zero.
     pub fn nclx_payload(&self) -> Vec<u8> {
         let mut p = Vec::with_capacity(11);
@@ -225,7 +219,7 @@ impl Default for Cicp {
     }
 }
 
-/// How the output colour space is described in the file.
+/// How the output color space is described in the file.
 #[derive(Clone, Debug)]
 pub struct ColorMetadata {
     pub cicp: Option<Cicp>,
@@ -233,7 +227,7 @@ pub struct ColorMetadata {
 }
 
 impl ColorMetadata {
-    /// CICP-only signalling (`nclx` box).
+    /// CICP-only signaling (`nclx` box).
     pub fn cicp(enc: Cicp) -> Self {
         ColorMetadata {
             cicp: Some(enc),
@@ -241,7 +235,7 @@ impl ColorMetadata {
         }
     }
 
-    /// ICC-only signalling (`prof` box).
+    /// ICC-only signaling (`prof` box).
     pub fn icc(profile: Vec<u8>) -> Self {
         ColorMetadata {
             cicp: None,

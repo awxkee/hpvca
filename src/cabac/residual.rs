@@ -381,7 +381,7 @@ fn encode_last_sig<W: CabacWriter>(
 /// sig_coeff_flag context increment — faithful port of libde265/zune logic.
 ///
 /// `xc,yc` are the coefficient's position within the whole TU. `prev_csbf` is the
-/// 2-bit neighbour code for this coefficient's sub-block (bit0 = right sub-block
+/// 2-bit neighbor code for this coefficient's sub-block (bit0 = right sub-block
 /// coded, bit1 = bottom sub-block coded). `scan_idx` is 0=diag, 1=horiz, 2=vert.
 pub(crate) fn sig_coeff_ctx(
     xc: usize,

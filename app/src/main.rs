@@ -43,7 +43,7 @@ fn main() {
         img.height(),
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv444)
-            .with_lossless(true),
+            .with_lossless(false),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

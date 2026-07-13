@@ -29,7 +29,7 @@
 use crate::{error::EncodeError, hevc::NaluStream};
 
 /// Output-side image metadata common to every `wrap_hevc_*` entry point: the
-/// sample bit depth plus the colour and image-metadata blocks written into the
+/// sample bit depth plus the color and image-metadata blocks written into the
 /// `meta` box. Bundled so the wrappers take this instead of three loose params.
 #[derive(Clone, Copy)]
 pub(crate) struct ImageMeta<'a> {
@@ -1061,7 +1061,7 @@ pub(crate) fn wrap_hevc_grid(
 
             // Tile items: hvcC(1,essential) + ispe_tile(2,essential) + colr(4,essential)
             // Apple's encoder marks colr essential on each tile so VideoToolbox can
-            // set up colour management per-tile during grid decoding.
+            // set up color management per-tile during grid decoding.
             for i in 1..=n_tiles {
                 w16(&mut f, i);
                 f.push(3);
@@ -1750,7 +1750,7 @@ mod tests {
         )
         .unwrap();
         // windows().position() returns the start of the fourcc bytes directly.
-        let iloc_fourcc = b.windows(4).position(|w| w == b"iloc").unwrap();
+        let iloc_fourcc = b.array_windows::<4>().position(|w| w == b"iloc").unwrap();
         let ver = b[iloc_fourcc + 4]; // version byte (first fullbox byte)
         let base_sz = (b[iloc_fourcc + 9] >> 4) & 0xF; // field2 high nibble = base_offset_size
         assert_eq!(ver, 0, "iloc must be version 0");
@@ -1808,7 +1808,7 @@ mod tests {
         //   box(8) + fullbox(4) + fields(2) + item_count(2) = 16
         //   item: item_id(2) + data_ref(2) + base_offset(4) + extent_count(2) = 10
         //   extent_offset here (4 bytes)
-        let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
+        let iloc_pos = b.array_windows::<4>().position(|w| w == b"iloc").unwrap() - 4;
         let offset_pos = iloc_pos + 16 + 10;
         let extent_offset = u32::from_be_bytes(b[offset_pos..offset_pos + 4].try_into().unwrap());
         assert_eq!(extent_offset, mdat_payload);
@@ -1827,7 +1827,7 @@ mod tests {
             },
         )
         .unwrap();
-        let ipco_start = b.windows(4).position(|w| w == b"ipco").unwrap() + 4;
+        let ipco_start = b.array_windows::<4>().position(|w| w == b"ipco").unwrap() + 4;
         let first_child = &b[ipco_start + 4..ipco_start + 8];
         assert_eq!(first_child, b"hvcC", "first ipco property must be hvcC");
         // second property should be colr
@@ -1854,11 +1854,14 @@ mod tests {
         )
         .unwrap();
         let s = b.as_slice();
-        assert!(s.windows(4).any(|w| w == b"iref"));
-        assert!(s.windows(4).any(|w| w == b"auxl"));
-        assert!(s.windows(4).any(|w| w == b"auxC"));
-        assert!(s.windows(26).any(|w| w == b"urn:mpeg:hevc:2015:auxid:1"));
-        let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
+        assert!(s.array_windows::<4>().any(|w| w == b"iref"));
+        assert!(s.array_windows::<4>().any(|w| w == b"auxl"));
+        assert!(s.array_windows::<4>().any(|w| w == b"auxC"));
+        assert!(
+            s.array_windows::<26>()
+                .any(|w| w == b"urn:mpeg:hevc:2015:auxid:1")
+        );
+        let ipma_pos = s.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
         assert_eq!(entry_count, 2);
     }

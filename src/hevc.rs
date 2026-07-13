@@ -343,10 +343,10 @@ pub(crate) fn build_sps(
     bw.write_ue(0); // sps_seq_parameter_set_id = 0
 
     bw.write_ue(chroma.idc()); // chroma_format_idc (1=4:2:0, 2=4:2:2, 3=4:4:4)
-    // separate_colour_plane_flag is present only when chroma_format_idc == 3. We use
+    // separate_color_plane_flag is present only when chroma_format_idc == 3. We use
     // packed 4:4:4 (the three components share one coding tree), so the flag is 0.
     if chroma.idc() == 3 {
-        bw.write_bit(false); // separate_colour_plane_flag = 0
+        bw.write_bit(false); // separate_color_plane_flag = 0
     }
 
     // Picture dimensions = multiple of the CTB size (64). This declares full CTBs
@@ -423,7 +423,7 @@ pub(crate) fn build_sps(
     // would make encoder and decoder predictions diverge.
     bw.write_bit(false); // strong_intra_smoothing_enabled_flag
 
-    // VUI parameters: colour info so decoders display correctly
+    // VUI parameters: color info so decoders display correctly
     bw.write_bit(true); // vui_parameters_present_flag
     write_vui(&mut bw, color);
 
@@ -455,7 +455,7 @@ pub(crate) fn build_sps(
 /// apply the wrong inverse matrix).
 ///
 /// When `color` is `None` the colorimetry is left **unspecified**:
-/// `colour_description_present_flag = 0`. The `video_signal_type` is still
+/// `color_description_present_flag = 0`. The `video_signal_type` is still
 /// signalled with `video_full_range_flag` so the sample range is unambiguous —
 /// the encoder always converts in full range, so that flag defaults to set.
 fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
@@ -468,13 +468,13 @@ fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
     bw.write_bit(color.map(|c| c.full_range).unwrap_or(true)); // video_full_range_flag
     match color {
         Some(c) => {
-            bw.write_bit(true); // colour_description_present_flag
-            bw.write_bits(c.primaries as u32, 8); // colour_primaries
+            bw.write_bit(true); // color_description_present_flag
+            bw.write_bits(c.primaries as u32, 8); // color_primaries
             bw.write_bits(c.transfer as u32, 8); // transfer_characteristics
             bw.write_bits(c.matrix as u32, 8); // matrix_coefficients (e.g. 8 = YCgCo)
         }
         None => {
-            bw.write_bit(false); // colour_description_present_flag = 0 (unspecified)
+            bw.write_bit(false); // color_description_present_flag = 0 (unspecified)
         }
     }
 
@@ -640,9 +640,9 @@ fn build_idr_slice(
     // HM-style intra Lagrange multiplier for J = SSE + λ·R (R in bits).
     let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
     // Per-8×8-block quadtree depth (1/2/3 for 32/16/8 leaves); drives the
-    // split_cu_flag context from the depths of the left and above neighbours.
+    // split_cu_flag context from the depths of the left and above neighbors.
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
-    // Per-8×8-block luma intra mode (for neighbour MPM derivation).
+    // Per-8×8-block luma intra mode (for neighbor MPM derivation).
     let blk_stride = w / 8;
     let mut mode_map = vec![0u8; (w / 8) * (h / 8)];
     // One reusable work area per independently encoded slice/tile. Boxing the
@@ -1305,7 +1305,7 @@ fn mpm_list(cand_a: u8, cand_b: u8) -> [u8; 3] {
     }
 }
 
-/// Decode-order availability for the block containing neighbour pixel (nr,nc),
+/// Decode-order availability for the block containing neighbor pixel (nr,nc),
 /// relative to the current block at (cur_r,cur_c). CTUs raster, sub-blocks Z-scan.
 fn is_block_decoded(
     nr: usize,
@@ -1695,7 +1695,7 @@ fn fast_cu_split_score(state: &CuTreeState<'_>, row: usize, col: usize, size: us
         + midline_sse as f32 * if size == 32 { 0.35 } else { 0.50 };
 
     // Four children add three extra CU headers/modes plus more CBF/residual
-    // signalling. Lambda already carries the QP dependence, while the larger
+    // signaling. Lambda already carries the QP dependence, while the larger
     // penalty at 16×16 avoids exploding into 8×8 CUs for mild texture.
     let extra_bits = if size == 32 { 52.0 } else { 76.0 };
     // Measurements above are normalized to 8-bit. Scale the rate term into
@@ -1891,7 +1891,7 @@ fn encode_cu<W: CabacWriter>(
     // ── Luma intra prediction + mode decision ────────────────────────────────
     const PLANAR: u8 = 0;
     const DC: u8 = 1;
-    // MPM candidates from neighbour modes (HEVC §8.4.2): candA = left, candB =
+    // MPM candidates from neighbor modes (HEVC §8.4.2): candA = left, candB =
     // above (DC if unavailable or in a different CTB row). Modes come from the
     // per-block mode map written by previously coded CUs.
     let ctb = 64usize;
@@ -2185,7 +2185,7 @@ fn encode_cu<W: CabacWriter>(
     // ── Luma intra pred mode syntax ──────────────────────────────────────────
     encode_luma_mode(enc, ictx, luma_mode, &mpm);
 
-    // Record this CU's luma mode for neighbours' MPM derivation.
+    // Record this CU's luma mode for neighbors' MPM derivation.
     for br in 0..(lu / 8) {
         for bc in 0..(lu / 8) {
             mode_map[((lu_row / 8) + br) * blk_stride + (lu_col / 8) + bc] = luma_mode;
@@ -2957,7 +2957,7 @@ mod tests {
         assert_eq!(candidates.map(|candidate| candidate.mode), [20, 50, 30]);
         assert!(
             candidates
-                .windows(2)
+                .array_windows::<2>()
                 .all(|pair| pair[0].cost <= pair[1].cost)
         );
     }

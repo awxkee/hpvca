@@ -143,7 +143,7 @@ impl CtxModel {
         bits
     }
 
-    /// Initialise from HEVC spec §9.3.2.2.
+    /// Initialize from HEVC spec §9.3.2.2.
     pub(crate) fn init(init_value: u8, qp: u8) -> Self {
         // HEVC §9.3.2.2 context initialization.
         let slope_idx = (init_value >> 4) as i32;
@@ -282,7 +282,7 @@ impl CabacEncoder {
         }
     }
 
-    /// Renormalise after a context-coded bin.
+    /// Renormalize after a context-coded bin.
     #[inline]
     fn renorm(&mut self) {
         while self.m_range < 256 {

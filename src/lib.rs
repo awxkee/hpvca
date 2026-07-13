@@ -346,7 +346,7 @@ pub fn encode_rgba12_with_alpha(
     encode_rgba_with_alpha_wide(rgba, width, height, BitDepth::Twelve, cfg)
 }
 
-/// Encode a packed 8-bit greyscale image to HEIC (monochrome, no chroma).
+/// Encode a packed 8-bit grayscale image to HEIC (monochrome, no chroma).
 ///
 /// `gray` must hold exactly `width * height` bytes.
 pub fn encode_gray(
@@ -362,7 +362,7 @@ pub fn encode_gray(
     encode_gray_wide(&wide, width, height, BitDepth::Eight, cfg)
 }
 
-/// Encode a packed 8-bit greyscale + alpha image to HEIC. Alpha is **discarded**.
+/// Encode a packed 8-bit grayscale + alpha image to HEIC. Alpha is **discarded**.
 /// Use [`encode_gray_alpha_with_alpha`] to preserve it.
 ///
 /// `ya` must hold exactly `width * height * 2` bytes in Y, A order.
@@ -384,7 +384,7 @@ pub fn encode_gray_alpha(
     encode_gray_wide(&wide, width, height, BitDepth::Eight, cfg)
 }
 
-/// Encode a packed 8-bit greyscale + alpha image to HEIC with a separate
+/// Encode a packed 8-bit grayscale + alpha image to HEIC with a separate
 /// alpha auxiliary image per ISO/IEC 23008-12.
 ///
 /// `ya` must hold exactly `width * height * 2` bytes in Y, A order.
@@ -401,7 +401,7 @@ pub fn encode_gray_alpha_with_alpha(
     encode_gray_alpha_wide(&wide, width, height, BitDepth::Eight, cfg)
 }
 
-/// Encode a 10-bit greyscale image to HEIC.
+/// Encode a 10-bit grayscale image to HEIC.
 ///
 /// `gray` must hold exactly `width * height` samples in `0..=1023`, packed as `u16`.
 pub fn encode_gray10(
@@ -416,7 +416,7 @@ pub fn encode_gray10(
     encode_gray_wide(gray, width, height, BitDepth::Ten, cfg)
 }
 
-/// Encode a 10-bit greyscale + alpha image to HEIC. Alpha is **discarded**.
+/// Encode a 10-bit grayscale + alpha image to HEIC. Alpha is **discarded**.
 ///
 /// `ya` must hold exactly `width * height * 2` samples in Y, A order,
 /// each in `0..=1023`, packed as `u16`.
@@ -433,7 +433,7 @@ pub fn encode_gray_alpha10(
     encode_gray_wide(&luma, width, height, BitDepth::Ten, cfg)
 }
 
-/// Encode a 10-bit greyscale + alpha image to HEIC with a separate alpha
+/// Encode a 10-bit grayscale + alpha image to HEIC with a separate alpha
 /// auxiliary image.
 ///
 /// `ya` must hold exactly `width * height * 2` samples in Y, A order,
@@ -450,7 +450,7 @@ pub fn encode_gray_alpha10_with_alpha(
     encode_gray_alpha_wide(ya, width, height, BitDepth::Ten, cfg)
 }
 
-/// Encode a 12-bit greyscale image to HEIC.
+/// Encode a 12-bit grayscale image to HEIC.
 ///
 /// `gray` must hold exactly `width * height` samples in `0..=4095`, packed as `u16`.
 pub fn encode_gray12(
@@ -465,7 +465,7 @@ pub fn encode_gray12(
     encode_gray_wide(gray, width, height, BitDepth::Twelve, cfg)
 }
 
-/// Encode a 12-bit greyscale + alpha image to HEIC. Alpha is **discarded**.
+/// Encode a 12-bit grayscale + alpha image to HEIC. Alpha is **discarded**.
 ///
 /// `ya` must hold exactly `width * height * 2` samples in Y, A order,
 /// each in `0..=4095`, packed as `u16`.
@@ -482,7 +482,7 @@ pub fn encode_gray_alpha12(
     encode_gray_wide(&luma, width, height, BitDepth::Twelve, cfg)
 }
 
-/// Encode a 12-bit greyscale + alpha image to HEIC with a separate alpha
+/// Encode a 12-bit grayscale + alpha image to HEIC with a separate alpha
 /// auxiliary image.
 ///
 /// `ya` must hold exactly `width * height * 2` samples in Y, A order,
@@ -607,10 +607,10 @@ fn encode_rgba_with_alpha_wide(
     let (w, h) = (width as usize, height as usize);
     let (nw, nh) = (enc_w as usize, enc_h as usize);
 
-    let mut colour_buf = vec![0u16; nw * nh * 3];
+    let mut color_buf = vec![0u16; nw * nh * 3];
     let mut alpha_plane = vec![0u16; nw * nh];
 
-    for (dst_row_idx, (col_row, alp_row)) in colour_buf
+    for (dst_row_idx, (col_row, alp_row)) in color_buf
         .chunks_exact_mut(nw * 3)
         .zip(alpha_plane.chunks_exact_mut(nw))
         .enumerate()
@@ -631,7 +631,7 @@ fn encode_rgba_with_alpha_wide(
         }
     }
 
-    let color_yuv = yuv::rgb_to_yuv(&colour_buf, enc_w, enc_h, cfg.chroma, bit_depth);
+    let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_w, enc_h, cfg.chroma, bit_depth);
     let color_stream = hevc::encode_intra(
         &color_yuv,
         enc_w,
@@ -664,7 +664,7 @@ fn encode_rgba_with_alpha_wide(
     )
 }
 
-/// Core greyscale path: dispatches to tiled grid for large images.
+/// Core grayscale path: dispatches to tiled grid for large images.
 /// Always encodes as Monochrome regardless of `cfg.chroma`.
 fn encode_gray_wide(
     gray: &[u16],
@@ -678,7 +678,7 @@ fn encode_gray_wide(
     if needs_tiling(width, height) {
         return encode_gray_tiled(gray, width, height, bit_depth, cfg);
     }
-    // Greyscale is always Monochrome regardless of cfg.chroma.
+    // Grayscale is always Monochrome regardless of cfg.chroma.
     let (enc_w, enc_h) = encoded_dims(width, height, ChromaFormat::Monochrome);
     let luma = if enc_w != width || enc_h != height {
         pad_buf::<1>(gray, width, height, enc_w, enc_h)
@@ -689,7 +689,7 @@ fn encode_gray_wide(
     encode_yuv_raw(&yuv, cfg)
 }
 
-/// Core greyscale-with-alpha path. Dispatches to a paired luma+alpha grid
+/// Core grayscale-with-alpha path. Dispatches to a paired luma+alpha grid
 /// for images larger than [`TILE_SIZE`]; otherwise a single item+auxl pair.
 fn encode_gray_alpha_wide(
     ya: &[u16],
@@ -783,7 +783,7 @@ pub fn encode_yuv_with_alpha(
         cfg.color.cicp,
     )?;
 
-    // Alpha auxiliary image — monochrome, coded at the colour image's dimensions.
+    // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
     let alpha_yuv = build_mono_yuv(
         alpha.to_vec(),
         yuv.width,
@@ -964,7 +964,7 @@ fn encode_rgb_tiled(
     )
 }
 
-/// Encode a large greyscale image as a HEIF grid of monochrome tiles.
+/// Encode a large grayscale image as a HEIF grid of monochrome tiles.
 fn encode_gray_tiled(
     gray: &[u16],
     width: u32,
@@ -1302,7 +1302,7 @@ fn encode_rgba_alpha_tiled(
     )
 }
 
-/// Encode a large greyscale+alpha image as a paired HEIF grid: a luma grid +
+/// Encode a large grayscale+alpha image as a paired HEIF grid: a luma grid +
 /// an alpha auxiliary grid, both monochrome, with [`TILE_SIZE`]×[`TILE_SIZE`] tiles.
 fn encode_gray_alpha_tiled(
     ya: &[u16],
@@ -1690,7 +1690,10 @@ mod tests {
         let rgb = vec![100u8; 281 * 181 * 3];
         let out = encode_rgb(&rgb, 281, 181, &cfg().with_chroma(ChromaFormat::Yuv420)).unwrap();
 
-        let ispe = out.windows(4).position(|w| w == b"ispe").expect("ispe");
+        let ispe = out
+            .array_windows::<4>()
+            .position(|w| w == b"ispe")
+            .expect("ispe");
         let wpos = ispe + 4 + 4;
         let w = u32::from_be_bytes(out[wpos..wpos + 4].try_into().unwrap());
         let h = u32::from_be_bytes(out[wpos + 4..wpos + 8].try_into().unwrap());
@@ -1720,21 +1723,24 @@ mod tests {
         assert!(out.len() > 1000);
         assert_eq!(&out[4..8], b"ftyp");
         // A grid HEIC has a 'grid' item type in iinf.
-        assert!(out.windows(4).any(|w| w == b"grid"), "expected grid item");
+        assert!(
+            out.array_windows::<4>().any(|w| w == b"grid"),
+            "expected grid item"
+        );
     }
 
     #[test]
     fn tiled_rgb10_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 3];
         let out = encode_rgb10(&px, 1024, 768, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"));
+        assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
     #[test]
     fn tiled_gray8_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768).map(|i| (i % 256) as u8).collect();
         let out = encode_gray(&px, 1024, 768, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"));
+        assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
     #[test]
@@ -1742,7 +1748,7 @@ mod tests {
         let rgb = vec![200u16; 1024 * 768 * 3];
         let yuv = yuv::rgb_to_yuv(&rgb, 1024, 768, ChromaFormat::Yuv420, BitDepth::Eight);
         let out = encode_yuv(&yuv, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"));
+        assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
     #[test]
@@ -1773,13 +1779,16 @@ mod tests {
     fn tiled_rgba8_with_alpha_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768 * 4).map(|i| (i % 256) as u8).collect();
         let out = encode_rgba_with_alpha(&px, 1024, 768, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"), "expected grid item");
         assert!(
-            out.windows(4).any(|w| w == b"auxl"),
+            out.array_windows::<4>().any(|w| w == b"grid"),
+            "expected grid item"
+        );
+        assert!(
+            out.array_windows::<4>().any(|w| w == b"auxl"),
             "expected auxl reference"
         );
         assert!(
-            out.windows(4).any(|w| w == b"auxC"),
+            out.array_windows::<4>().any(|w| w == b"auxC"),
             "expected auxC property"
         );
     }
@@ -1788,16 +1797,16 @@ mod tests {
     fn tiled_rgba10_with_alpha_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 4];
         let out = encode_rgba10_with_alpha(&px, 1024, 768, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"));
-        assert!(out.windows(4).any(|w| w == b"auxl"));
+        assert!(out.array_windows::<4>().any(|w| w == b"grid"));
+        assert!(out.array_windows::<4>().any(|w| w == b"auxl"));
     }
 
     #[test]
     fn tiled_gray_alpha8_with_alpha_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768 * 2).map(|i| (i % 256) as u8).collect();
         let out = encode_gray_alpha_with_alpha(&px, 1024, 768, &cfg()).unwrap();
-        assert!(out.windows(4).any(|w| w == b"grid"));
-        assert!(out.windows(4).any(|w| w == b"auxl"));
+        assert!(out.array_windows::<4>().any(|w| w == b"grid"));
+        assert!(out.array_windows::<4>().any(|w| w == b"auxl"));
     }
 
     #[test]
@@ -1826,7 +1835,7 @@ mod tests {
         let px: Vec<u8> = vec![128u8; 1024 * 768 * 4];
         let out = encode_rgba_with_alpha(&px, 1024, 768, &cfg()).unwrap();
         // Two 'grid' entries in iinf: color grid + alpha grid.
-        let count = out.windows(4).filter(|w| *w == b"grid").count();
+        let count = out.array_windows::<4>().filter(|w| *w == b"grid").count();
         assert_eq!(
             count, 2,
             "expected 2 grid items (color + alpha), got {count}"
@@ -1873,7 +1882,7 @@ mod tests {
         assert_eq!(&out[4..8], b"ftyp");
         // The auxiliary alpha item adds an `auxl` item reference.
         assert!(
-            out.windows(4).any(|w| w == b"auxl"),
+            out.array_windows::<4>().any(|w| w == b"auxl"),
             "expected an auxl reference for the alpha aux image"
         );
     }

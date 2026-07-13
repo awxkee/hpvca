@@ -157,7 +157,7 @@ fn raw_scan(blk: usize, scan_idx: u8) -> Vec<(usize, usize)> {
     v
 }
 
-/// Coefficient scan for a TB as `(row, col)`, organised as a grid of 4×4
+/// Coefficient scan for a TB as `(row, col)`, organized as a grid of 4×4
 /// sub-blocks (each sub-block and the sub-block grid scanned in `scan_idx`
 /// order) so that `coeffs[sb*16 + k]` indexing stays consistent. The diagonal
 /// case returns the canonical static tables directly; horizontal/vertical are

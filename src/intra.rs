@@ -289,7 +289,9 @@ fn predict_angular_n<const N: usize>(
                     if fraction == 0 {
                         row.copy_from_slice(&main[index..index + N]);
                     } else {
-                        for (dst, pair) in row.iter_mut().zip(main[index..index + N + 1].windows(2))
+                        for (dst, pair) in row
+                            .iter_mut()
+                            .zip(main[index..index + N + 1].array_windows::<2>())
                         {
                             *dst = (((32 - fraction) * pair[0] as i32
                                 + fraction * pair[1] as i32
@@ -359,7 +361,7 @@ fn predict_angular_n<const N: usize>(
                     } else {
                         for (dst, pair) in row
                             .iter_mut()
-                            .zip(scratch.refs[start..start + N + 1].windows(2))
+                            .zip(scratch.refs[start..start + N + 1].array_windows::<2>())
                         {
                             *dst =
                                 (((32 - fraction) * pair[0] + fraction * pair[1] + 16) >> 5) as u16;
@@ -418,7 +420,7 @@ pub(crate) fn predict_chroma_tb_into(
 /// above samples then top-right (length n+1), `left[0..=n]` = left samples
 /// then bottom-left (length n+1). Returns filtered (above', left') in the same
 /// layout that `predict_planar` consumes (length n+1 each). Endpoints that have
-/// no outer neighbour (top-right, bottom-left) are filtered using the sample
+/// no outer neighbor (top-right, bottom-left) are filtered using the sample
 /// beyond them, which for our restricted reference we approximate by clamping.
 pub(crate) fn filter_references(
     corner: u16,
@@ -430,14 +432,14 @@ pub(crate) fn filter_references(
     // filter (§8.4.4.2.3) is applied to every interior reference sample; only the
     // two extreme endpoints (corner and the farthest above-right / below-left,
     // index 2n) are left unfiltered. predict_planar reads indices 0..=n, so we
-    // need filtered values at 0..=n, which requires unfiltered neighbours up to
+    // need filtered values at 0..=n, which requires unfiltered neighbors up to
     // index n+1 — present because we gathered 2n samples.
     let mut fa = [0u16; 65];
     let mut fl = [0u16; 65];
     let ext = 2 * n; // = 2n; derived from n (not array len) so larger buffers are safe
     fa[..=ext].copy_from_slice(&above[..=ext]);
     fl[..=ext].copy_from_slice(&left[..=ext]);
-    // above[0] uses the corner as its previous neighbour.
+    // above[0] uses the corner as its previous neighbor.
     if ext >= 1 {
         fa[0] = ((corner as i32 + 2 * above[0] as i32 + above[1] as i32 + 2) >> 2) as u16;
     }
@@ -492,7 +494,7 @@ fn decode_order(r: usize, c: usize, blk: usize, ctu: usize, ctus_x: usize) -> i6
     (ctu_idx as i64) * cells + z as i64
 }
 
-/// Returns true if neighbour pixel (nr,nc) was already reconstructed when coding
+/// Returns true if neighbor pixel (nr,nc) was already reconstructed when coding
 /// the block whose top-left is (block_row, block_col).
 #[allow(clippy::too_many_arguments)]
 fn is_available(
@@ -523,14 +525,14 @@ fn is_available(
 ///
 /// `ctu` is the CTU size in this plane and `ctus_x` the CTUs per row; together
 /// with the block size `n` these drive the decode-order availability test so the
-/// encoder never references a neighbour the decoder has not yet reconstructed.
+/// encoder never references a neighbor the decoder has not yet reconstructed.
 /// Public wrapper exposing luma decode order for chroma availability mapping.
 pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
     decode_order(r, c, 8, 64, ctus_x)
 }
 
 /// Shared reference-sample substitution (HEVC §8.4.4.2.1): fill unavailable
-/// reference positions from their available neighbours along the scan order
+/// reference positions from their available neighbors along the scan order
 /// (bottom-left → corner → top-right). `above`/`left` carry the raw samples;
 /// the `avail_*` flags say which were populated.
 #[allow(clippy::too_many_arguments)]
