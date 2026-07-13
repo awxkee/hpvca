@@ -51,7 +51,10 @@ fn clip_sample(v: i32, max_val: i32) -> u16 {
 }
 
 /// Chroma QP mapping (HEVC Table 8-22) for 4:2:0.
-fn table8_22(qpi: i32) -> i32 {
+fn chroma_qp(qpi: i32, chroma: crate::fmt::ChromaFormat) -> i32 {
+    if !matches!(chroma, crate::fmt::ChromaFormat::Yuv420) {
+        return qpi.min(51);
+    }
     static TAB: [i32; 13] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37];
     if qpi < 30 {
         qpi
@@ -78,29 +81,54 @@ pub(crate) fn deblock(
     ch: usize,
     qp: u8,
     bit_depth: crate::fmt::BitDepth,
+    chroma: crate::fmt::ChromaFormat,
+    edge_v: &[bool],
+    edge_h: &[bool],
 ) {
+    let edge_stride = w / 4;
     for &vertical in &[true, false] {
-        deblock_luma(y, w, h, qp, vertical, bit_depth.bits());
-        deblock_chroma(cb, cw, ch, qp, vertical, bit_depth.bits());
-        deblock_chroma(cr, cw, ch, qp, vertical, bit_depth.bits());
+        let edges = if vertical { edge_v } else { edge_h };
+        deblock_luma(y, w, h, qp, vertical, bit_depth.bits(), edges, edge_stride);
+        if !chroma.is_monochrome() {
+            deblock_chroma(
+                cb,
+                cw,
+                ch,
+                qp,
+                vertical,
+                bit_depth.bits(),
+                chroma,
+                edges,
+                edge_stride,
+            );
+            deblock_chroma(
+                cr,
+                cw,
+                ch,
+                qp,
+                vertical,
+                bit_depth.bits(),
+                chroma,
+                edges,
+                edge_stride,
+            );
+        }
     }
 }
 
 /// Luma-only deblocking, for monochrome (4:0:0) pictures that have no chroma.
-pub(crate) fn deblock_luma_only(
+/// Luma deblocking for all edges of one orientation on the 8-sample grid.
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma(
     y: &mut [u16],
     w: usize,
     h: usize,
     qp: u8,
-    bit_depth: crate::fmt::BitDepth,
+    vertical: bool,
+    bit_depth: u8,
+    edges: &[bool],
+    edge_stride: usize,
 ) {
-    for &vertical in &[true, false] {
-        deblock_luma(y, w, h, qp, vertical, bit_depth.bits());
-    }
-}
-
-/// Luma deblocking for all edges of one orientation on the 8-sample grid.
-fn deblock_luma(y: &mut [u16], w: usize, h: usize, qp: u8, vertical: bool, bit_depth: u8) {
     let qp_l = qp as i32;
     let bdshift = (bit_depth - 8) as i32;
     // beta and tc scale with bit depth (HEVC §8.7.2.4.3): beta' = beta * (1<<(bd-8)),
@@ -117,7 +145,9 @@ fn deblock_luma(y: &mut [u16], w: usize, h: usize, qp: u8, vertical: bool, bit_d
         while x < w {
             let mut yk = 0;
             while yk + 4 <= h {
-                filter_luma_segment(y, w, x, yk, true, beta, tc, max_val);
+                if edges[(yk / 4) * edge_stride + x / 4] {
+                    filter_luma_segment(y, w, x, yk, true, beta, tc, max_val);
+                }
                 yk += 4;
             }
             x += 8;
@@ -127,7 +157,9 @@ fn deblock_luma(y: &mut [u16], w: usize, h: usize, qp: u8, vertical: bool, bit_d
         while yy < h {
             let mut xk = 0;
             while xk + 4 <= w {
-                filter_luma_segment(y, w, xk, yy, false, beta, tc, max_val);
+                if edges[(yy / 4) * edge_stride + xk / 4] {
+                    filter_luma_segment(y, w, xk, yy, false, beta, tc, max_val);
+                }
                 xk += 4;
             }
             yy += 8;
@@ -283,9 +315,20 @@ fn filter_luma_segment(
 
 /// Chroma deblocking. Chroma edges sit on the 8-chroma-sample grid (= 16 luma),
 /// i.e. every 8th chroma sample, processed in 4-sample segments. bS = 2 always.
-fn deblock_chroma(c: &mut [u16], cw: usize, chh: usize, qp: u8, vertical: bool, bit_depth: u8) {
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma(
+    c: &mut [u16],
+    cw: usize,
+    chh: usize,
+    qp: u8,
+    vertical: bool,
+    bit_depth: u8,
+    chroma: crate::fmt::ChromaFormat,
+    edges: &[bool],
+    edge_stride: usize,
+) {
     let qpi = qp as i32;
-    let qp_c = table8_22(qpi);
+    let qp_c = chroma_qp(qpi, chroma);
     let bdshift = (bit_depth - 8) as i32;
     let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
     let max_val = (1i32 << bit_depth) - 1;
@@ -297,7 +340,11 @@ fn deblock_chroma(c: &mut [u16], cw: usize, chh: usize, qp: u8, vertical: bool, 
         while x < cw {
             let mut yk = 0;
             while yk + 4 <= chh {
-                filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
+                let lx = x * chroma.sub_w();
+                let ly = (yk + 1) * chroma.sub_h();
+                if edges[(ly / 4) * edge_stride + lx / 4] {
+                    filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
+                }
                 yk += 4;
             }
             x += 8;
@@ -307,7 +354,11 @@ fn deblock_chroma(c: &mut [u16], cw: usize, chh: usize, qp: u8, vertical: bool, 
         while yy < chh {
             let mut xk = 0;
             while xk + 4 <= cw {
-                filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
+                let lx = (xk + 1) * chroma.sub_w();
+                let ly = yy * chroma.sub_h();
+                if edges[(ly / 4) * edge_stride + lx / 4] {
+                    filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
+                }
                 xk += 4;
             }
             yy += 8;
@@ -348,5 +399,48 @@ fn filter_chroma_segment(
             c[(ey - 1) * stride + (ex + k)] = clip_sample(p0 + delta, max_val);
             c[ey * stride + (ex + k)] = clip_sample(q0 - delta, max_val);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn luma_filters_only_marked_segments() {
+        let w = 16;
+        let h = 8;
+        let mut y = vec![0u16; w * h];
+        for row in y.chunks_exact_mut(w) {
+            row[..8].fill(96);
+            row[8..].fill(104);
+        }
+        let before = y.clone();
+        let mut edge_v = vec![false; (w / 4) * (h / 4)];
+        let edge_h = edge_v.clone();
+        edge_v[2] = true; // x=8, rows 0..4 only
+        deblock(
+            &mut y,
+            w,
+            h,
+            &mut [],
+            &mut [],
+            0,
+            0,
+            40,
+            crate::fmt::BitDepth::Eight,
+            crate::fmt::ChromaFormat::Monochrome,
+            &edge_v,
+            &edge_h,
+        );
+        assert_ne!(&y[..4 * w], &before[..4 * w]);
+        assert_eq!(&y[4 * w..], &before[4 * w..]);
+    }
+
+    #[test]
+    fn chroma_qp_mapping_matches_format_rules() {
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv420), 33);
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv422), 35);
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv444), 35);
     }
 }

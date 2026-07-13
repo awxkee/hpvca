@@ -32,10 +32,6 @@ mod cabac;
 mod color;
 mod cost;
 mod dct;
-// Deblocking is a decoder-side post-filter; the encoder signals it but no longer
-// computes it (single intra frame, prediction uses un-deblocked samples), so the
-// module is currently unreferenced but kept for a future in-loop reference need.
-#[allow(dead_code)]
 mod deblock;
 mod error;
 mod fmt;

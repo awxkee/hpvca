@@ -553,12 +553,10 @@ pub(crate) fn build_pps_tiled(
     // x265). With a single slice it has no visible effect, but
     // x265 sets it and we keep the PPS identical.
 
-    // Deblocking filter ENABLED with default beta/tc offsets (0). The encoder
-    // applies the same in-loop deblocking to its reconstruction, so the output
-    // matches conformant decoders (libde265/ffmpeg) and block-edge artifacts are
-    // smoothed. We still emit the control-present block so the offsets are
-    // explicit rather than relying on defaults.
-    bw.write_bit(false); // deblocking_filter_control_present_flag (use defaults: enabled, offsets 0)
+    // Deblocking is enabled by inference with beta/tc offsets 0. Avoid emitting
+    // an otherwise redundant control block: it produces the same decoded image
+    // while saving its PPS bits.
+    bw.write_bit(false); // deblocking_filter_control_present_flag
     bw.write_bit(false); // pps_scaling_list_data_present_flag
     bw.write_bit(false); // lists_modification_present_flag
     bw.write_ue(0); // log2_parallel_merge_level_minus2
@@ -724,6 +722,8 @@ fn encode_wpp_parallel(
         rec_cr,
         mode_map,
         cu_depth,
+        edge_v,
+        edge_h,
         cu_stride,
         mode_stride,
     } = rec;
@@ -751,6 +751,8 @@ fn encode_wpp_parallel(
     let rec_cr = SyncSlice::new(rec_cr);
     let mode_map = SyncSlice::new(mode_map);
     let cu_depth = SyncSlice::new(cu_depth);
+    let edge_v = SyncSlice::new(edge_v);
+    let edge_h = SyncSlice::new(edge_h);
 
     let worker = || {
         // Each worker owns one reusable work area; whichever row it codes.
@@ -810,6 +812,8 @@ fn encode_wpp_parallel(
                         rec_cr: unsafe { rec_cr.get() },
                         mode_map: unsafe { mode_map.get() },
                         cu_depth: unsafe { cu_depth.get() },
+                        edge_v: unsafe { edge_v.get() },
+                        edge_h: unsafe { edge_h.get() },
                         cu_stride,
                         mode_stride,
                     },
@@ -881,6 +885,8 @@ fn code_one_ctu(
         rec_cr,
         mode_map,
         cu_depth,
+        edge_v,
+        edge_h,
         cu_stride,
         mode_stride,
     } = rec;
@@ -919,6 +925,8 @@ fn code_one_ctu(
         lambda,
         mode_map,
         cu_depth,
+        edge_v,
+        edge_h,
         cu_stride,
         mode_stride,
         lossless,
@@ -932,6 +940,15 @@ fn code_one_ctu(
     }
 }
 
+struct RegionOutput {
+    substreams: Vec<Vec<u8>>,
+    y: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
+    #[cfg(test)]
+    unfiltered_y: Vec<u16>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_region_substreams(
     yuv: &Yuv,
@@ -943,7 +960,7 @@ fn encode_region_substreams(
     threads: usize,
     is_last_region: bool,
     pool: &crate::pool::ThreadPool,
-) -> Vec<Vec<u8>> {
+) -> RegionOutput {
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
     let w = ((width + 63) & !63) as usize;
@@ -959,6 +976,8 @@ fn encode_region_substreams(
     let mode_stride = w / 4;
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
     let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
+    let mut edge_v = vec![false; (w / 4) * (h / 4)];
+    let mut edge_h = vec![false; (w / 4) * (h / 4)];
     let mut scratch = Box::new(CompressionContext::new());
     let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
     let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
@@ -982,7 +1001,7 @@ fn encode_region_substreams(
         sub_h,
     };
 
-    if !wpp {
+    let substreams = if !wpp {
         let mut cab = CabacEncoder::new();
         let mut ctx = ContextSet::init_islice(qp);
         let mut ictx = IntraModeContexts::init_islice(qp);
@@ -1001,6 +1020,8 @@ fn encode_region_substreams(
                         rec_cr: &mut rec_cr,
                         mode_map: &mut mode_map,
                         cu_depth: &mut cu_depth,
+                        edge_v: &mut edge_v,
+                        edge_h: &mut edge_h,
                         cu_stride,
                         mode_stride,
                     },
@@ -1031,6 +1052,8 @@ fn encode_region_substreams(
                 rec_cr: &mut rec_cr,
                 mode_map: &mut mode_map,
                 cu_depth: &mut cu_depth,
+                edge_v: &mut edge_v,
+                edge_h: &mut edge_h,
                 cu_stride,
                 mode_stride,
             },
@@ -1072,6 +1095,8 @@ fn encode_region_substreams(
                         rec_cr: &mut rec_cr,
                         mode_map: &mut mode_map,
                         cu_depth: &mut cu_depth,
+                        edge_v: &mut edge_v,
+                        edge_h: &mut edge_h,
                         cu_stride,
                         mode_stride,
                     },
@@ -1100,6 +1125,37 @@ fn encode_region_substreams(
             substreams.push(cab.finish());
         }
         substreams
+    };
+
+    #[cfg(test)]
+    let unfiltered_y = rec_y.clone();
+
+    // In-loop filters run after the complete region has been reconstructed.
+    // Using filtered pixels for intra prediction would be non-conformant. Every
+    // lossless CU is transquant-bypass, whose samples are exempt from filtering.
+    if !lossless {
+        crate::deblock::deblock(
+            &mut rec_y,
+            w,
+            h,
+            &mut rec_cb,
+            &mut rec_cr,
+            cw,
+            ch,
+            qp,
+            yuv.bit_depth,
+            yuv.chroma,
+            &edge_v,
+            &edge_h,
+        );
+    }
+    RegionOutput {
+        substreams,
+        y: rec_y,
+        cb: rec_cb,
+        cr: rec_cr,
+        #[cfg(test)]
+        unfiltered_y,
     }
 }
 
@@ -1213,10 +1269,17 @@ fn build_idr_slice(
     // an independent region coded in parallel on the pool and its substreams are
     // concatenated in tile-scan order.
     let num_tiles = tile_cols * tile_rows;
+    let mut final_y = Vec::new();
+    let mut final_cb = Vec::new();
+    let mut final_cr = Vec::new();
     let slice_data = if num_tiles <= 1 {
-        let substreams = encode_region_substreams(
+        let output = encode_region_substreams(
             yuv, width, height, qp_val, lossless, wpp, threads, true, pool,
         );
+        final_y = output.y;
+        final_cb = output.cb;
+        final_cr = output.cr;
+        let substreams = output.substreams;
         if wpp {
             assemble_substreams(&mut hdr, &substreams)
         } else {
@@ -1246,15 +1309,16 @@ fn build_idr_slice(
         // on the shared pool). Give every tile the full thread count and let the pool's
         // single work queue balance the combined tile×row tasks across the cores.
         let tile_threads = threads;
-        let mut tile_subs: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_tiles];
+        let mut tile_outputs: Vec<Option<RegionOutput>> =
+            std::iter::repeat_with(|| None).take(num_tiles).collect();
         {
-            let slot = SyncSlice::new(&mut tile_subs);
+            let slot = SyncSlice::new(&mut tile_outputs);
             pool.scoped(|s| {
                 for (idx, &(x0, y0, tw, th)) in bounds.iter().enumerate() {
                     let is_last = idx == num_tiles - 1;
                     s.spawn(move || {
                         let tile_yuv = extract_tile_yuv(yuv, x0, y0, tw, th);
-                        let subs = encode_region_substreams(
+                        let output = encode_region_substreams(
                             &tile_yuv,
                             tw as u32,
                             th as u32,
@@ -1265,15 +1329,45 @@ fn build_idr_slice(
                             is_last,
                             pool,
                         );
-                        // SAFETY: each task writes a distinct index of `tile_subs`.
+                        // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
-                            slot.get()[idx] = subs;
+                            slot.get()[idx] = Some(output);
                         }
                     });
                 }
             });
         }
-        let all: Vec<Vec<u8>> = tile_subs.into_iter().flatten().collect();
+        final_y.resize(w * h, 0);
+        let sub_w = yuv.chroma.sub_w();
+        let sub_h = yuv.chroma.sub_h();
+        let cw = w / sub_w;
+        let ch = h / sub_h;
+        if !yuv.chroma.is_monochrome() {
+            final_cb.resize(cw * ch, 0);
+            final_cr.resize(cw * ch, 0);
+        }
+        let mut all = Vec::new();
+        for (idx, output) in tile_outputs.into_iter().enumerate() {
+            let output = output.expect("tile worker did not produce output");
+            let (x0, y0, tw, th) = bounds[idx];
+            for r in 0..th {
+                final_y[(y0 + r) * w + x0..(y0 + r) * w + x0 + tw]
+                    .copy_from_slice(&output.y[r * tw..r * tw + tw]);
+            }
+            if !yuv.chroma.is_monochrome() {
+                let cx0 = x0 / sub_w;
+                let cy0 = y0 / sub_h;
+                let tcw = tw / sub_w;
+                let tch = th / sub_h;
+                for r in 0..tch {
+                    final_cb[(cy0 + r) * cw + cx0..(cy0 + r) * cw + cx0 + tcw]
+                        .copy_from_slice(&output.cb[r * tcw..r * tcw + tcw]);
+                    final_cr[(cy0 + r) * cw + cx0..(cy0 + r) * cw + cx0 + tcw]
+                        .copy_from_slice(&output.cr[r * tcw..r * tcw + tcw]);
+                }
+            }
+            all.extend(output.substreams);
+        }
         assemble_substreams(&mut hdr, &all)
     };
 
@@ -1286,9 +1380,9 @@ fn build_idr_slice(
             _nal_type: 20,
             data: nalu_data,
         },
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        final_y,
+        final_cb,
+        final_cr,
     ))
 }
 
@@ -2033,6 +2127,8 @@ struct CtuRecState<'a> {
     rec_cr: &'a mut [u16],
     mode_map: &'a mut [u8],
     cu_depth: &'a mut [u8],
+    edge_v: &'a mut [bool],
+    edge_h: &'a mut [bool],
     cu_stride: usize,
     mode_stride: usize,
 }
@@ -2224,6 +2320,7 @@ struct CompressionContext {
     fwd_transform: crate::hevc_transform::FwdTransformFn,
     inv_transform: crate::hevc_transform::InvTransformFn,
     dequantize: crate::hevc_transform::DequantizeFn,
+    last_tu_layout: TuLayout,
     orig: [u16; 1024],
     chroma_orig_cb: [u16; 1024],
     chroma_orig_cr: [u16; 1024],
@@ -2252,6 +2349,7 @@ impl CompressionContext {
             fwd_transform: crate::hevc_transform::resolve_fwd_transform(),
             inv_transform: crate::hevc_transform::resolve_inv_transform(),
             dequantize: crate::hevc_transform::resolve_dequantize(),
+            last_tu_layout: TuLayout::Unsplit,
             orig: [0; 1024],
             chroma_orig_cb: [0; 1024],
             chroma_orig_cr: [0; 1024],
@@ -2310,6 +2408,8 @@ struct CuTreeState<'a> {
     lambda: f32,
     mode_map: &'a mut [u8],
     cu_depth: &'a mut [u8],
+    edge_v: &'a mut [bool],
+    edge_h: &'a mut [bool],
     cu_stride: usize,
     mode_stride: usize,
     lossless: bool,
@@ -2374,7 +2474,80 @@ fn encode_cu_leaf(
         state.mode_stride,
         &mut *state.scratch,
     );
+    mark_deblock_edges(
+        &mut *state.edge_v,
+        &mut *state.edge_h,
+        state.mode_stride,
+        row,
+        col,
+        size,
+        state.scratch.last_tu_layout,
+        &state.scratch.tu_tree.split,
+    );
     fill_cu_depth(&mut *state.cu_depth, row, col, size, depth, state.cu_stride);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_deblock_edges(
+    edge_v: &mut [bool],
+    edge_h: &mut [bool],
+    stride: usize,
+    row: usize,
+    col: usize,
+    size: usize,
+    layout: TuLayout,
+    split: &[bool; 85],
+) {
+    let mut mark_box = |r: usize, c: usize, side: usize| {
+        if c != 0 && c.is_multiple_of(8) {
+            let gx = c / 4;
+            for gy in r / 4..(r + side) / 4 {
+                edge_v[gy * stride + gx] = true;
+            }
+        }
+        if r != 0 && r.is_multiple_of(8) {
+            let gy = r / 4;
+            for gx in c / 4..(c + side) / 4 {
+                edge_h[gy * stride + gx] = true;
+            }
+        }
+    };
+    mark_box(row, col, size);
+    match layout {
+        TuLayout::Unsplit => {}
+        TuLayout::Split => {
+            let child = size / 2;
+            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                mark_box(row + dy * child, col + dx * child, child);
+            }
+        }
+        TuLayout::Recursive => {
+            fn walk(
+                mark: &mut impl FnMut(usize, usize, usize),
+                split: &[bool; 85],
+                node: usize,
+                row: usize,
+                col: usize,
+                size: usize,
+            ) {
+                mark(row, col, size);
+                if size > 4 && split[node] {
+                    let child = size / 2;
+                    for (q, (dy, dx)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
+                        walk(
+                            mark,
+                            split,
+                            node * 4 + 1 + q,
+                            row + dy * child,
+                            col + dx * child,
+                            child,
+                        );
+                    }
+                }
+            }
+            walk(&mut mark_box, split, 0, row, col, size);
+        }
+    }
 }
 
 /// Source-only split proxy. `score >= 1` means the expected prediction
@@ -3550,7 +3723,12 @@ fn commit_split_chroma(
             let dy = child_index / 2;
             let dx = child_index % 2;
             for stack_index in 0..stacked {
-                let c_row = ch_row + dy * parent_side + stack_index * child_side;
+                // One luma child covers `child_side` chroma rows in 4:2:0/4:4:4
+                // and two stacked square TBs in 4:2:2. Advancing by parent_side
+                // unconditionally skipped a row band for 4:2:0/4:4:4 and made
+                // the lower children overrun the reconstruction at picture bottom.
+                let child_height = child_side * stacked;
+                let c_row = ch_row + dy * child_height + stack_index * child_side;
                 let c_col = ch_col + dx * child_side;
 
                 if component == 0 {
@@ -5348,6 +5526,7 @@ fn encode_cu<W: CabacWriter>(
     mode_map: &mut [u8],
     scratch: &mut CompressionContext,
 ) {
+    scratch.last_tu_layout = TuLayout::Unsplit;
     // destructure so the rest of the body is unchanged
     let Entropy { enc, ctx, ictx } = ent;
     let CuGeometry {
@@ -5963,6 +6142,7 @@ fn encode_cu<W: CabacWriter>(
         }
         (TuLayout::Unsplit, y_nz_unsplit)
     };
+    scratch.last_tu_layout = tu_layout;
     // ── Independent chroma intra-mode RDO ──────────────────────────────────
     // HEVC exposes four explicit chroma modes plus DM_CHROMA. As in HM, a
     // duplicate explicit mode is replaced by angular mode 34. All five modes are
@@ -6838,6 +7018,102 @@ mod tests {
         fill_cu_depth(&mut depths, 0, 0, 16, 2, stride);
         assert_eq!(split_cu_context(&depths, 0, 16, 1, stride), 1);
         assert_eq!(split_cu_context(&depths, 16, 0, 1, stride), 1);
+    }
+
+    #[test]
+    fn deblock_map_contains_cu_and_selected_tu_edges() {
+        let stride = 16;
+        let mut v = vec![false; stride * stride];
+        let mut h = v.clone();
+        mark_deblock_edges(
+            &mut v,
+            &mut h,
+            stride,
+            8,
+            8,
+            16,
+            TuLayout::Split,
+            &[false; 85],
+        );
+        assert!(v[(8 / 4) * stride + 8 / 4]);
+        assert!(h[(8 / 4) * stride + 8 / 4]);
+        assert!(v[(8 / 4) * stride + 16 / 4]);
+        assert!(h[(16 / 4) * stride + 8 / 4]);
+        assert!(!v[(8 / 4) * stride + 12 / 4]);
+    }
+
+    #[test]
+    fn deblocking_reduces_actual_reconstruction_sse() {
+        let (w, h) = (64usize, 64usize);
+        let mut y = vec![0u16; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                // Smooth content with a weak diagonal component makes quantized
+                // transform-boundary discontinuities measurable without giving
+                // the filter an artificial step edge to erase.
+                y[row * w + col] = (48 + (3 * col + 2 * row) / 2).min(255) as u16;
+            }
+        }
+        let yuv = Yuv {
+            y: y.clone(),
+            cb: vec![128; (w / 2) * (h / 2)],
+            cr: vec![128; (w / 2) * (h / 2)],
+            width: w as u32,
+            height: h as u32,
+            display_w: w as u32,
+            display_h: h as u32,
+            chroma: crate::fmt::ChromaFormat::Yuv420,
+            bit_depth: crate::fmt::BitDepth::Eight,
+        };
+        let pool = crate::pool::ThreadPool::new(0);
+        let output =
+            encode_region_substreams(&yuv, w as u32, h as u32, 38, false, false, 1, true, &pool);
+        let sse = |rec: &[u16]| -> u64 {
+            y.iter()
+                .zip(rec)
+                .map(|(&a, &b)| {
+                    let d = i64::from(a) - i64::from(b);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let before = sse(&output.unfiltered_y);
+        let after = sse(&output.y);
+        eprintln!("deblock luma SSE: {before} -> {after}");
+        assert!(
+            after < before,
+            "deblock SSE did not improve: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn split_444_chroma_at_picture_bottom_does_not_overrun() {
+        let (w, h) = (64usize, 64usize);
+        let mut seed = 0x9e37_79b9u32;
+        let mut plane = || {
+            (0..w * h)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 24) as u16
+                })
+                .collect::<Vec<_>>()
+        };
+        let yuv = Yuv {
+            y: plane(),
+            cb: plane(),
+            cr: plane(),
+            width: w as u32,
+            height: h as u32,
+            display_w: w as u32,
+            display_h: h as u32,
+            chroma: crate::fmt::ChromaFormat::Yuv444,
+            bit_depth: crate::fmt::BitDepth::Eight,
+        };
+        let pool = crate::pool::ThreadPool::new(0);
+        let output =
+            encode_region_substreams(&yuv, w as u32, h as u32, 30, false, false, 1, true, &pool);
+        assert_eq!(output.cb.len(), w * h);
+        assert_eq!(output.cr.len(), w * h);
     }
 
     #[test]
