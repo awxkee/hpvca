@@ -1409,96 +1409,6 @@ fn choose_tile_grid(ctus_x: usize, ctus_y: usize, par: usize) -> (usize, usize) 
     best
 }
 
-/// Encode one intra CU and its format-dependent chroma transform blocks.
-///
-/// HEVC intra CU syntax per §7.3.8.5/8.6/8.11:
-///   [luma intra mode] [chroma intra mode] [cbf_cb] [cbf_cr] [cbf_luma]
-///   [luma residual?] [Cb residual?] [Cr residual?]
-#[allow(clippy::too_many_arguments)]
-/// Build the 3-entry MPM candidate list from left (A) and above (B) modes,
-/// per HEVC §8.4.2 (fillIntraPredModeCandidates).
-/// Sum of absolute 4×4 Hadamard-transformed differences over an N×N block —
-/// the standard fast distortion proxy for intra mode decision (correlates with
-/// post-transform coded cost far better than raw SAD).
-#[inline]
-fn satd_block_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
-    let mut total = 0u32;
-    let mut diff = [0i32; 16];
-
-    for (orig_band, pred_band) in orig[..N * N]
-        .chunks_exact(N * 4)
-        .zip(pred[..N * N].chunks_exact(N * 4))
-    {
-        for bx in (0..N).step_by(4) {
-            for ((dst_row, orig_row), pred_row) in diff
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(orig_band.as_chunks::<N>().0.iter())
-                .zip(pred_band.as_chunks::<N>().0.iter())
-            {
-                for ((dst, &orig), &pred) in dst_row
-                    .iter_mut()
-                    .zip(&orig_row[bx..bx + 4])
-                    .zip(&pred_row[bx..bx + 4])
-                {
-                    *dst = orig as i32 - pred as i32;
-                }
-            }
-
-            for row in diff.as_chunks_mut::<4>().0 {
-                let a0 = row[0] + row[2];
-                let a1 = row[1] + row[3];
-                let a2 = row[0] - row[2];
-                let a3 = row[1] - row[3];
-                row[0] = a0 + a1;
-                row[1] = a0 - a1;
-                row[2] = a2 + a3;
-                row[3] = a2 - a3;
-            }
-            for col in 0..4 {
-                let a0 = diff[col] + diff[8 + col];
-                let a1 = diff[4 + col] + diff[12 + col];
-                let a2 = diff[col] - diff[8 + col];
-                let a3 = diff[4 + col] - diff[12 + col];
-                diff[col] = a0 + a1;
-                diff[4 + col] = a0 - a1;
-                diff[8 + col] = a2 + a3;
-                diff[12 + col] = a2 - a3;
-            }
-            let sum = diff[0].unsigned_abs()
-                + diff[1].unsigned_abs()
-                + diff[2].unsigned_abs()
-                + diff[3].unsigned_abs()
-                + diff[4].unsigned_abs()
-                + diff[5].unsigned_abs()
-                + diff[6].unsigned_abs()
-                + diff[7].unsigned_abs()
-                + diff[8].unsigned_abs()
-                + diff[9].unsigned_abs()
-                + diff[10].unsigned_abs()
-                + diff[11].unsigned_abs()
-                + diff[12].unsigned_abs()
-                + diff[13].unsigned_abs()
-                + diff[14].unsigned_abs()
-                + diff[15].unsigned_abs();
-            total += (sum + 1) >> 1;
-        }
-    }
-    total
-}
-
-#[inline]
-fn satd_block(orig: &[u16], pred: &[u16], n: usize) -> u32 {
-    match n {
-        4 => satd_block_n::<4>(orig, pred),
-        8 => satd_block_n::<8>(orig, pred),
-        16 => satd_block_n::<16>(orig, pred),
-        32 => satd_block_n::<32>(orig, pred),
-        _ => panic!("unsupported SATD block size {n}"),
-    }
-}
-
 #[derive(Clone, Copy)]
 struct IntraModeCandidate {
     mode: u8,
@@ -2295,6 +2205,10 @@ enum TuLayout {
 /// naturally private to each parallel tile encoder.
 #[repr(align(64))]
 struct CompressionContext {
+    satd: crate::cost::SatdFn,
+    fwd_transform: crate::hevc_transform::FwdTransformFn,
+    inv_transform: crate::hevc_transform::InvTransformFn,
+    dequantize: crate::hevc_transform::DequantizeFn,
     orig: [u16; 1024],
     chroma_orig_cb: [u16; 1024],
     chroma_orig_cr: [u16; 1024],
@@ -2319,6 +2233,10 @@ struct CompressionContext {
 impl CompressionContext {
     fn new() -> Self {
         Self {
+            satd: crate::cost::resolve_satd(),
+            fwd_transform: crate::hevc_transform::resolve_fwd_transform(),
+            inv_transform: crate::hevc_transform::resolve_inv_transform(),
+            dequantize: crate::hevc_transform::resolve_dequantize(),
             orig: [0; 1024],
             chroma_orig_cb: [0; 1024],
             chroma_orig_cr: [0; 1024],
@@ -2339,6 +2257,13 @@ impl CompressionContext {
             tu_tree: TuTreeScratch::new(),
             rdoq: crate::hevc_transform::RdoqScratch::new(),
         }
+    }
+
+    #[inline]
+    fn satd(&self, orig: &[u16], pred: &[u16], n: usize) -> u32 {
+        // SAFETY: every SATD implementation has the same slice-based contract;
+        // the selected implementation validates the block shape and lengths.
+        unsafe { (self.satd)(orig, pred, n) }
     }
 }
 
@@ -2933,12 +2858,14 @@ fn commit_split_luma(
             }
         }
 
-        crate::hevc_transform::fwd_transform_intra_luma_into(
+        crate::hevc_transform::run_fwd_transform(
+            scratch.fwd_transform,
             &scratch.residual[..child_len],
             child,
             bit_depth,
             &mut scratch.coeff,
             &mut scratch.transform_tmp,
+            true,
         );
         let tb = crate::hevc_transform::RdoqTb {
             coeff: &scratch.coeff,
@@ -2973,19 +2900,22 @@ fn commit_split_luma(
             advance_residual_contexts(&mut residual_ctx, packed, log2_child, true, scan_idx, true);
         }
 
-        crate::hevc_transform::dequantize_into(
+        crate::hevc_transform::run_dequantize(
+            scratch.dequantize,
             &scratch.levels,
             child,
             qp,
             bit_depth,
             &mut scratch.dequant,
         );
-        crate::hevc_transform::inv_transform_intra_luma_into(
+        crate::hevc_transform::run_inv_transform(
+            scratch.inv_transform,
             &scratch.dequant,
             child,
             bit_depth,
             &mut scratch.inverse,
             &mut scratch.transform_tmp,
+            true,
         );
 
         // Reconstruct pred + residual directly into the picture so subsequent
@@ -3163,12 +3093,14 @@ fn commit_split_chroma(
                         &mut scratch.residual,
                     );
                 }
-                crate::hevc_transform::fwd_transform_into(
+                crate::hevc_transform::run_fwd_transform(
+                    scratch.fwd_transform,
                     &scratch.residual[..child_len],
                     child_side,
                     bit_depth,
                     &mut scratch.coeff,
                     &mut scratch.transform_tmp,
+                    false,
                 );
                 let tb = crate::hevc_transform::RdoqTb {
                     coeff: &scratch.coeff,
@@ -3232,19 +3164,22 @@ fn commit_split_chroma(
                     );
                 }
 
-                crate::hevc_transform::dequantize_into(
+                crate::hevc_transform::run_dequantize(
+                    scratch.dequantize,
                     &scratch.levels,
                     child_side,
                     chroma_qp,
                     bit_depth,
                     &mut scratch.dequant,
                 );
-                crate::hevc_transform::inv_transform_into(
+                crate::hevc_transform::run_inv_transform(
+                    scratch.inv_transform,
                     &scratch.dequant,
                     child_side,
                     bit_depth,
                     &mut scratch.inverse,
                     &mut scratch.transform_tmp,
+                    false,
                 );
                 let dst_start = c_row * cw_stride + c_col;
                 let rec_plane = if component == 0 {
@@ -3416,12 +3351,14 @@ fn evaluate_chroma_mode(
                 side,
                 &mut scratch.residual,
             );
-            crate::hevc_transform::fwd_transform_into(
+            crate::hevc_transform::run_fwd_transform(
+                scratch.fwd_transform,
                 &scratch.residual[..block_len],
                 side,
                 bit_depth,
                 &mut scratch.coeff,
                 &mut scratch.transform_tmp,
+                false,
             );
             if winner_rdoq {
                 let tb = crate::hevc_transform::RdoqTb {
@@ -3477,19 +3414,22 @@ fn evaluate_chroma_mode(
                 }
             }
 
-            crate::hevc_transform::dequantize_into(
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
                 &scratch.levels,
                 side,
                 chroma_qp,
                 bit_depth,
                 &mut scratch.dequant,
             );
-            crate::hevc_transform::inv_transform_into(
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
                 &scratch.dequant,
                 side,
                 bit_depth,
                 &mut scratch.inverse,
                 &mut scratch.transform_tmp,
+                false,
             );
             intra::reconstruct_into(
                 &scratch.pred[..block_len],
@@ -3557,7 +3497,13 @@ fn evaluate_chroma_mode(
 }
 
 #[inline]
-fn choose_nxn_proxy(orig: &[u16], parent_pred: &[u16], lambda: f32, bit_depth: u8) -> bool {
+fn choose_nxn_proxy(
+    satd: crate::cost::SatdFn,
+    orig: &[u16],
+    parent_pred: &[u16],
+    lambda: f32,
+    bit_depth: u8,
+) -> bool {
     debug_assert!(orig.len() >= 64 && parent_pred.len() >= 64);
 
     // PART_NxN is expensive only after it has been selected: four independent
@@ -3566,7 +3512,8 @@ fn choose_nxn_proxy(orig: &[u16], parent_pred: &[u16], lambda: f32, bit_depth: u
     // independent predictors, while gradient-orientation spread identifies edges
     // that one 8×8 direction cannot represent well.
     let depth_scale = 1u64 << bit_depth.saturating_sub(8);
-    let parent_satd = satd_block(&orig[..64], &parent_pred[..64], 8) as f32;
+    // SAFETY: the two slices were checked above and 8 is a supported block size.
+    let parent_satd = unsafe { satd(&orig[..64], &parent_pred[..64], 8) } as f32;
     let satd_floor = 48.0 * depth_scale as f32 + lambda.sqrt() * 8.0;
     if parent_satd <= satd_floor {
         return false;
@@ -3777,7 +3724,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
                 &mut scratch.pred,
                 &mut scratch.angular,
             );
-            cost += satd_block(&scratch.chroma_orig_cb[..LEN], &scratch.pred[..LEN], SIDE) as f32;
+            cost += scratch.satd(&scratch.chroma_orig_cb[..LEN], &scratch.pred[..LEN], SIDE) as f32;
             intra::predict_chroma_tb_into(
                 candidate.pred_mode,
                 rc0,
@@ -3788,7 +3735,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
                 &mut scratch.pred,
                 &mut scratch.angular,
             );
-            cost += satd_block(&scratch.chroma_orig_cr[..LEN], &scratch.pred[..LEN], SIDE) as f32;
+            cost += scratch.satd(&scratch.chroma_orig_cr[..LEN], &scratch.pred[..LEN], SIDE) as f32;
             candidate.cost = cost;
             update_chroma_candidate(&mut ranked, candidate);
         }
@@ -4046,7 +3993,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             }
             tested[index] = true;
             predict(mode, &mut scratch.pred, &mut scratch.angular);
-            let cost = satd_block(&scratch.orig[..PU_LEN], &scratch.pred[..PU_LEN], PU) as f32
+            let cost = scratch.satd(&scratch.orig[..PU_LEN], &scratch.pred[..PU_LEN], PU) as f32
                 + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
             mode_costs[index] = cost;
             update_intra_candidate(&mut rmd, mode, cost);
@@ -4116,12 +4063,14 @@ fn encode_cu_nxn<W: CabacWriter>(
                 PU,
                 &mut scratch.residual,
             );
-            crate::hevc_transform::fwd_transform_intra_luma_into(
+            crate::hevc_transform::run_fwd_transform(
+                scratch.fwd_transform,
                 &scratch.residual[..PU_LEN],
                 PU,
                 bit_depth.bits(),
                 &mut scratch.coeff,
                 &mut scratch.transform_tmp,
+                true,
             );
             crate::hevc_transform::quantize_with_sign_hiding_into(
                 &scratch.coeff,
@@ -4152,19 +4101,22 @@ fn encode_cu_nxn<W: CabacWriter>(
             if rate_cost >= best_cost {
                 continue;
             }
-            crate::hevc_transform::dequantize_into(
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
                 &scratch.levels,
                 PU,
                 qp,
                 bit_depth.bits(),
                 &mut scratch.dequant,
             );
-            crate::hevc_transform::inv_transform_intra_luma_into(
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
                 &scratch.dequant,
                 PU,
                 bit_depth.bits(),
                 &mut scratch.inverse,
                 &mut scratch.transform_tmp,
+                true,
             );
             intra::reconstruct_into(
                 &scratch.pred[..PU_LEN],
@@ -4226,19 +4178,22 @@ fn encode_cu_nxn<W: CabacWriter>(
             advance_residual_contexts(&mut rdoq_ctx, packed, 2, true, scan_idx, true);
         }
 
-        crate::hevc_transform::dequantize_into(
+        crate::hevc_transform::run_dequantize(
+            scratch.dequantize,
             &scratch.levels,
             PU,
             qp,
             bit_depth.bits(),
             &mut scratch.dequant,
         );
-        crate::hevc_transform::inv_transform_intra_luma_into(
+        crate::hevc_transform::run_inv_transform(
+            scratch.inv_transform,
             &scratch.dequant,
             PU,
             bit_depth.bits(),
             &mut scratch.inverse,
             &mut scratch.transform_tmp,
+            true,
         );
         intra::reconstruct_into(
             &scratch.best_pred[..PU_LEN],
@@ -4346,6 +4301,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                         neutral,
                     },
                 );
+                let satd = scratch.satd;
                 for component in 0..2 {
                     let (source_plane, corner, above, left, orig) = if component == 0 {
                         (src_cb, bc0, &ba[..], &bl[..], &mut scratch.chroma_orig_cb)
@@ -4371,7 +4327,9 @@ fn encode_cu_nxn<W: CabacWriter>(
                         &mut scratch.pred,
                         &mut scratch.angular,
                     );
-                    cost += satd_block(&orig[..block_len], &scratch.pred[..block_len], side) as f32;
+                    // SAFETY: both buffers contain a complete supported square block.
+                    cost += unsafe { satd(&orig[..block_len], &scratch.pred[..block_len], side) }
+                        as f32;
                 }
             }
             candidate.cost = cost;
@@ -4806,7 +4764,7 @@ fn encode_cu<W: CabacWriter>(
     // closure dispatch from the previous implementation.
     for mode in 0u8..35 {
         predict_luma(mode, &mut scratch.pred, &mut scratch.angular);
-        let satd = satd_block(&scratch.orig[..num_luma], &scratch.pred[..num_luma], lu) as f32;
+        let satd = scratch.satd(&scratch.orig[..num_luma], &scratch.pred[..num_luma], lu) as f32;
         let cost = satd + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
         mode_costs[mode as usize] = cost;
         update_intra_candidate(&mut rmd[..fast_mode_count], mode, cost);
@@ -4900,12 +4858,14 @@ fn encode_cu<W: CabacWriter>(
                 &mut scratch.levels,
             );
         } else {
-            crate::hevc_transform::fwd_transform_into(
+            crate::hevc_transform::run_fwd_transform(
+                scratch.fwd_transform,
                 &scratch.residual[..num_luma],
                 lu,
                 bit_depth.bits(),
                 &mut scratch.coeff,
                 &mut scratch.transform_tmp,
+                false,
             );
             crate::hevc_transform::quantize_with_sign_hiding_into(
                 &scratch.coeff,
@@ -4947,19 +4907,22 @@ fn encode_cu<W: CabacWriter>(
             // decision. Avoid a redundant reconstruction and full-block SSE pass.
             rate_cost
         } else {
-            crate::hevc_transform::dequantize_into(
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
                 &scratch.levels,
                 lu,
                 qp,
                 bit_depth.bits(),
                 &mut scratch.dequant,
             );
-            crate::hevc_transform::inv_transform_into(
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
                 &scratch.dequant,
                 lu,
                 bit_depth.bits(),
                 &mut scratch.inverse,
                 &mut scratch.transform_tmp,
+                false,
             );
             intra::reconstruct_into(
                 &scratch.pred[..num_luma],
@@ -5003,6 +4966,7 @@ fn encode_cu<W: CabacWriter>(
         && !lossless
         && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422)
         && choose_nxn_proxy(
+            scratch.satd,
             &scratch.orig[..num_luma],
             &scratch.best_pred[..num_luma],
             lambda,
@@ -5137,19 +5101,22 @@ fn encode_cu<W: CabacWriter>(
             *dst = residual;
         }
     } else {
-        crate::hevc_transform::dequantize_into(
+        crate::hevc_transform::run_dequantize(
+            scratch.dequantize,
             &scratch.levels,
             lu,
             qp,
             bit_depth.bits(),
             &mut scratch.dequant,
         );
-        crate::hevc_transform::inv_transform_into(
+        crate::hevc_transform::run_inv_transform(
+            scratch.inv_transform,
             &scratch.dequant,
             lu,
             bit_depth.bits(),
             &mut scratch.inverse,
             &mut scratch.transform_tmp,
+            false,
         );
     }
     intra::reconstruct_into(
@@ -5473,7 +5440,7 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.pred,
                             &mut scratch.angular,
                         );
-                        proxy_cost += satd_block(orig, &scratch.pred[..n_ch], ctb) as f32;
+                        proxy_cost += scratch.satd(orig, &scratch.pred[..n_ch], ctb) as f32;
                         if proxy_cost >= ranked[1].cost {
                             break 'proxy_tbs;
                         }
@@ -5622,12 +5589,14 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.levels,
                         );
                     } else {
-                        crate::hevc_transform::fwd_transform_into(
+                        crate::hevc_transform::run_fwd_transform(
+                            scratch.fwd_transform,
                             &scratch.residual[..n_ch],
                             ctb,
                             bit_depth.bits(),
                             &mut scratch.coeff,
                             &mut scratch.transform_tmp,
+                            false,
                         );
                         if winner_rdoq {
                             let tb = crate::hevc_transform::RdoqTb {
@@ -5682,19 +5651,22 @@ fn encode_cu<W: CabacWriter>(
                             dst_row[..ctb].copy_from_slice(src_row);
                         }
                     } else {
-                        crate::hevc_transform::dequantize_into(
+                        crate::hevc_transform::run_dequantize(
+                            scratch.dequantize,
                             &scratch.levels,
                             ctb,
                             chroma_qp,
                             bit_depth.bits(),
                             &mut scratch.dequant,
                         );
-                        crate::hevc_transform::inv_transform_into(
+                        crate::hevc_transform::run_inv_transform(
+                            scratch.inv_transform,
                             &scratch.dequant,
                             ctb,
                             bit_depth.bits(),
                             &mut scratch.inverse,
                             &mut scratch.transform_tmp,
+                            false,
                         );
                         intra::reconstruct_into(
                             &scratch.pred[..n_ch],
@@ -6328,7 +6300,8 @@ mod tests {
     #[test]
     fn nxn_proxy_rejects_flat_and_accepts_piecewise_residual() {
         let flat = [96u16; 64];
-        assert!(!choose_nxn_proxy(&flat, &flat, 4.0, 8));
+        let satd = crate::cost::resolve_satd();
+        assert!(!choose_nxn_proxy(satd, &flat, &flat, 4.0, 8));
 
         let mut piecewise = [0u16; 64];
         for row in 0..8 {
@@ -6342,7 +6315,7 @@ mod tests {
             }
         }
         let parent = [128u16; 64];
-        assert!(choose_nxn_proxy(&piecewise, &parent, 4.0, 8));
+        assert!(choose_nxn_proxy(satd, &piecewise, &parent, 4.0, 8));
     }
 
     #[test]

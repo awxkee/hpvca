@@ -17,6 +17,11 @@ repository = "https://github.com/awxkee/hpvca"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.94.0"
 
+[features]
+default = ["avx", "neon"]
+avx = []
+neon = []
+
 [dependencies]
 
 [profile.release]

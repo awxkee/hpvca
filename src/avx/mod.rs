@@ -27,27 +27,10 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy};
-use image::imageops::FilterType;
-use std::fs;
-use std::time::Instant;
+mod dequant;
+mod satd;
+mod transform;
 
-fn main() {
-    let img = image::open("./assets/aak.jpg").unwrap().to_rgb8();
-    let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
-
-    let instant = Instant::now();
-    let data = hpvca::encode_rgb(
-        &arr,
-        img.width(),
-        img.height(),
-        &EncodeConfig::default()
-            .with_chroma(ChromaFormat::Yuv444)
-            .with_parallelism(ParallelismStrategy::GridWpp)
-            .with_lossless(false),
-    )
-    .unwrap();
-    println!("Encoded time: {:?}", instant.elapsed());
-    fs::write("results.heic", data).unwrap();
-    println!("Hello, world!");
-}
+pub(crate) use dequant::dequantize_avx2;
+pub(crate) use satd::satd_avx2;
+pub(crate) use transform::{fwd_transform_avx2, inv_transform_avx2};

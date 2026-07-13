@@ -31,9 +31,10 @@
 
 use crate::cabac::ContextSet;
 use crate::cabac::residual::sig_coeff_ctx;
+use std::sync::OnceLock;
 
 /// 4×4 HEVC transform matrix.
-static T4: [[i32; 4]; 4] = [
+pub(crate) static T4: [[i32; 4]; 4] = [
     [64, 64, 64, 64],
     [83, 36, -36, -83],
     [64, -64, -64, 64],
@@ -42,7 +43,7 @@ static T4: [[i32; 4]; 4] = [
 
 /// HEVC 4×4 intra-luma integer DST matrix (spec Table 8-7). The transform is
 /// normative for 4×4 luma TUs in intra CUs; chroma and larger luma TUs keep DCT.
-static DST4: [[i32; 4]; 4] = [
+pub(crate) static DST4: [[i32; 4]; 4] = [
     [29, 55, 74, 84],
     [74, 74, 0, -74],
     [84, -29, -74, 55],
@@ -50,7 +51,7 @@ static DST4: [[i32; 4]; 4] = [
 ];
 
 /// 8×8 HEVC transform matrix.
-static T8: [[i32; 8]; 8] = [
+pub(crate) static T8: [[i32; 8]; 8] = [
     [64, 64, 64, 64, 64, 64, 64, 64],
     [89, 75, 50, 18, -18, -50, -75, -89],
     [83, 36, -36, -83, -83, -36, 36, 83],
@@ -63,7 +64,7 @@ static T8: [[i32; 8]; 8] = [
 
 /// 16×16 HEVC transform matrix (spec Table 8-6).
 #[rustfmt::skip]
-static T16: [[i32; 16]; 16] = [
+pub(crate) static T16: [[i32; 16]; 16] = [
     [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90],
     [89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89],
@@ -83,7 +84,7 @@ static T16: [[i32; 16]; 16] = [
 ];
 
 #[rustfmt::skip]
-static T32: [[i32; 32]; 32] = [
+pub(crate) static T32: [[i32; 32]; 32] = [
     [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     [90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90],
     [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90],
@@ -121,8 +122,8 @@ static T32: [[i32; 32]; 32] = [
 static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 
 /// Largest supported transform: 32×32 → 1024 coefficients per fixed buffer.
-const MAX_TB: usize = 1024;
-static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
+pub(crate) const MAX_TB: usize = 1024;
+pub(crate) static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 /// Persistent work area for winner-only RDOQ. The HM-style pass jointly
 /// selects coefficient levels, coefficient-group significance, CBF and the last
@@ -144,6 +145,185 @@ impl RdoqScratch {
             cost_group_sig: [0.0; 64],
             group_flags: [0; 64],
         }
+    }
+}
+
+pub(crate) type FwdTransformFn =
+    unsafe fn(&[i32], usize, u8, &mut [i32; MAX_TB], &mut [i32; MAX_TB], bool);
+
+static FWD_TRANSFORM: OnceLock<FwdTransformFn> = OnceLock::new();
+
+pub(crate) type InvTransformFn =
+    unsafe fn(&[i32], usize, u8, &mut [i32; MAX_TB], &mut [i32; MAX_TB], bool);
+
+static INV_TRANSFORM: OnceLock<InvTransformFn> = OnceLock::new();
+
+pub(crate) type DequantizeFn = unsafe fn(&[i16], usize, u8, u8, &mut [i32; MAX_TB]);
+
+static DEQUANTIZE: OnceLock<DequantizeFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn resolve_fwd_transform() -> FwdTransformFn {
+    *FWD_TRANSFORM.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::fwd_transform_neon as FwdTransformFn
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            let mut f = fwd_transform_scalar as FwdTransformFn;
+            if std::is_x86_feature_detected!("avx2") {
+                f = crate::avx::fwd_transform_avx2 as FwdTransformFn;
+            }
+            f
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "x86_64", feature = "avx")
+        )))]
+        {
+            fwd_transform_scalar as FwdTransformFn
+        }
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_inv_transform() -> InvTransformFn {
+    *INV_TRANSFORM.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::inv_transform_neon as InvTransformFn
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            let mut f = inv_transform_scalar as InvTransformFn;
+            if std::is_x86_feature_detected!("avx2") {
+                f = crate::avx::inv_transform_avx2 as InvTransformFn;
+            }
+            f
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "x86_64", feature = "avx")
+        )))]
+        {
+            inv_transform_scalar as InvTransformFn
+        }
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_dequantize() -> DequantizeFn {
+    *DEQUANTIZE.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::dequantize_neon as DequantizeFn
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            let mut f = dequantize_into as DequantizeFn;
+            if std::is_x86_feature_detected!("avx2") {
+                f = crate::avx::dequantize_avx2 as DequantizeFn;
+            }
+            f
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "x86_64", feature = "avx")
+        )))]
+        {
+            dequantize_into as DequantizeFn
+        }
+    })
+}
+
+#[inline]
+pub(crate) fn run_fwd_transform(
+    f: FwdTransformFn,
+    res: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+    intra_luma: bool,
+) {
+    // SAFETY: resolvers only return implementations with this slice-based
+    // contract; each implementation validates the transform size and buffers.
+    unsafe { f(res, n, bit_depth, out, tmp, intra_luma) }
+}
+
+#[inline]
+pub(crate) fn run_inv_transform(
+    f: InvTransformFn,
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+    intra_luma: bool,
+) {
+    // SAFETY: resolvers only return implementations with this slice-based
+    // contract; each implementation validates the transform size and buffers.
+    unsafe { f(coeff, n, bit_depth, out, tmp, intra_luma) }
+}
+
+#[inline]
+pub(crate) fn run_dequantize(
+    f: DequantizeFn,
+    level: &[i16],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+) {
+    // SAFETY: resolvers only return implementations with this slice-based
+    // contract; callers provide one complete supported transform block.
+    unsafe { f(level, n, qp, bit_depth, out) }
+}
+
+#[inline]
+#[cfg_attr(
+    any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ),
+    allow(dead_code)
+)]
+pub(crate) fn fwd_transform_scalar(
+    res: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+    intra_luma: bool,
+) {
+    if intra_luma {
+        fwd_transform_intra_luma_into(res, n, bit_depth, out, tmp);
+    } else {
+        fwd_transform_into(res, n, bit_depth, out, tmp);
+    }
+}
+
+#[inline]
+#[cfg_attr(
+    any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ),
+    allow(dead_code)
+)]
+pub(crate) fn inv_transform_scalar(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+    intra_luma: bool,
+) {
+    if intra_luma {
+        inv_transform_intra_luma_into(coeff, n, bit_depth, out, tmp);
+    } else {
+        inv_transform_into(coeff, n, bit_depth, out, tmp);
     }
 }
 
@@ -1035,6 +1215,13 @@ fn sign_bit_hiding_hdq(
 
 /// Dequantisation: level → transform coefficient (spec 8.6.3).
 #[inline]
+#[cfg_attr(
+    any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn dequantize_into(
     level: &[i16],
     n: usize,

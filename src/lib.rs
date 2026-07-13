@@ -30,6 +30,7 @@
 use std::mem::size_of;
 mod cabac;
 mod color;
+mod cost;
 mod dct;
 // Deblocking is a decoder-side post-filter; the encoder signals it but no longer
 // computes it (single intra frame, prediction uses un-deblocked samples), so the
@@ -47,6 +48,11 @@ mod pool;
 mod ycgco;
 mod yuv;
 
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+mod avx;
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+mod neon;
+
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
@@ -62,10 +68,6 @@ const TILE_SIZE: u32 = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ParallelismStrategy {
-    /// Pick automatically: a HEIF grid (parallel across cells) for images larger
-    /// than one tile, a single sequential image otherwise.
-    #[default]
-    Auto,
     /// One HEVC image, no parallel coding tools (sequential).
     Single,
     /// One HEVC image coded with Wavefront Parallel Processing
@@ -79,13 +81,14 @@ pub enum ParallelismStrategy {
     /// A HEIF grid of independent HEVC images, each internally WPP'd — every cell is
     /// a plain WPP image, so it stays broadly compatible while each cell also
     /// carries its own wavefront substreams.
+    #[default]
     GridWpp,
 }
 
 impl ParallelismStrategy {
     /// Whether a picture large enough to tile is coded as a HEIF grid.
     fn uses_grid(self) -> bool {
-        matches!(self, Self::Auto | Self::Grid | Self::GridWpp)
+        matches!(self, Self::Grid | Self::GridWpp)
     }
     /// Whether grid cells are individually WPP'd (only when [`uses_grid`]).
     fn grid_cell_wpp(self) -> bool {
@@ -146,7 +149,7 @@ impl Default for EncodeConfig {
             color: ColorMetadata::default(), // sRGB ICC profile
             metadata: Metadata::default(),
             threads: 0, // auto-detect
-            parallelism: ParallelismStrategy::Auto,
+            parallelism: ParallelismStrategy::GridWpp,
         }
     }
 }
