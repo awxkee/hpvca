@@ -31,6 +31,10 @@ use std::mem::size_of;
 mod cabac;
 mod color;
 mod dct;
+// Deblocking is a decoder-side post-filter; the encoder signals it but no longer
+// computes it (single intra frame, prediction uses un-deblocked samples), so the
+// module is currently unreferenced but kept for a future in-loop reference need.
+#[allow(dead_code)]
 mod deblock;
 mod error;
 mod fmt;
@@ -39,6 +43,7 @@ mod hevc_transform;
 mod intra;
 mod isobmff;
 mod metadata;
+mod pool;
 mod ycgco;
 mod yuv;
 
@@ -55,7 +60,47 @@ const MAX_DIM: u32 = 16_384;
 /// tiles. The value matches Apple's tile size for compatibility.
 const TILE_SIZE: u32 = 512;
 
-// ── EncodeConfig ──────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ParallelismStrategy {
+    /// Pick automatically: a HEIF grid (parallel across cells) for images larger
+    /// than one tile, a single sequential image otherwise.
+    #[default]
+    Auto,
+    /// One HEVC image, no parallel coding tools (sequential).
+    Single,
+    /// One HEVC image coded with Wavefront Parallel Processing
+    /// (`entropy_coding_sync`): CTU rows are independent CABAC substreams.
+    Wpp,
+    /// One HEVC image combining HEVC tiles + WPP for maximum core saturation.
+    TilesWpp,
+    /// A HEIF grid of independent HEVC images (large pictures), each coded
+    /// sequentially. Broadly compatible;
+    Grid,
+    /// A HEIF grid of independent HEVC images, each internally WPP'd — every cell is
+    /// a plain WPP image, so it stays broadly compatible while each cell also
+    /// carries its own wavefront substreams.
+    GridWpp,
+}
+
+impl ParallelismStrategy {
+    /// Whether a picture large enough to tile is coded as a HEIF grid.
+    fn uses_grid(self) -> bool {
+        matches!(self, Self::Auto | Self::Grid | Self::GridWpp)
+    }
+    /// Whether grid cells are individually WPP'd (only when [`uses_grid`]).
+    fn grid_cell_wpp(self) -> bool {
+        matches!(self, Self::GridWpp)
+    }
+    /// Whether the single-image path enables WPP. `GridWpp`/`TilesWpp` fall back to
+    /// plain WPP here when the picture is too small to grid/tile.
+    fn single_wpp(self) -> bool {
+        matches!(self, Self::Wpp | Self::TilesWpp | Self::GridWpp)
+    }
+    /// Whether the single-image path also enables HEVC tiles (combined with WPP).
+    fn single_tiles(self) -> bool {
+        matches!(self, Self::TilesWpp)
+    }
+}
 
 /// Encoder configuration shared by all entry points.
 ///
@@ -87,6 +132,9 @@ pub struct EncodeConfig {
     /// "auto": use the number of hardware threads reported by the platform
     /// (falling back to 1). Images small enough not to be tiled ignore this.
     pub threads: usize,
+    /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
+    /// defaults to [`ParallelismStrategy::Auto`].
+    pub parallelism: ParallelismStrategy,
 }
 
 impl Default for EncodeConfig {
@@ -98,6 +146,7 @@ impl Default for EncodeConfig {
             color: ColorMetadata::default(), // sRGB ICC profile
             metadata: Metadata::default(),
             threads: 0, // auto-detect
+            parallelism: ParallelismStrategy::Auto,
         }
     }
 }
@@ -110,6 +159,12 @@ impl EncodeConfig {
 
     pub fn with_quality(mut self, quality: u8) -> Self {
         self.quality = quality;
+        self
+    }
+
+    /// Select the [`ParallelismStrategy`].
+    pub fn with_parallelism(mut self, parallelism: ParallelismStrategy) -> Self {
+        self.parallelism = parallelism;
         self
     }
 
@@ -515,27 +570,12 @@ pub fn encode_gray_alpha12_with_alpha(
 pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
     yuv.validate()?;
     cfg.validate()?;
-    if needs_tiling(yuv.display_w, yuv.display_h) {
+    // A grid packages the picture as multiple items; the single-image strategies
+    // (Wpp / TilesWpp / Single) code it as one item instead.
+    if needs_tiling(yuv.display_w, yuv.display_h) && cfg.parallelism.uses_grid() {
         return encode_yuv_tiled(yuv, cfg);
     }
-    let nalu_stream = hevc::encode_intra(
-        yuv,
-        yuv.width,
-        yuv.height,
-        cfg.quality,
-        cfg.lossless,
-        cfg.color.cicp,
-    )?;
-    isobmff::wrap_hevc_image(
-        &nalu_stream,
-        yuv.display_w,
-        yuv.display_h,
-        isobmff::ImageMeta {
-            bit_depth: yuv.bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
-    )
+    encode_yuv_raw(yuv, cfg)
 }
 
 /// Returns true if the image is large enough to need grid tiling.
@@ -561,7 +601,9 @@ fn encode_rgb_wide(
         force_identity_matrix(&mut local_cfg.color);
     }
     let cfg = &local_cfg;
-    if needs_tiling(width, height) {
+    // A grid packages the picture as multiple HEVC items; the single-image
+    // strategies code it as one item instead (handled below).
+    if needs_tiling(width, height) && cfg.parallelism.uses_grid() {
         return encode_rgb_tiled(rgb, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
@@ -816,13 +858,16 @@ pub fn encode_yuv_with_alpha(
 
 /// Wrap an already-built [`Yuv`] into a HEIC bitstream (no re-validation).
 fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
-    let nalu_stream = hevc::encode_intra(
+    let nalu_stream = hevc::encode_intra_opts(
         yuv,
         yuv.width,
         yuv.height,
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.parallelism.single_wpp(),
+        cfg.parallelism.single_tiles(),
+        resolve_threads(cfg.threads),
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -882,30 +927,50 @@ where
     }
     let nthreads = resolve_threads(threads).clamp(1, n);
     if nthreads == 1 {
-        // Sequential fast path: no thread spawn, no allocation of slots.
+        // Sequential fast path: no scheduling, no allocation of slots.
         return (0..n).map(&f).collect();
     }
 
+    // One task per item on a context-local pool; `slots.iter_mut()` hands each task
+    // a disjoint slot, and the pool load-balances items of uneven cost across cores.
+    // The pool's threads are joined when it is dropped at the end of this call.
     let mut slots: Vec<Option<Result<T, E>>> = (0..n).map(|_| None).collect();
-    let chunk = n.div_ceil(nthreads); // >= 1 since nthreads <= n
     let f = &f;
-    std::thread::scope(|scope| {
-        for (ci, slice) in slots.chunks_mut(chunk).enumerate() {
-            let base = ci * chunk;
+    let pool = pool::ThreadPool::new(nthreads.saturating_sub(1));
+    pool.scoped(|scope| {
+        for (i, slot) in slots.iter_mut().enumerate() {
             scope.spawn(move || {
-                for (j, slot) in slice.iter_mut().enumerate() {
-                    *slot = Some(f(base + j));
-                }
+                *slot = Some(f(i));
             });
         }
     });
 
     let mut out = Vec::with_capacity(n);
     for slot in slots {
-        // Every slot is written exactly once by its owning worker.
-        out.push(slot.expect("scoped workers fill every slot")?);
+        // Every slot is written exactly once by its owning task.
+        out.push(slot.expect("scoped tasks fill every slot")?);
     }
     Ok(out)
+}
+
+/// Encode one grid cell as an independent HEVC image. With `cell_wpp` the cell is
+/// WPP-coded (its CTU rows become CABAC substreams) — still a plain single-image WPP
+/// stream, decodable everywhere. Cells already run in parallel across the grid, so
+/// each cell is coded on a single thread (no nested wavefront pool).
+fn encode_cell(
+    yuv: &Yuv,
+    w: u32,
+    h: u32,
+    quality: u8,
+    lossless: bool,
+    cicp: Option<Cicp>,
+    cell_wpp: bool,
+) -> Result<hevc::NaluStream, EncodeError> {
+    if cell_wpp {
+        hevc::encode_intra_opts(yuv, w, h, quality, lossless, cicp, true, false, 1)
+    } else {
+        hevc::encode_intra(yuv, w, h, quality, lossless, cicp)
+    }
 }
 
 /// Encode a large RGB image as a HEIF grid of [`TILE_SIZE`]×[`TILE_SIZE`] tiles.
@@ -917,6 +982,7 @@ fn encode_rgb_tiled(
     encode_cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut cfg = encode_cfg.clone();
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
     // TILE_SIZE=512 is always chroma-even for sub_w/sub_h ∈ {1,2}, so
@@ -940,13 +1006,14 @@ fn encode_rgb_tiled(
         } else {
             yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
         };
-        hevc::encode_intra(
+        encode_cell(
             &yuv,
             enc_tw,
             enc_th,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1135,6 +1202,7 @@ fn encode_yuv_alpha_tiled(
 /// Encode a large pre-converted [`Yuv`] image as a HEIF grid. Splits all
 /// planes (Y, Cb, Cr) into tiles respecting the chroma subsampling ratio.
 fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
     let cols = yuv.display_w.div_ceil(TILE_SIZE);
     let rows = yuv.display_h.div_ceil(TILE_SIZE);
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, yuv.chroma);
@@ -1186,13 +1254,14 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             chroma: yuv.chroma,
             bit_depth: yuv.bit_depth,
         };
-        hevc::encode_intra(
+        encode_cell(
             &tile_yuv,
             enc_tw,
             enc_th,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
         )
     })?;
     isobmff::wrap_hevc_grid(

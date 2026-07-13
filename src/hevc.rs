@@ -491,7 +491,20 @@ fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
     bw.write_bit(false); // bitstream_restriction_flag
 }
 
-pub(crate) fn build_pps(qp: u8, lossless: bool) -> Nalu {
+#[cfg(test)]
+pub(crate) fn build_pps(qp: u8, lossless: bool, wpp: bool) -> Nalu {
+    build_pps_tiled(qp, lossless, wpp, 1, 1)
+}
+
+/// PPS with an optional uniform tile grid. `tile_cols`/`tile_rows` == 1 means no
+/// tiles (`tiles_enabled_flag = 0`), preserving the exact non-tiled bitstream.
+pub(crate) fn build_pps_tiled(
+    qp: u8,
+    lossless: bool,
+    wpp: bool,
+    tile_cols: usize,
+    tile_rows: usize,
+) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
 
@@ -524,9 +537,19 @@ pub(crate) fn build_pps(qp: u8, lossless: bool) -> Nalu {
     // transquant_bypass_enabled_flag: when set, CUs may carry
     // cu_transquant_bypass_flag to skip transform+quantization (lossless coding).
     bw.write_bit(lossless); // transquant_bypass_enabled_flag
-    bw.write_bit(false); // tiles_enabled_flag
-    bw.write_bit(false); // entropy_coding_sync_enabled_flag
-    // No tile fields (tiles_enabled=0).
+    let tiled = tile_cols > 1 || tile_rows > 1;
+    bw.write_bit(tiled); // tiles_enabled_flag
+    bw.write_bit(wpp); // entropy_coding_sync_enabled_flag (WPP)
+    if tiled {
+        // Uniform tile grid: the decoder derives per-column/row CTB spans itself,
+        // so only the counts and the uniform flag are signalled (HEVC §7.3.2.3).
+        bw.write_ue(tile_cols as u32 - 1); // num_tile_columns_minus1
+        bw.write_ue(tile_rows as u32 - 1); // num_tile_rows_minus1
+        bw.write_bit(true); // uniform_spacing_flag
+        // Prediction and in-loop filtering never cross a tile edge (each tile is
+        // coded as an independent sub-image), matching HEIC-grid seam behavior.
+        bw.write_bit(false); // loop_filter_across_tiles_enabled_flag
+    }
     // seq_loop_filter_across_slices_enabled_flag: ALWAYS present per HEVC spec and
     // ffmpeg decode_pps() unconditionally reads it after tiles/ecs flags.
     bw.write_bit(true); // pps_loop_filter_across_slices_enabled_flag = 1 (matches
@@ -561,6 +584,46 @@ pub(crate) fn encode_intra(
     lossless: bool,
     color: Option<crate::color::Cicp>,
 ) -> Result<NaluStream, EncodeError> {
+    encode_intra_opts(
+        yuv, width, height, quality, lossless, color, false, false, 1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_intra_opts(
+    yuv: &Yuv,
+    width: u32,
+    height: u32,
+    quality: u8,
+    lossless: bool,
+    color: Option<crate::color::Cicp>,
+    wpp: bool,
+    tiles: bool,
+    threads: usize,
+) -> Result<NaluStream, EncodeError> {
+    // WPP needs at least two CTU columns to form a wavefront; otherwise fall back
+    // to an ordinary single-substream slice.
+    let ctus_x = (((width + 63) & !63) / 64) as usize;
+    let ctus_y = (((height + 63) & !63) / 64) as usize;
+    // `wpp` enables Wavefront Parallel Processing (`entropy_coding_sync`). `tiles`
+    // additionally splits the picture into a modest grid of HEVC tiles, each
+    // internally WPP'd — the two HEVC parallel tools combined (spec-legal, §7.4.3.3):
+    // tiles give independent wavefronts (no cross-column ramp coupling, independent
+    // CABAC) while WPP supplies the bulk of the parallelism per tile with no
+    // prediction seam. Tile count near sqrt(threads) keeps tile seams small. NOTE:
+    // the tiles+WPP combination is decoded correctly only by conformant decoders
+    // (Apple/hpvcd/HM), not ffmpeg/libheif — callers gate it via `TilesWpp`. The
+    // offsets counting emulation-prevention bytes (`epb_substream_lengths`) are what
+    // make the many-substream stream decodable.
+    let want_tiles = tiles && wpp && threads > 1;
+    let tile_target = (threads as f64).sqrt().ceil() as usize;
+    let (tile_cols, tile_rows) = if want_tiles {
+        choose_tile_grid(ctus_x, ctus_y, tile_target)
+    } else {
+        (1, 1)
+    };
+    // WPP needs ≥2 CTU columns (tiles are kept ≥4 CTB wide by `choose_tile_grid`).
+    let wpp = wpp && ctus_x >= 2;
     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless);
     let sps = build_sps(
         width,
@@ -571,27 +634,319 @@ pub(crate) fn encode_intra(
         color.as_ref(),
     );
     let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-    let pps = build_pps(qp_val, lossless);
-    let (idr, _ry, _rcb, _rcr) = build_idr_slice(yuv, width, height, quality, lossless)?;
+    let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows);
+    // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
+    // background workers plus the calling thread give `threads`-way concurrency; the
+    // pool (and its threads) is dropped when this function returns.
+    let pool = crate::pool::ThreadPool::new(threads.saturating_sub(1));
+    let (idr, _ry, _rcb, _rcr) = build_idr_slice(
+        yuv,
+        width,
+        height,
+        quality,
+        lossless,
+        ParallelPlan {
+            wpp,
+            threads,
+            tile_cols,
+            tile_rows,
+            pool: &pool,
+        },
+    )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
     })
 }
 
-#[allow(clippy::type_complexity)]
-fn build_idr_slice(
+/// A raw-pointer view over a slice that is shareable across scoped threads for
+/// WPP wavefront encoding. Soundness rests on two structural invariants enforced
+/// by [`encode_wpp_parallel`]: (1) each CTU row is coded by exactly one thread and
+/// writes only the reconstruction/map cells of its own 64-pixel CTB-row band, so
+/// writes never overlap; (2) a thread reads cells of the rows above only after the
+/// `row_progress` atomics mark those CTUs complete, so reads never race a write.
+/// Concurrent element accesses are therefore always disjoint. Debug builds
+/// additionally assert the wavefront read condition at every CTU.
+struct SyncSlice<T> {
+    ptr: *mut T,
+    len: usize,
+}
+
+// Copy is unconditional in `T` (a SyncSlice is just a raw pointer + length), unlike
+// the derive, which would demand `T: Copy`. Copying is needed to hand the same view
+// to several tile/row tasks.
+impl<T> Clone for SyncSlice<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SyncSlice<T> {}
+
+// SAFETY: the pointer targets a slice that outlives the scope in which the
+// SyncSlice is shared, and the invariants above guarantee data-race freedom.
+unsafe impl<T: Send> Send for SyncSlice<T> {}
+unsafe impl<T: Send> Sync for SyncSlice<T> {}
+
+impl<T> SyncSlice<T> {
+    fn new(s: &mut [T]) -> Self {
+        Self {
+            ptr: s.as_mut_ptr(),
+            len: s.len(),
+        }
+    }
+    /// SAFETY: the caller must access only elements no other thread accesses
+    /// concurrently (guaranteed by the WPP wavefront ordering).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+/// Wavefront-parallel WPP encode: one CABAC substream per CTU row, coded on a
+/// pool of `threads` workers. A worker claims the next row, waits for the row
+/// above to be two CTUs ahead (reconstruction references + the WPP context sync
+/// point), then codes the row into its own substream. Returns the per-row
+/// substream bytes in row order.
+#[allow(clippy::too_many_arguments)]
+fn encode_wpp_parallel(
+    yuv: &Yuv,
+    rec: CtuRecState<'_>,
+    strides: PlaneStrides,
+    coding: SliceCoding,
+    ctus_x: usize,
+    ctus_y: usize,
+    threads: usize,
+    is_last_region: bool,
+    pool: &crate::pool::ThreadPool,
+) -> Vec<Vec<u8>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    let CtuRecState {
+        rec_y,
+        rec_cb,
+        rec_cr,
+        mode_map,
+        cu_depth,
+        cu_stride,
+        mode_stride,
+    } = rec;
+    let SliceCoding {
+        qp,
+        lambda,
+        lossless,
+    } = coding;
+
+    let progress: Vec<AtomicUsize> = (0..ctus_y).map(|_| AtomicUsize::new(0)).collect();
+    // Debug guard: each row band must have exactly one writer, so the SyncSlice
+    // writes never overlap. Set when a worker claims a row; a double-claim trips.
+    #[cfg(debug_assertions)]
+    let band_claimed: Vec<std::sync::atomic::AtomicBool> = (0..ctus_y)
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
+    // Context models saved after the 2nd CTU of each row, consumed by the next.
+    let sync_ctx: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
+        (0..ctus_y).map(|_| OnceLock::new()).collect();
+    let substreams: Vec<Mutex<Vec<u8>>> = (0..ctus_y).map(|_| Mutex::new(Vec::new())).collect();
+    let next_row = AtomicUsize::new(0);
+
+    let rec_y = SyncSlice::new(rec_y);
+    let rec_cb = SyncSlice::new(rec_cb);
+    let rec_cr = SyncSlice::new(rec_cr);
+    let mode_map = SyncSlice::new(mode_map);
+    let cu_depth = SyncSlice::new(cu_depth);
+
+    let worker = || {
+        // Each worker owns one reusable work area; whichever row it codes.
+        let mut scratch = Box::new(CompressionContext::new());
+        loop {
+            let r = next_row.fetch_add(1, Ordering::Relaxed);
+            if r >= ctus_y {
+                break;
+            }
+            // Debug guard: assert this band has no other writer (disjoint writes).
+            #[cfg(debug_assertions)]
+            assert!(
+                !band_claimed[r].swap(true, Ordering::Relaxed),
+                "WPP row {r} claimed by two workers — writes would alias"
+            );
+            // Seed the row's context from the row above's WPP sync point.
+            let (mut ctx, mut ictx) = if r == 0 {
+                (
+                    ContextSet::init_islice(qp),
+                    IntraModeContexts::init_islice(qp),
+                )
+            } else {
+                loop {
+                    if let Some(c) = sync_ctx[r - 1].get() {
+                        break c.clone();
+                    }
+                    std::thread::yield_now();
+                }
+            };
+            let mut cab = CabacEncoder::new();
+            for col in 0..ctus_x {
+                if r > 0 {
+                    // Wavefront: the CTU above-right must be reconstructed first.
+                    let need = (col + 2).min(ctus_x);
+                    while progress[r - 1].load(Ordering::Acquire) < need {
+                        std::thread::yield_now();
+                    }
+                    // Debug guard: reads of the row above only touch completed CTUs.
+                    debug_assert!(
+                        progress[r - 1].load(Ordering::Acquire) >= need,
+                        "WPP wavefront violated: row {} not far enough ahead of row {r}",
+                        r - 1
+                    );
+                }
+                // SAFETY: this row is the sole writer of its CTB-row band, and the
+                // wait above guarantees every cell it reads from rows < r is done.
+                code_one_ctu(
+                    Entropy {
+                        enc: &mut cab,
+                        ctx: &mut ctx,
+                        ictx: &mut ictx,
+                    },
+                    yuv,
+                    CtuRecState {
+                        rec_y: unsafe { rec_y.get() },
+                        rec_cb: unsafe { rec_cb.get() },
+                        rec_cr: unsafe { rec_cr.get() },
+                        mode_map: unsafe { mode_map.get() },
+                        cu_depth: unsafe { cu_depth.get() },
+                        cu_stride,
+                        mode_stride,
+                    },
+                    &mut scratch,
+                    strides,
+                    SliceCoding {
+                        qp,
+                        lambda,
+                        lossless,
+                    },
+                    r,
+                    col,
+                );
+                if col == 1 {
+                    let _ = sync_ctx[r].set((ctx.clone(), ictx.clone()));
+                }
+                // end_of_slice_segment_flag: 1 only on the whole slice's final CTU
+                // (last row of the last region).
+                let is_last = is_last_region && r == ctus_y - 1 && col == ctus_x - 1;
+                cab.encode_terminate(is_last as u8);
+                progress[r].store(col + 1, Ordering::Release);
+            }
+            // Close the substream unless its last CTU already ended the slice.
+            if !(is_last_region && r == ctus_y - 1) {
+                cab.encode_terminate(1); // end_of_subset_one_bit
+            }
+            *substreams[r].lock().unwrap() = cab.finish();
+        }
+    };
+
+    // Run the wavefront on the caller's pool: `n` worker loops pull rows in order
+    // and stream along the wavefront. The calling thread helps too, so `n` is
+    // capped at the pool's execution slots (and never exceeds the row count).
+    let n = threads.min(pool.parallelism()).min(ctus_y).max(1);
+    pool.scoped(|scope| {
+        for _ in 0..n {
+            scope.spawn(worker);
+        }
+    });
+
+    substreams
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
+/// Code one 64×64 CTU into `cab`: the per-CTU SAO-disable flags, the forced root
+/// split, and the four 32×32 quadtrees via RD search + commit. Shared by the
+/// sequential and WPP encoders.
+#[allow(clippy::too_many_arguments)]
+fn code_one_ctu(
+    ent: Entropy<'_, CabacEncoder>,
+    yuv: &Yuv,
+    rec: CtuRecState<'_>,
+    scratch: &mut CompressionContext,
+    strides: PlaneStrides,
+    coding: SliceCoding,
+    ctu_row: usize,
+    ctu_col: usize,
+) {
+    let Entropy {
+        enc: cab,
+        ctx,
+        ictx,
+    } = ent;
+    let CtuRecState {
+        rec_y,
+        rec_cb,
+        rec_cr,
+        mode_map,
+        cu_depth,
+        cu_stride,
+        mode_stride,
+    } = rec;
+    let SliceCoding {
+        qp,
+        lambda,
+        lossless,
+    } = coding;
+    let lu_row0 = ctu_row * 64;
+    let lu_col0 = ctu_col * 64;
+
+    // SAO is enabled in the SPS/slice but explicitly disabled per CTU.
+    if ctu_col > 0 {
+        cab.encode_bin(0, &mut ctx.sao_merge_flag);
+    }
+    if ctu_row > 0 {
+        cab.encode_bin(0, &mut ctx.sao_merge_flag);
+    }
+    cab.encode_bin(0, &mut ctx.sao_type_idx);
+    if !yuv.chroma.is_monochrome() {
+        cab.encode_bin(0, &mut ctx.sao_type_idx);
+    }
+
+    // The 64×64 root cannot be a leaf until the encoder has a 64-CU / four-32-TU
+    // transform-tree path, so signal the root split and code four 32×32 quadtrees.
+    let root_ctx = (ctu_col > 0) as usize + (ctu_row > 0) as usize;
+    cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
+
+    let mut tree = CuTreeState {
+        yuv,
+        rec_y,
+        rec_cb,
+        rec_cr,
+        strides,
+        qp,
+        lambda,
+        mode_map,
+        cu_depth,
+        cu_stride,
+        mode_stride,
+        lossless,
+        scratch,
+    };
+    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+        let row = lu_row0 + dy * 32;
+        let col = lu_col0 + dx * 32;
+        let plan = rdo_cu32_plan(&mut tree, row, col, ctx, ictx);
+        commit_cu32_plan(cab, ctx, ictx, &mut tree, row, col, 1, plan);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_region_substreams(
     yuv: &Yuv,
     width: u32,
     height: u32,
-    quality: u8,
+    qp: u8,
     lossless: bool,
-) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
-    // Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51
-    let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-    let _ = quality; // used above
-
-    // Coded dimensions: multiples of CTB size (64 luma). Chroma planes subsample
-    // by sub_w horizontally and sub_h vertically (4:2:0 → /2,/2; 4:2:2 → /2,/1).
+    wpp: bool,
+    threads: usize,
+    is_last_region: bool,
+    pool: &crate::pool::ThreadPool,
+) -> Vec<Vec<u8>> {
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
     let w = ((width + 63) & !63) as usize;
@@ -602,6 +957,227 @@ fn build_idr_slice(
     let src_yh = yuv.height as usize;
     let src_cw = (yuv.width as usize).div_ceil(sub_w);
     let src_ch = (yuv.height as usize).div_ceil(sub_h);
+    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
+    let cu_stride = w / 8;
+    let mode_stride = w / 4;
+    let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
+    let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
+    let mut scratch = Box::new(CompressionContext::new());
+    let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
+    let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            pad_plane(&yuv.cb, src_cw, src_ch, cw, ch),
+            pad_plane(&yuv.cr, src_cw, src_ch, cw, ch),
+        )
+    };
+    let ctus_x = w / 64;
+    let ctus_y = h / 64;
+    let strides = PlaneStrides {
+        w,
+        src_yw,
+        src_yh,
+        cw,
+        src_cw,
+        src_ch,
+        sub_w,
+        sub_h,
+    };
+
+    if !wpp {
+        let mut cab = CabacEncoder::new();
+        let mut ctx = ContextSet::init_islice(qp);
+        let mut ictx = IntraModeContexts::init_islice(qp);
+        for ctu_row in 0..ctus_y {
+            for ctu_col in 0..ctus_x {
+                code_one_ctu(
+                    Entropy {
+                        enc: &mut cab,
+                        ctx: &mut ctx,
+                        ictx: &mut ictx,
+                    },
+                    yuv,
+                    CtuRecState {
+                        rec_y: &mut rec_y,
+                        rec_cb: &mut rec_cb,
+                        rec_cr: &mut rec_cr,
+                        mode_map: &mut mode_map,
+                        cu_depth: &mut cu_depth,
+                        cu_stride,
+                        mode_stride,
+                    },
+                    &mut scratch,
+                    strides,
+                    SliceCoding {
+                        qp,
+                        lambda,
+                        lossless,
+                    },
+                    ctu_row,
+                    ctu_col,
+                );
+                let last = is_last_region && ctu_row == ctus_y - 1 && ctu_col == ctus_x - 1;
+                cab.encode_terminate(last as u8); // end_of_slice_segment_flag
+            }
+        }
+        if !is_last_region {
+            cab.encode_terminate(1); // end_of_subset_one_bit closing this tile
+        }
+        vec![cab.finish()]
+    } else if threads > 1 && ctus_y > 1 {
+        encode_wpp_parallel(
+            yuv,
+            CtuRecState {
+                rec_y: &mut rec_y,
+                rec_cb: &mut rec_cb,
+                rec_cr: &mut rec_cr,
+                mode_map: &mut mode_map,
+                cu_depth: &mut cu_depth,
+                cu_stride,
+                mode_stride,
+            },
+            strides,
+            SliceCoding {
+                qp,
+                lambda,
+                lossless,
+            },
+            ctus_x,
+            ctus_y,
+            threads,
+            is_last_region,
+            pool,
+        )
+    } else {
+        let mut substreams: Vec<Vec<u8>> = Vec::with_capacity(ctus_y);
+        let mut prev_sync: Option<(ContextSet, IntraModeContexts)> = None;
+        for ctu_row in 0..ctus_y {
+            let mut cab = CabacEncoder::new();
+            let (mut ctx, mut ictx) = prev_sync.take().unwrap_or_else(|| {
+                (
+                    ContextSet::init_islice(qp),
+                    IntraModeContexts::init_islice(qp),
+                )
+            });
+            let mut this_sync = None;
+            for ctu_col in 0..ctus_x {
+                code_one_ctu(
+                    Entropy {
+                        enc: &mut cab,
+                        ctx: &mut ctx,
+                        ictx: &mut ictx,
+                    },
+                    yuv,
+                    CtuRecState {
+                        rec_y: &mut rec_y,
+                        rec_cb: &mut rec_cb,
+                        rec_cr: &mut rec_cr,
+                        mode_map: &mut mode_map,
+                        cu_depth: &mut cu_depth,
+                        cu_stride,
+                        mode_stride,
+                    },
+                    &mut scratch,
+                    strides,
+                    SliceCoding {
+                        qp,
+                        lambda,
+                        lossless,
+                    },
+                    ctu_row,
+                    ctu_col,
+                );
+                if ctu_col == 1 {
+                    this_sync = Some((ctx.clone(), ictx.clone()));
+                }
+                let last = is_last_region && ctu_row == ctus_y - 1 && ctu_col == ctus_x - 1;
+                cab.encode_terminate(last as u8); // end_of_slice_segment_flag
+            }
+            if ctu_row < ctus_y - 1 {
+                cab.encode_terminate(1); // end_of_subset → carry WPP sync to next row
+                prev_sync = this_sync;
+            } else if !is_last_region {
+                cab.encode_terminate(1); // end_of_subset closing this tile
+            }
+            substreams.push(cab.finish());
+        }
+        substreams
+    }
+}
+
+/// Post-emulation-prevention byte length of each substream as it will appear in the
+/// concatenated slice segment data. HEVC §7.4.7.1 NOTE 3 requires entry-point offsets
+/// to COUNT the emulation-prevention (0x03) bytes, so the sizes must be measured after
+/// escaping — not on the raw RBSP. The escape state carries across substream
+/// boundaries exactly as the global escaper in `to_length_prefixed_slices` will apply
+/// it; the slice header ends byte-aligned on a non-zero (trailing-bit) byte, so the
+/// header→data boundary never triggers an escape and starting from `0xff,0xff` is
+/// faithful. A 0x03 triggered by a substream's first byte is attributed to that
+/// substream (it is emitted while consuming that byte), which is where the decoder's
+/// firstByte[] accounting places it.
+fn epb_substream_lengths(substreams: &[Vec<u8>]) -> Vec<usize> {
+    let mut lens = Vec::with_capacity(substreams.len());
+    let mut prev = [0xffu8, 0xff];
+    for s in substreams {
+        let mut out = 0usize;
+        for &b in s {
+            if prev[0] == 0 && prev[1] == 0 && b <= 3 {
+                out += 1; // emulation_prevention_three_byte (0x03)
+                prev = [prev[1], 0x03];
+            }
+            out += 1;
+            prev = [prev[1], b];
+        }
+        lens.push(out);
+    }
+    lens
+}
+
+/// Assemble slice-header entry points for the concatenated substreams (all but the
+/// last) and return the concatenated slice data. Offsets are the POST-escape sizes.
+fn assemble_substreams(hdr: &mut BitWriter, substreams: &[Vec<u8>]) -> Vec<u8> {
+    let sizes = epb_substream_lengths(substreams);
+    let num_entry = sizes.len().saturating_sub(1);
+    hdr.write_ue(num_entry as u32);
+    if num_entry > 0 {
+        let max_off = sizes[..num_entry].iter().map(|&s| s - 1).max().unwrap_or(0);
+        let offset_len = if max_off == 0 {
+            1
+        } else {
+            usize::BITS - max_off.leading_zeros()
+        };
+        hdr.write_ue(offset_len - 1);
+        for &s in &sizes[..num_entry] {
+            hdr.write_bits((s - 1) as u32, offset_len);
+        }
+    }
+    let mut data = Vec::with_capacity(substreams.iter().map(|s| s.len()).sum());
+    for s in substreams {
+        data.extend_from_slice(s);
+    }
+    data
+}
+
+#[allow(clippy::type_complexity)]
+fn build_idr_slice(
+    yuv: &Yuv,
+    width: u32,
+    height: u32,
+    quality: u8,
+    lossless: bool,
+    plan: ParallelPlan<'_>,
+) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
+    let ParallelPlan {
+        wpp,
+        threads,
+        tile_cols,
+        tile_rows,
+        pool,
+    } = plan;
+    // Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51
+    let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
+    let _ = quality; // used above
 
     // ── Slice header ────────────────────────────────────────────────────────
     let mut hdr = BitWriter::new();
@@ -632,158 +1208,90 @@ fn build_idr_slice(
     // "alignment_bit_equal_to_one=0 / undecodable NALU 20" seen in recent ffmpeg).
     // Value 1 matches x265 and is a no-op for a single-slice picture.
     hdr.write_bit(true); // slice_loop_filter_across_slices_enabled_flag = 1
-    hdr.rbsp_trailing_bits();
-    let header_bytes = hdr.finish();
+    // For WPP the slice header also carries per-substream entry points; those need
+    // the encoded substream sizes, so `hdr` is finalized after coding (below).
 
-    // HEVC slice_segment_data(): each CTU carries a recursively selected
-    // 32→16→8 intra CU tree followed by end_of_slice_segment_flag.
-    let qp: u8 = qp_val;
-    let mut cab = CabacEncoder::new();
-    let mut ctx = ContextSet::init_islice(qp);
-    let mut ictx = IntraModeContexts::init_islice(qp);
-    // HM-style intra Lagrange multiplier for J = SSE + λ·R (R in bits).
-    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
-    // Per-8×8-block quadtree depth (1/2/3 for 32/16/8 leaves); drives the
-    // split_cu_flag context from the depths of the left and above neighbors.
-    let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
-    // CU depths live on the SPS minimum-CU 8×8 grid, while intra prediction
-    // modes live on the minimum-PU 4×4 grid so an 8×8 PART_NxN CU can expose
-    // four independently coded luma modes to later neighbors.
-    let cu_stride = w / 8;
-    let mode_stride = w / 4;
-    let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
-    // One reusable work area per independently encoded slice/tile. Boxing the
-    // aggregate keeps the large 32×32 buffers out of the call stack.
-    let mut scratch = Box::new(CompressionContext::new());
-
-    // Padded reconstruction buffers (prediction uses coded dimensions). Monochrome
-    // has no chroma planes.
-    let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
-    let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
-        (Vec::new(), Vec::new())
-    } else {
-        (
-            pad_plane(&yuv.cb, src_cw, src_ch, cw, ch),
-            pad_plane(&yuv.cr, src_cw, src_ch, cw, ch),
-        )
-    };
-
-    // CTB grid: full 64×64 CTBs over the padded coded picture. The 64×64
-    // root remains forced split because this encoder has no 64×64 prediction
-    // leaf. Each representable 32/16/8 leaf may independently keep its root TU
-    // or split once into four child TUs, selected before the committed encode.
-    let ctb_size_y = 64usize;
-    let ctus_x = w / ctb_size_y;
-    let ctus_y = h / ctb_size_y;
-    let total_ctus = ctus_x * ctus_y;
-    let strides = PlaneStrides {
-        w,
-        src_yw,
-        src_yh,
-        cw,
-        src_cw,
-        src_ch,
-        sub_w,
-        sub_h,
-    };
-    let mut ctu_idx = 0usize;
-
-    for ctu_row in 0..ctus_y {
-        for ctu_col in 0..ctus_x {
-            let lu_row0 = ctu_row * ctb_size_y;
-            let lu_col0 = ctu_col * ctb_size_y;
-
-            // SAO is enabled in the SPS/slice but explicitly disabled per CTU.
-            if ctu_col > 0 {
-                cab.encode_bin(0, &mut ctx.sao_merge_flag);
-            }
-            if ctu_row > 0 {
-                cab.encode_bin(0, &mut ctx.sao_merge_flag);
-            }
-            cab.encode_bin(0, &mut ctx.sao_type_idx);
-            if !yuv.chroma.is_monochrome() {
-                cab.encode_bin(0, &mut ctx.sao_type_idx);
-            }
-
-            // The 64×64 root cannot be a leaf until the encoder has a 64-CU /
-            // four-32-TU transform-tree path, so signal the root split and select
-            // a fast 32→16→8 plan for each representable child.
-            let root_ctx = (ctu_col > 0) as usize + (ctu_row > 0) as usize;
-            cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
-
-            let mut tree = CuTreeState {
-                yuv,
-                rec_y: &mut rec_y,
-                rec_cb: &mut rec_cb,
-                rec_cr: &mut rec_cr,
-                strides,
-                qp,
-                lambda,
-                mode_map: &mut mode_map,
-                cu_depth: &mut cu_depth,
-                cu_stride,
-                mode_stride,
-                lossless,
-                scratch: &mut scratch,
-            };
-            for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                let row = lu_row0 + dy * 32;
-                let col = lu_col0 + dx * 32;
-                // Full rate–distortion CU-quadtree search: cost every 32/16/8
-                // candidate by actually encoding it (mode search + transform +
-                // reconstruction into rec, bits via the fractional estimator) and
-                // keep the cheapest tree, then commit it once for real.
-                let plan = rdo_cu32_plan(&mut tree, row, col, &ctx, &ictx);
-                commit_cu32_plan(&mut cab, &mut ctx, &mut ictx, &mut tree, row, col, 1, plan);
-            }
-
-            let is_last_ctu = ctu_idx == total_ctus - 1;
-            cab.encode_terminate(if is_last_ctu { 1 } else { 0 });
-            ctu_idx += 1;
-        }
-    }
-
-    let cabac_bytes = cab.finish();
-    let mut nalu_data = header_bytes;
-    nalu_data.extend_from_slice(&cabac_bytes);
-
-    // In-loop deblocking filter (matches the decoder's post-decode filtering, so
-    // the returned reconstruction equals a conformant decoder's output and block
-    // edges are smoothed).
-    // In-loop deblocking. Monochrome filters luma only.
-    //
-    // Lossless (transquant-bypass) CUs are exempt from deblocking per HEVC
-    // §8.7.2: an edge is not filtered when a sample on either side belongs to a
-    // CU with cu_transquant_bypass_flag = 1. With every CU coded in bypass the
-    // filter is a no-op across the whole picture, so we skip it outright — both
-    // to stay bit-exact with a conformant decoder and to avoid perturbing the
-    // already-exact reconstruction.
-    if !lossless {
-        if yuv.chroma.is_monochrome() {
-            crate::deblock::deblock_luma_only(&mut rec_y, w, h, qp_val, yuv.bit_depth);
+    // Encode the slice data. Without tiles the whole picture is one region emitting
+    // a single substream (non-WPP) or one per CTU row (WPP). With tiles, each tile is
+    // an independent region coded in parallel on the pool and its substreams are
+    // concatenated in tile-scan order.
+    let num_tiles = tile_cols * tile_rows;
+    let slice_data = if num_tiles <= 1 {
+        let substreams = encode_region_substreams(
+            yuv, width, height, qp_val, lossless, wpp, threads, true, pool,
+        );
+        if wpp {
+            assemble_substreams(&mut hdr, &substreams)
         } else {
-            crate::deblock::deblock(
-                &mut rec_y,
-                w,
-                h,
-                &mut rec_cb,
-                &mut rec_cr,
-                cw,
-                ch,
-                qp_val,
-                yuv.bit_depth,
-            );
+            // No tiles and no WPP: one substream, and no entry-point block.
+            substreams.into_iter().next().unwrap_or_default()
         }
-    }
+    } else {
+        let w = ((width + 63) & !63) as usize;
+        let h = ((height + 63) & !63) as usize;
+        let ctus_x = w / 64;
+        let ctus_y = h / 64;
+        // Uniform-spacing CTB boundaries (must match the decoder's derivation from
+        // num_tile_columns_minus1/num_tile_rows_minus1 in the PPS).
+        let col_bd: Vec<usize> = (0..=tile_cols).map(|i| i * ctus_x / tile_cols).collect();
+        let row_bd: Vec<usize> = (0..=tile_rows).map(|j| j * ctus_y / tile_rows).collect();
+        let mut bounds = Vec::with_capacity(num_tiles);
+        for tj in 0..tile_rows {
+            for ti in 0..tile_cols {
+                let x0 = col_bd[ti] * 64;
+                let y0 = row_bd[tj] * 64;
+                let tw = (col_bd[ti + 1] - col_bd[ti]) * 64;
+                let th = (row_bd[tj + 1] - row_bd[tj]) * 64;
+                bounds.push((x0, y0, tw, th));
+            }
+        }
+        // Tiles run concurrently AND each WPP-parallelizes its rows internally (nested
+        // on the shared pool). Give every tile the full thread count and let the pool's
+        // single work queue balance the combined tile×row tasks across the cores.
+        let tile_threads = threads;
+        let mut tile_subs: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_tiles];
+        {
+            let slot = SyncSlice::new(&mut tile_subs);
+            pool.scoped(|s| {
+                for (idx, &(x0, y0, tw, th)) in bounds.iter().enumerate() {
+                    let is_last = idx == num_tiles - 1;
+                    s.spawn(move || {
+                        let tile_yuv = extract_tile_yuv(yuv, x0, y0, tw, th);
+                        let subs = encode_region_substreams(
+                            &tile_yuv,
+                            tw as u32,
+                            th as u32,
+                            qp_val,
+                            lossless,
+                            wpp,
+                            tile_threads,
+                            is_last,
+                            pool,
+                        );
+                        // SAFETY: each task writes a distinct index of `tile_subs`.
+                        unsafe {
+                            slot.get()[idx] = subs;
+                        }
+                    });
+                }
+            });
+        }
+        let all: Vec<Vec<u8>> = tile_subs.into_iter().flatten().collect();
+        assemble_substreams(&mut hdr, &all)
+    };
+
+    hdr.rbsp_trailing_bits(); // byte_alignment() ending the slice header
+    let mut nalu_data = hdr.finish();
+    nalu_data.extend_from_slice(&slice_data);
 
     Ok((
         Nalu {
             _nal_type: 20,
             data: nalu_data,
         },
-        rec_y,
-        rec_cb,
-        rec_cr,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     ))
 }
 
@@ -802,6 +1310,103 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
     }
 
     out
+}
+
+/// Copy a `tw × th` window starting at (x0, y0) out of a plane, replicating the
+/// source edge for any part of the window past the plane bounds.
+fn extract_plane(
+    src: &[u16],
+    sw: usize,
+    sh: usize,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+) -> Vec<u16> {
+    let mut out = vec![0u16; tw * th];
+    for r in 0..th {
+        let sr = (y0 + r).min(sh - 1);
+        let base = sr * sw;
+        let dst = &mut out[r * tw..r * tw + tw];
+        // Interior columns copy directly; the tail (past sw) replicates the edge.
+        let copy = tw.min(sw.saturating_sub(x0));
+        for (c, d) in dst.iter_mut().enumerate().take(copy) {
+            *d = src[base + x0 + c];
+        }
+        if copy < tw {
+            let edge = src[base + sw - 1];
+            dst[copy..].fill(edge);
+        }
+    }
+    out
+}
+
+/// Extract one HEVC tile as a standalone sub-picture whose coded size is the tile's
+/// (CTB-aligned) pixel span. Encoding this sub-picture independently reproduces exact
+/// tile semantics: the tile's edge CTBs see "picture edge" (unavailable) neighbors,
+/// which is precisely how a decoder treats cross-tile neighbors — so no cross-tile
+/// prediction ever occurs, and no availability refactor is needed.
+fn extract_tile_yuv(yuv: &Yuv, x0: usize, y0: usize, tw: usize, th: usize) -> Yuv {
+    let sw = yuv.width as usize;
+    let sh = yuv.height as usize;
+    let y = extract_plane(&yuv.y, sw, sh, x0, y0, tw, th);
+    let (cb, cr) = if yuv.chroma.is_monochrome() {
+        (Vec::new(), Vec::new())
+    } else {
+        let subw = yuv.chroma.sub_w();
+        let subh = yuv.chroma.sub_h();
+        let scw = sw.div_ceil(subw);
+        let sch = sh.div_ceil(subh);
+        let (cx, cy) = (x0 / subw, y0 / subh);
+        let (ctw, cth) = (tw / subw, th / subh);
+        (
+            extract_plane(&yuv.cb, scw, sch, cx, cy, ctw, cth),
+            extract_plane(&yuv.cr, scw, sch, cx, cy, ctw, cth),
+        )
+    };
+    Yuv {
+        y,
+        cb,
+        cr,
+        width: tw as u32,
+        height: th as u32,
+        display_w: tw as u32,
+        display_h: th as u32,
+        chroma: yuv.chroma,
+        bit_depth: yuv.bit_depth,
+    }
+}
+
+/// Choose a uniform tile grid (columns, rows) targeting `par`-way tile parallelism
+/// while keeping tiles reasonably large (≥ `MIN_CTB` per side) and roughly square, so
+/// the seam/entry-point overhead of tiling stays small. Returns (1, 1) — no tiles —
+/// when there is no parallelism to exploit or the picture is too small to split.
+fn choose_tile_grid(ctus_x: usize, ctus_y: usize, par: usize) -> (usize, usize) {
+    if par <= 1 {
+        return (1, 1);
+    }
+    const MIN_CTB: usize = 4; // ≥256-px tiles keep prediction seams and overhead low
+    let max_cols = (ctus_x / MIN_CTB).max(1);
+    let max_rows = (ctus_y / MIN_CTB).max(1);
+    let mut best = (1usize, 1usize);
+    let mut best_score = i64::MAX;
+    for rows in 1..=max_rows {
+        for cols in 1..=max_cols {
+            let n = cols * rows;
+            if n > par {
+                break;
+            }
+            let tw = ctus_x / cols;
+            let th = ctus_y / rows;
+            // Prefer counts near `par`, breaking ties toward square tiles.
+            let score = (par as i64 - n as i64) * 1000 + (tw as i64 - th as i64).abs();
+            if score < best_score {
+                best_score = score;
+                best = (cols, rows);
+            }
+        }
+    }
+    best
 }
 
 /// Encode one intra CU and its format-dependent chroma transform blocks.
@@ -1503,6 +2108,133 @@ struct CuParams {
     lossless: bool,
 }
 
+/// Frame-constant coding parameters threaded through the CTU/CU intra RD search.
+#[derive(Clone, Copy)]
+struct SliceCoding {
+    qp: u8,
+    lambda: f32,
+    lossless: bool,
+}
+
+/// Mutable reconstruction and neighbor-map state for coding one CTU (or a WPP row
+/// band): the padded reconstruction planes plus the per-8×8 CU-depth and per-4×4
+/// intra-mode maps and their strides. Passed by value so a per-CTU reborrow yields
+/// plain `&mut [_]` fields (the body uses them directly).
+struct CtuRecState<'a> {
+    rec_y: &'a mut [u16],
+    rec_cb: &'a mut [u16],
+    rec_cr: &'a mut [u16],
+    mode_map: &'a mut [u8],
+    cu_depth: &'a mut [u8],
+    cu_stride: usize,
+    mode_stride: usize,
+}
+
+/// How one region (whole picture or one HEVC tile) is parallelized and terminated.
+#[derive(Clone, Copy)]
+struct ParallelPlan<'a> {
+    wpp: bool,
+    threads: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+    pool: &'a crate::pool::ThreadPool,
+}
+
+/// Luma position/stride geometry for committing one split (NxN child) TB.
+#[derive(Clone, Copy)]
+struct LumaSplitGeom {
+    stride: usize,
+    coded_yh: usize,
+    block_row: usize,
+    block_col: usize,
+    parent: usize,
+}
+
+/// Per-TB luma coding parameters and pixel-format constants.
+#[derive(Clone, Copy)]
+struct LumaTbCoding {
+    mode: u8,
+    qp: u8,
+    bit_depth: u8,
+    max_val: u16,
+    neutral: u16,
+    lambda: f32,
+}
+
+/// The four chroma planes involved in a chroma-TB decision: the two source planes
+/// and the two mutable reconstruction planes.
+struct ChromaPlanes<'a> {
+    src_cb: &'a [u16],
+    src_cr: &'a [u16],
+    rec_cb: &'a mut [u16],
+    rec_cr: &'a mut [u16],
+}
+
+/// Chroma/luma stride + position geometry shared by chroma-TB commit and search.
+#[derive(Clone, Copy)]
+struct ChromaSplitGeom {
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    lu_row: usize,
+    lu_col: usize,
+    parent_luma: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+}
+
+/// Chroma coding parameters and pixel-format constants (no per-candidate mode).
+#[derive(Clone, Copy)]
+struct ChromaCoding {
+    chroma: crate::fmt::ChromaFormat,
+    chroma_qp: u8,
+    bit_depth: u8,
+    max_val: u16,
+    lambda: f32,
+}
+
+/// Options for one chroma-mode RD evaluation.
+struct ChromaEvalOpts {
+    candidate: ChromaModeCandidate,
+    estimate_rate: bool,
+    winner_rdoq: bool,
+    cost_limit: f32,
+}
+
+/// Stride/position geometry for the PART_NxN intra CU coder.
+#[derive(Clone, Copy)]
+struct NxnGeom {
+    lu_row: usize,
+    lu_col: usize,
+    yw_stride: usize,
+    src_yh: usize,
+    cw_stride: usize,
+    src_cw: usize,
+    src_ch: usize,
+    coded_yh: usize,
+    coded_ch_h: usize,
+    mode_stride: usize,
+}
+
+/// Coding parameters for the PART_NxN intra CU coder.
+#[derive(Clone, Copy)]
+struct NxnParams {
+    qp_slice: u8,
+    qp: u8,
+    chroma: crate::fmt::ChromaFormat,
+    bit_depth: crate::fmt::BitDepth,
+    lambda: f32,
+}
+
+/// Luma position of one CU: min-CU grid row/col and the CU side (8/16/32).
+#[derive(Clone, Copy)]
+struct CuPos {
+    lu_row: usize,
+    lu_col: usize,
+    lu: usize,
+}
+
 struct ChromaTb {
     cb_zz: [i16; 1024],
     cb_nz: bool,
@@ -1682,18 +2414,24 @@ fn encode_cu_leaf(
             ictx,
         },
         state.yuv,
-        &mut *state.rec_y,
-        &mut *state.rec_cb,
-        &mut *state.rec_cr,
-        row,
-        col,
-        size,
+        CuRecPlanes {
+            y: &mut *state.rec_y,
+            cb: &mut *state.rec_cb,
+            cr: &mut *state.rec_cr,
+        },
+        CuPos {
+            lu_row: row,
+            lu_col: col,
+            lu: size,
+        },
         state.strides,
-        state.qp,
-        state.lambda,
+        SliceCoding {
+            qp: state.qp,
+            lambda: state.lambda,
+            lossless: state.lossless,
+        },
         &mut *state.mode_map,
         state.mode_stride,
-        state.lossless,
         &mut *state.scratch,
     );
     fill_cu_depth(&mut *state.cu_depth, row, col, size, depth, state.cu_stride);
@@ -1927,18 +2665,24 @@ fn cost_leaf(
             ictx: &mut ictx,
         },
         tree.yuv,
-        &mut *tree.rec_y,
-        &mut *tree.rec_cb,
-        &mut *tree.rec_cr,
-        row,
-        col,
-        size,
+        CuRecPlanes {
+            y: &mut *tree.rec_y,
+            cb: &mut *tree.rec_cb,
+            cr: &mut *tree.rec_cr,
+        },
+        CuPos {
+            lu_row: row,
+            lu_col: col,
+            lu: size,
+        },
         tree.strides,
-        tree.qp,
-        tree.lambda,
+        SliceCoding {
+            qp: tree.qp,
+            lambda: tree.lambda,
+            lossless: tree.lossless,
+        },
         &mut *tree.mode_map,
         tree.mode_stride,
-        tree.lossless,
         &mut *tree.scratch,
     );
     cu_region_sse(tree, row, col, size) + tree.lambda * est.bits()
@@ -2095,23 +2839,28 @@ fn split_transform_context(size: usize) -> usize {
     (5usize - size.trailing_zeros() as usize).min(2)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn commit_split_luma(
     scratch: &mut CompressionContext,
     rec_y: &mut [u16],
-    stride: usize,
-    coded_yh: usize,
-    block_row: usize,
-    block_col: usize,
-    parent: usize,
-    mode: u8,
-    qp: u8,
-    bit_depth: u8,
-    max_val: u16,
-    neutral: u16,
-    lambda: f32,
+    geom: LumaSplitGeom,
+    coding: LumaTbCoding,
     ctx: &ContextSet,
 ) -> bool {
+    let LumaSplitGeom {
+        stride,
+        coded_yh,
+        block_row,
+        block_col,
+        parent,
+    } = geom;
+    let LumaTbCoding {
+        mode,
+        qp,
+        bit_depth,
+        max_val,
+        neutral,
+        lambda,
+    } = coding;
     let child = parent / 2;
     let child_len = child * child;
     let log2_child = child.trailing_zeros();
@@ -2191,15 +2940,18 @@ fn commit_split_luma(
             &mut scratch.coeff,
             &mut scratch.transform_tmp,
         );
-        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
-            &scratch.coeff,
-            child,
+        let tb = crate::hevc_transform::RdoqTb {
+            coeff: &scratch.coeff,
+            n: child,
             qp,
             bit_depth,
             scan,
             scan_idx,
-            1,
             lambda,
+        };
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &tb,
+            1,
             &residual_ctx,
             &mut scratch.levels,
             &mut scratch.rdoq,
@@ -2263,30 +3015,38 @@ fn split_chroma_is_shared(parent_luma: usize, chroma: crate::fmt::ChromaFormat) 
     child_luma / chroma.sub_w() < 4 || child_luma / chroma.sub_h() < 4
 }
 
-#[allow(clippy::too_many_arguments)]
 fn commit_split_chroma(
     scratch: &mut CompressionContext,
-    src_cb: &[u16],
-    src_cr: &[u16],
-    rec_cb: &mut [u16],
-    rec_cr: &mut [u16],
-    src_cw: usize,
-    src_ch: usize,
-    cw_stride: usize,
-    coded_ch_h: usize,
-    lu_row: usize,
-    lu_col: usize,
-    parent_luma: usize,
-    yw_stride: usize,
-    coded_yh: usize,
-    chroma: crate::fmt::ChromaFormat,
+    planes: ChromaPlanes<'_>,
+    geom: ChromaSplitGeom,
+    coding: ChromaCoding,
     mode: u8,
-    chroma_qp: u8,
-    bit_depth: u8,
-    max_val: u16,
-    lambda: f32,
     ctx_after_luma: &ContextSet,
 ) {
+    let ChromaPlanes {
+        src_cb,
+        src_cr,
+        rec_cb,
+        rec_cr,
+    } = planes;
+    let ChromaSplitGeom {
+        src_cw,
+        src_ch,
+        cw_stride,
+        coded_ch_h,
+        lu_row,
+        lu_col,
+        parent_luma,
+        yw_stride,
+        coded_yh,
+    } = geom;
+    let ChromaCoding {
+        chroma,
+        chroma_qp,
+        bit_depth,
+        max_val,
+        lambda,
+    } = coding;
     debug_assert!(!chroma.is_monochrome());
     debug_assert!(!split_chroma_is_shared(parent_luma, chroma));
 
@@ -2410,15 +3170,18 @@ fn commit_split_chroma(
                     &mut scratch.coeff,
                     &mut scratch.transform_tmp,
                 );
-                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
-                    &scratch.coeff,
-                    child_side,
-                    chroma_qp,
+                let tb = crate::hevc_transform::RdoqTb {
+                    coeff: &scratch.coeff,
+                    n: child_side,
+                    qp: chroma_qp,
                     bit_depth,
                     scan,
                     scan_idx,
-                    1,
                     lambda,
+                };
+                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                    &tb,
+                    1,
                     &residual_ctx,
                     &mut scratch.levels,
                     &mut scratch.rdoq,
@@ -2509,33 +3272,45 @@ fn commit_split_chroma(
 
 #[allow(clippy::too_many_arguments)]
 fn evaluate_chroma_mode(
-    candidate: ChromaModeCandidate,
-    estimate_rate: bool,
-    winner_rdoq: bool,
-    cost_limit: f32,
+    opts: ChromaEvalOpts,
     scratch: &mut CompressionContext,
-    src_cb: &[u16],
-    src_cr: &[u16],
-    rec_cb: &mut [u16],
-    rec_cr: &mut [u16],
-    src_cw: usize,
-    src_ch: usize,
-    cw_stride: usize,
-    coded_ch_h: usize,
-    lu_row: usize,
-    lu_col: usize,
-    parent_luma: usize,
+    planes: ChromaPlanes<'_>,
+    geom: ChromaSplitGeom,
+    coding: ChromaCoding,
     trafo_depth: usize,
-    yw_stride: usize,
-    coded_yh: usize,
-    chroma: crate::fmt::ChromaFormat,
-    chroma_qp: u8,
-    bit_depth: u8,
-    max_val: u16,
-    lambda: f32,
     residual_ctx_after_luma: &ContextSet,
     ictx: &IntraModeContexts,
 ) -> f32 {
+    let ChromaEvalOpts {
+        candidate,
+        estimate_rate,
+        winner_rdoq,
+        cost_limit,
+    } = opts;
+    let ChromaPlanes {
+        src_cb,
+        src_cr,
+        rec_cb,
+        rec_cr,
+    } = planes;
+    let ChromaSplitGeom {
+        src_cw,
+        src_ch,
+        cw_stride,
+        coded_ch_h,
+        lu_row,
+        lu_col,
+        parent_luma,
+        yw_stride,
+        coded_yh,
+    } = geom;
+    let ChromaCoding {
+        chroma,
+        chroma_qp,
+        bit_depth,
+        max_val,
+        lambda,
+    } = coding;
     let sub_w = chroma.sub_w();
     let sub_h = chroma.sub_h();
     let side = parent_luma / sub_w;
@@ -2649,15 +3424,18 @@ fn evaluate_chroma_mode(
                 &mut scratch.transform_tmp,
             );
             if winner_rdoq {
-                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
-                    &scratch.coeff,
-                    side,
-                    chroma_qp,
+                let tb = crate::hevc_transform::RdoqTb {
+                    coeff: &scratch.coeff,
+                    n: side,
+                    qp: chroma_qp,
                     bit_depth,
                     scan,
                     scan_idx,
-                    trafo_depth,
                     lambda,
+                };
+                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                    &tb,
+                    trafo_depth,
                     &rdoq_ctx,
                     &mut scratch.levels,
                     &mut scratch.rdoq,
@@ -3021,30 +3799,38 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
             let mut best_cost = f32::MAX;
             for &candidate in &ranked[..exact_count] {
                 let cost = evaluate_chroma_mode(
-                    candidate,
-                    true,
-                    false,
-                    best_cost,
+                    ChromaEvalOpts {
+                        candidate,
+                        estimate_rate: true,
+                        winner_rdoq: false,
+                        cost_limit: best_cost,
+                    },
                     scratch,
-                    src_cb,
-                    src_cr,
-                    rec_cb,
-                    rec_cr,
-                    src_cw,
-                    src_ch,
-                    cw_stride,
-                    coded_ch_h,
-                    row,
-                    col,
-                    SIDE,
+                    ChromaPlanes {
+                        src_cb,
+                        src_cr,
+                        rec_cb: &mut *rec_cb,
+                        rec_cr: &mut *rec_cr,
+                    },
+                    ChromaSplitGeom {
+                        src_cw,
+                        src_ch,
+                        cw_stride,
+                        coded_ch_h,
+                        lu_row: row,
+                        lu_col: col,
+                        parent_luma: SIDE,
+                        yw_stride,
+                        coded_yh,
+                    },
+                    ChromaCoding {
+                        chroma,
+                        chroma_qp,
+                        bit_depth: bit_depth.bits(),
+                        max_val,
+                        lambda: chroma_lambda,
+                    },
                     1,
-                    yw_stride,
-                    coded_yh,
-                    chroma,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    max_val,
-                    chroma_lambda,
                     &residual_ctx,
                     ictx,
                 );
@@ -3055,30 +3841,38 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
             }
         }
         let _ = evaluate_chroma_mode(
-            best,
-            false,
-            true,
-            f32::MAX,
+            ChromaEvalOpts {
+                candidate: best,
+                estimate_rate: false,
+                winner_rdoq: true,
+                cost_limit: f32::MAX,
+            },
             scratch,
-            src_cb,
-            src_cr,
-            rec_cb,
-            rec_cr,
-            src_cw,
-            src_ch,
-            cw_stride,
-            coded_ch_h,
-            row,
-            col,
-            SIDE,
+            ChromaPlanes {
+                src_cb,
+                src_cr,
+                rec_cb: &mut *rec_cb,
+                rec_cr: &mut *rec_cr,
+            },
+            ChromaSplitGeom {
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                lu_row: row,
+                lu_col: col,
+                parent_luma: SIDE,
+                yw_stride,
+                coded_yh,
+            },
+            ChromaCoding {
+                chroma,
+                chroma_qp,
+                bit_depth: bit_depth.bits(),
+                max_val,
+                lambda: chroma_lambda,
+            },
             1,
-            yw_stride,
-            coded_yh,
-            chroma,
-            chroma_qp,
-            bit_depth.bits(),
-            max_val,
-            chroma_lambda,
             &residual_ctx,
             ictx,
         );
@@ -3125,35 +3919,46 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_cu_nxn<W: CabacWriter>(
-    enc: &mut W,
-    ctx: &mut ContextSet,
-    ictx: &mut IntraModeContexts,
-    src_y: &[u16],
-    src_cb: &[u16],
-    src_cr: &[u16],
-    rec_y: &mut [u16],
-    rec_cb: &mut [u16],
-    rec_cr: &mut [u16],
-    lu_row: usize,
-    lu_col: usize,
-    yw_stride: usize,
-    src_yw: usize,
-    src_yh: usize,
-    cw_stride: usize,
-    src_cw: usize,
-    src_ch: usize,
-    coded_yh: usize,
-    coded_ch_h: usize,
-    qp_slice: u8,
-    qp: u8,
-    chroma: crate::fmt::ChromaFormat,
-    bit_depth: crate::fmt::BitDepth,
-    lambda: f32,
+    ent: Entropy<'_, W>,
+    src: CuSrcPlanes<'_>,
+    rec: CuRecPlanes<'_>,
+    geom: NxnGeom,
+    params: NxnParams,
     mode_map: &mut [u8],
-    mode_stride: usize,
     challenger_cost: f32,
     scratch: &mut CompressionContext,
 ) -> bool {
+    let Entropy { enc, ctx, ictx } = ent;
+    let CuSrcPlanes {
+        y: src_y,
+        cb: src_cb,
+        cr: src_cr,
+        src_yw,
+    } = src;
+    let CuRecPlanes {
+        y: rec_y,
+        cb: rec_cb,
+        cr: rec_cr,
+    } = rec;
+    let NxnGeom {
+        lu_row,
+        lu_col,
+        yw_stride,
+        src_yh,
+        cw_stride,
+        src_cw,
+        src_ch,
+        coded_yh,
+        coded_ch_h,
+        mode_stride,
+    } = geom;
+    let NxnParams {
+        qp_slice,
+        qp,
+        chroma,
+        bit_depth,
+        lambda,
+    } = params;
     const PU: usize = 4;
     const PU_LEN: usize = 16;
     let max_val = bit_depth.max_val();
@@ -3390,15 +4195,18 @@ fn encode_cu_nxn<W: CabacWriter>(
 
         let scan_idx = dct::scan_idx_for(best_mode, 2, true, false);
         let scan = dct::coeff_scan(2, scan_idx);
-        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
-            &scratch.best_coeff,
-            PU,
+        let tb = crate::hevc_transform::RdoqTb {
+            coeff: &scratch.best_coeff,
+            n: PU,
             qp,
-            bit_depth.bits(),
+            bit_depth: bit_depth.bits(),
             scan,
             scan_idx,
-            1,
             lambda,
+        };
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &tb,
+            1,
             &rdoq_ctx,
             &mut scratch.levels,
             &mut scratch.rdoq,
@@ -3576,30 +4384,38 @@ fn encode_cu_nxn<W: CabacWriter>(
             let mut best_cost = f32::MAX;
             for &candidate in &ranked[..exact_count] {
                 let cost = evaluate_chroma_mode(
-                    candidate,
-                    true,
-                    false,
-                    best_cost,
+                    ChromaEvalOpts {
+                        candidate,
+                        estimate_rate: true,
+                        winner_rdoq: false,
+                        cost_limit: best_cost,
+                    },
                     scratch,
-                    src_cb,
-                    src_cr,
-                    rec_cb,
-                    rec_cr,
-                    src_cw,
-                    src_ch,
-                    cw_stride,
-                    coded_ch_h,
-                    lu_row,
-                    lu_col,
-                    8,
+                    ChromaPlanes {
+                        src_cb,
+                        src_cr,
+                        rec_cb: &mut *rec_cb,
+                        rec_cr: &mut *rec_cr,
+                    },
+                    ChromaSplitGeom {
+                        src_cw,
+                        src_ch,
+                        cw_stride,
+                        coded_ch_h,
+                        lu_row,
+                        lu_col,
+                        parent_luma: 8,
+                        yw_stride,
+                        coded_yh,
+                    },
+                    ChromaCoding {
+                        chroma,
+                        chroma_qp,
+                        bit_depth: bit_depth.bits(),
+                        max_val,
+                        lambda: chroma_lambda,
+                    },
                     0,
-                    yw_stride,
-                    coded_yh,
-                    chroma,
-                    chroma_qp,
-                    bit_depth.bits(),
-                    max_val,
-                    chroma_lambda,
                     &rdoq_ctx,
                     ictx,
                 );
@@ -3611,30 +4427,38 @@ fn encode_cu_nxn<W: CabacWriter>(
         }
 
         let _ = evaluate_chroma_mode(
-            best,
-            false,
-            true,
-            f32::MAX,
+            ChromaEvalOpts {
+                candidate: best,
+                estimate_rate: false,
+                winner_rdoq: true,
+                cost_limit: f32::MAX,
+            },
             scratch,
-            src_cb,
-            src_cr,
-            rec_cb,
-            rec_cr,
-            src_cw,
-            src_ch,
-            cw_stride,
-            coded_ch_h,
-            lu_row,
-            lu_col,
-            8,
+            ChromaPlanes {
+                src_cb,
+                src_cr,
+                rec_cb: &mut *rec_cb,
+                rec_cr: &mut *rec_cr,
+            },
+            ChromaSplitGeom {
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                lu_row,
+                lu_col,
+                parent_luma: 8,
+                yw_stride,
+                coded_yh,
+            },
+            ChromaCoding {
+                chroma,
+                chroma_qp,
+                bit_depth: bit_depth.bits(),
+                max_val,
+                lambda: chroma_lambda,
+            },
             0,
-            yw_stride,
-            coded_yh,
-            chroma,
-            chroma_qp,
-            bit_depth.bits(),
-            max_val,
-            chroma_lambda,
             &rdoq_ctx,
             ictx,
         );
@@ -4194,32 +5018,42 @@ fn encode_cu<W: CabacWriter>(
         saved_pred.copy_from_slice(&scratch.best_pred[..num_luma]);
         saved_coeff.copy_from_slice(&scratch.best_coeff[..num_luma]);
         if encode_cu_nxn(
-            enc,
-            ctx,
-            ictx,
-            src_y,
-            src_cb,
-            src_cr,
-            rec_y,
-            rec_cb,
-            rec_cr,
-            lu_row,
-            lu_col,
-            yw_stride,
-            src_yw,
-            src_yh,
-            cw_stride,
-            src_cw,
-            src_ch,
-            coded_yh,
-            coded_ch_h,
-            qp_slice,
-            qp,
-            chroma,
-            bit_depth,
-            lambda,
+            Entropy {
+                enc: &mut *enc,
+                ctx: &mut *ctx,
+                ictx: &mut *ictx,
+            },
+            CuSrcPlanes {
+                y: src_y,
+                cb: src_cb,
+                cr: src_cr,
+                src_yw,
+            },
+            CuRecPlanes {
+                y: rec_y,
+                cb: rec_cb,
+                cr: rec_cr,
+            },
+            NxnGeom {
+                lu_row,
+                lu_col,
+                yw_stride,
+                src_yh,
+                cw_stride,
+                src_cw,
+                src_ch,
+                coded_yh,
+                coded_ch_h,
+                mode_stride,
+            },
+            NxnParams {
+                qp_slice,
+                qp,
+                chroma,
+                bit_depth,
+                lambda,
+            },
             mode_map,
-            mode_stride,
             best_rd_cost,
             scratch,
         ) {
@@ -4273,14 +5107,17 @@ fn encode_cu<W: CabacWriter>(
             &mut scratch.levels,
         );
     } else {
-        crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
-            &scratch.best_coeff,
-            lu,
+        let tb = crate::hevc_transform::RdoqTb {
+            coeff: &scratch.best_coeff,
+            n: lu,
             qp,
-            bit_depth.bits(),
-            luma_scan,
-            luma_scan_idx,
+            bit_depth: bit_depth.bits(),
+            scan: luma_scan,
+            scan_idx: luma_scan_idx,
             lambda,
+        };
+        crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
+            &tb,
             ctx,
             &mut scratch.levels,
             &mut scratch.rdoq,
@@ -4351,17 +5188,21 @@ fn encode_cu<W: CabacWriter>(
         let y_nz_split = commit_split_luma(
             scratch,
             rec_y,
-            yw_stride,
-            coded_yh,
-            lu_row,
-            lu_col,
-            lu,
-            luma_mode,
-            qp,
-            bit_depth.bits(),
-            max_val,
-            neutral,
-            lambda,
+            LumaSplitGeom {
+                stride: yw_stride,
+                coded_yh,
+                block_row: lu_row,
+                block_col: lu_col,
+                parent: lu,
+            },
+            LumaTbCoding {
+                mode: luma_mode,
+                qp,
+                bit_depth: bit_depth.bits(),
+                max_val,
+                neutral,
+                lambda,
+            },
             ctx,
         );
         let d_split = sse_plane(
@@ -4789,14 +5630,17 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.transform_tmp,
                         );
                         if winner_rdoq {
-                            crate::hevc_transform::rdoq_chroma_with_sign_hiding_into(
-                                &scratch.coeff,
-                                ctb,
-                                chroma_qp,
-                                bit_depth.bits(),
+                            let tb = crate::hevc_transform::RdoqTb {
+                                coeff: &scratch.coeff,
+                                n: ctb,
+                                qp: chroma_qp,
+                                bit_depth: bit_depth.bits(),
                                 scan,
                                 scan_idx,
-                                chroma_lambda,
+                                lambda: chroma_lambda,
+                            };
+                            crate::hevc_transform::rdoq_chroma_with_sign_hiding_into(
+                                &tb,
                                 &residual_ctx_after_luma,
                                 &mut scratch.levels,
                                 &mut scratch.rdoq,
@@ -4948,25 +5792,31 @@ fn encode_cu<W: CabacWriter>(
         } else if split_chroma_tree {
             commit_split_chroma(
                 scratch,
-                src_cb,
-                src_cr,
-                rec_cb,
-                rec_cr,
-                src_cw,
-                src_ch,
-                cw_stride,
-                coded_ch_h,
-                lu_row,
-                lu_col,
-                lu,
-                yw_stride,
-                coded_yh,
-                chroma,
+                ChromaPlanes {
+                    src_cb,
+                    src_cr,
+                    rec_cb,
+                    rec_cr,
+                },
+                ChromaSplitGeom {
+                    src_cw,
+                    src_ch,
+                    cw_stride,
+                    coded_ch_h,
+                    lu_row,
+                    lu_col,
+                    parent_luma: lu,
+                    yw_stride,
+                    coded_yh,
+                },
+                ChromaCoding {
+                    chroma,
+                    chroma_qp,
+                    bit_depth: bit_depth.bits(),
+                    max_val,
+                    lambda: chroma_lambda,
+                },
                 best_chroma.pred_mode,
-                chroma_qp,
-                bit_depth.bits(),
-                max_val,
-                chroma_lambda,
                 &residual_ctx_after_luma,
             );
         }
@@ -5039,20 +5889,25 @@ fn encode_cu<W: CabacWriter>(
 fn code_one_cu<W: CabacWriter>(
     ent: Entropy<'_, W>,
     yuv: &Yuv,
-    rec_y: &mut [u16],
-    rec_cb: &mut [u16],
-    rec_cr: &mut [u16],
-    lu_row: usize,
-    lu_col: usize,
-    lu: usize,
+    rec: CuRecPlanes<'_>,
+    pos: CuPos,
     strides: PlaneStrides,
-    qp: u8,
-    lambda: f32,
+    coding: SliceCoding,
     mode_map: &mut [u8],
     mode_stride: usize,
-    lossless: bool,
     scratch: &mut CompressionContext,
 ) {
+    let CuRecPlanes {
+        y: rec_y,
+        cb: rec_cb,
+        cr: rec_cr,
+    } = rec;
+    let CuPos { lu_row, lu_col, lu } = pos;
+    let SliceCoding {
+        qp,
+        lambda,
+        lossless,
+    } = coding;
     let PlaneStrides {
         w,
         src_yw,
@@ -5533,7 +6388,7 @@ mod tests {
 
     #[test]
     fn pps_builds_cleanly() {
-        let pps = build_pps(30, false);
+        let pps = build_pps(30, false, false);
         assert_eq!(pps.data[0], 0x44, "PPS first byte should be 0x44");
     }
 }

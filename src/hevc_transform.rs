@@ -472,22 +472,34 @@ impl RdoqDistortion {
     }
 }
 
+pub(crate) struct RdoqTb<'a> {
+    pub coeff: &'a [i32],
+    pub n: usize,
+    pub qp: u8,
+    pub bit_depth: u8,
+    pub scan: &'a [(usize, usize)],
+    pub scan_idx: u8,
+    pub lambda: f32,
+}
+
 /// Rate-distortion optimized quantization for a committed luma or chroma mode.
-#[allow(clippy::too_many_arguments)]
 fn rdoq_with_sign_hiding_into(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-    scan_idx: u8,
+    tb: &RdoqTb<'_>,
     is_luma: bool,
     cbf_depth: usize,
-    lambda: f32,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
+    let RdoqTb {
+        coeff,
+        n,
+        qp,
+        bit_depth,
+        scan,
+        scan_idx,
+        lambda,
+    } = *tb;
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
@@ -778,106 +790,48 @@ fn rdoq_with_sign_hiding_into(
 }
 
 /// Winner-only RDOQ for a committed luma mode.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_luma_with_sign_hiding_into(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-    scan_idx: u8,
-    lambda: f32,
+    tb: &RdoqTb<'_>,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
-    rdoq_with_sign_hiding_into(
-        coeff, n, qp, bit_depth, scan, scan_idx, true, 0, lambda, ctx, levels, scratch,
-    );
+    rdoq_with_sign_hiding_into(tb, true, 0, ctx, levels, scratch);
 }
 
 /// Winner-only RDOQ for a committed chroma mode. Chroma uses its own
 /// significant-coefficient, coefficient-group, greater1/greater2 and CBF
 /// contexts while sharing the same HM-style significance, level, CG, CBF and
 /// last-position optimization as luma.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_chroma_with_sign_hiding_into(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-    scan_idx: u8,
-    lambda: f32,
+    tb: &RdoqTb<'_>,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
-    rdoq_with_sign_hiding_into(
-        coeff, n, qp, bit_depth, scan, scan_idx, false, 0, lambda, ctx, levels, scratch,
-    );
+    rdoq_with_sign_hiding_into(tb, false, 0, ctx, levels, scratch);
 }
 
 /// Depth-aware luma RDOQ used by child TUs in the transform quadtree.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_luma_at_depth_with_sign_hiding_into(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-    scan_idx: u8,
+    tb: &RdoqTb<'_>,
     trafo_depth: usize,
-    lambda: f32,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
-    rdoq_with_sign_hiding_into(
-        coeff,
-        n,
-        qp,
-        bit_depth,
-        scan,
-        scan_idx,
-        true,
-        trafo_depth,
-        lambda,
-        ctx,
-        levels,
-        scratch,
-    );
+    rdoq_with_sign_hiding_into(tb, true, trafo_depth, ctx, levels, scratch);
 }
 
 /// Depth-aware chroma RDOQ used by child TUs in the transform quadtree.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rdoq_chroma_at_depth_with_sign_hiding_into(
-    coeff: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    scan: &[(usize, usize)],
-    scan_idx: u8,
+    tb: &RdoqTb<'_>,
     trafo_depth: usize,
-    lambda: f32,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
-    rdoq_with_sign_hiding_into(
-        coeff,
-        n,
-        qp,
-        bit_depth,
-        scan,
-        scan_idx,
-        false,
-        trafo_depth,
-        lambda,
-        ctx,
-        levels,
-        scratch,
-    );
+    rdoq_with_sign_hiding_into(tb, false, trafo_depth, ctx, levels, scratch);
 }
 
 /// Forward quantization followed by HEVC sign-data hiding.
@@ -1546,7 +1500,7 @@ mod tests {
     ) -> [i16; MAX_TB] {
         let mut levels = [0i16; MAX_TB];
         let mut scratch = RdoqScratch::new();
-        rdoq_luma_with_sign_hiding_into(
+        let tb = RdoqTb {
             coeff,
             n,
             qp,
@@ -1554,10 +1508,8 @@ mod tests {
             scan,
             scan_idx,
             lambda,
-            ctx,
-            &mut levels,
-            &mut scratch,
-        );
+        };
+        rdoq_luma_with_sign_hiding_into(&tb, ctx, &mut levels, &mut scratch);
         levels
     }
 
@@ -1572,18 +1524,16 @@ mod tests {
         let ctx = ContextSet::init_islice(22);
         let mut levels = [0i16; MAX_TB];
         let mut scratch = RdoqScratch::new();
-        rdoq_chroma_with_sign_hiding_into(
-            &coeff,
-            4,
-            22,
-            8,
+        let tb = RdoqTb {
+            coeff: &coeff,
+            n: 4,
+            qp: 22,
+            bit_depth: 8,
             scan,
-            0,
-            0.57 * 2f32.powf((22.0 - 12.0) / 3.0),
-            &ctx,
-            &mut levels,
-            &mut scratch,
-        );
+            scan_idx: 0,
+            lambda: 0.57 * 2f32.powf((22.0 - 12.0) / 3.0),
+        };
+        rdoq_chroma_with_sign_hiding_into(&tb, &ctx, &mut levels, &mut scratch);
         assert!(levels[..16].iter().any(|&level| level != 0));
         for (&level, &source) in levels[..16].iter().zip(&coeff[..16]) {
             assert!(level == 0 || level.signum() as i32 == source.signum());

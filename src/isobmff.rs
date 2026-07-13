@@ -1633,7 +1633,7 @@ mod tests {
             nalus: vec![
                 build_vps(16, 16, chroma, bd, false),
                 build_sps(16, 16, chroma, bd, false, Some(&crate::color::Cicp::srgb())),
-                build_pps(30, false),
+                build_pps(30, false, false),
             ],
         }
     }
@@ -1659,7 +1659,7 @@ mod tests {
                     true,
                     Some(&crate::color::Cicp::srgb()),
                 ),
-                build_pps(30, true),
+                build_pps(30, true, false),
             ],
         }
     }

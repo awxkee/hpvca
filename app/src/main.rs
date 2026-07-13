@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig};
+use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy};
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
