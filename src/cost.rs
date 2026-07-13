@@ -33,9 +33,6 @@ pub(crate) type SatdFn = unsafe fn(&[u16], &[u16], usize) -> u32;
 
 static SATD: OnceLock<SatdFn> = OnceLock::new();
 
-/// Resolve SATD once, before it is copied into a compression context. Keeping
-/// feature detection out of the mode-search hot path is important because SATD
-/// is called for every prediction candidate.
 #[inline]
 pub(crate) fn resolve_satd() -> SatdFn {
     *SATD.get_or_init(|| {
@@ -69,7 +66,7 @@ pub(crate) fn resolve_satd() -> SatdFn {
     ),
     allow(dead_code)
 )]
-pub(crate) unsafe fn satd_scalar(orig: &[u16], pred: &[u16], n: usize) -> u32 {
+pub(crate) fn satd_scalar(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     match n {
         4 => satd_scalar_n::<4>(orig, pred),
         8 => satd_scalar_n::<8>(orig, pred),

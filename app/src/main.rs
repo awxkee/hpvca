@@ -44,7 +44,7 @@ fn main() {
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv444)
             .with_parallelism(ParallelismStrategy::GridWpp)
-            .with_lossless(false),
+            .with_lossless(true),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

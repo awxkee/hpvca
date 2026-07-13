@@ -402,12 +402,9 @@ pub(crate) fn build_sps(
     // HEVC §7.3.2.2.1 orders the transform-hierarchy depths inter-before-intra.
     // max_transform_hierarchy_depth_inter = 0 (matches x265).
     bw.write_ue(0);
-    // max_transform_hierarchy_depth_intra = 1. A CU may keep one transform
-    // matching its prediction block or split once into four child TUs. For an
-    // 8×8 PART_NxN CU the root split is inferred and yields four 4×4 luma TUs.
-    // Bounding the hierarchy to one optional level captures the important
-    // 32→16, 16→8 and 8→4 choices without an exponential transform search.
-    bw.write_ue(1);
+    // max_transform_hierarchy_depth_intra = 3 permits recursive 32→16→8→4
+    // transform trees. Smaller CUs naturally stop at the 4×4 minimum TB size.
+    bw.write_ue(3);
 
     bw.write_bit(false); // scaling_list_enabled_flag
     bw.write_bit(false); // amp_enabled_flag
@@ -2069,6 +2066,7 @@ struct LumaTbCoding {
     max_val: u16,
     neutral: u16,
     lambda: f32,
+    lossless: bool,
 }
 
 /// The four chroma planes involved in a chroma-TB decision: the two source planes
@@ -2163,10 +2161,10 @@ impl ChromaTb {
     }
 }
 
-/// Packed coefficient storage for one bounded transform-tree split. Four luma
-/// leaves cover exactly the parent CU area; chroma storage is packed in child
-/// Z-order and, for 4:2:2, upper/lower TB order inside each child. Keeping this
-/// in the persistent compression context avoids per-CU allocation and clearing.
+/// Packed coefficient storage for both the normal one-level transform search and
+/// the complete 32→16→8→4 lossless quadtree. Chroma coefficients follow child
+/// Z-order and, for 4:2:2, upper/lower TB order inside each child. Keeping this in
+/// the persistent compression context avoids per-CU allocation.
 struct TuTreeScratch {
     y_zz: [i16; 1024],
     cb_zz: [i16; 1024],
@@ -2176,6 +2174,14 @@ struct TuTreeScratch {
     cr_nz: [bool; 8],
     y_scan_idx: [u8; 4],
     chroma_scan_idx: [u8; 8],
+    split: [bool; 85],
+    node_y_nz: [bool; 85],
+    node_y_scan_idx: [u8; 85],
+    node_cb_nz: [[bool; 2]; 85],
+    node_cr_nz: [[bool; 2]; 85],
+    node_chroma_offset: [[u16; 2]; 85],
+    node_chroma_side: [u8; 85],
+    node_chroma_scan_idx: [u8; 85],
 }
 
 impl TuTreeScratch {
@@ -2189,6 +2195,14 @@ impl TuTreeScratch {
             cr_nz: [false; 8],
             y_scan_idx: [0; 4],
             chroma_scan_idx: [0; 8],
+            split: [false; 85],
+            node_y_nz: [false; 85],
+            node_y_scan_idx: [0; 85],
+            node_cb_nz: [[false; 2]; 85],
+            node_cr_nz: [[false; 2]; 85],
+            node_chroma_offset: [[0; 2]; 85],
+            node_chroma_side: [0; 85],
+            node_chroma_scan_idx: [0; 85],
         }
     }
 }
@@ -2197,6 +2211,7 @@ impl TuTreeScratch {
 enum TuLayout {
     Unsplit,
     Split,
+    Recursive,
 }
 
 /// Per-slice reusable working set for CU prediction, transform and RDO. Keeping
@@ -2764,6 +2779,510 @@ fn split_transform_context(size: usize) -> usize {
     (5usize - size.trailing_zeros() as usize).min(2)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn commit_lossless_luma_leaf(
+    scratch: &mut CompressionContext,
+    rec_y: &mut [u16],
+    stride: usize,
+    coded_yh: usize,
+    root_row: usize,
+    root_col: usize,
+    root_size: usize,
+    rel_row: usize,
+    rel_col: usize,
+    size: usize,
+    mode: u8,
+    neutral: u16,
+    max_val: u16,
+    coeff_offset: usize,
+    node: usize,
+    reconstruct: bool,
+) -> bool {
+    let len = size * size;
+    let row = root_row + rel_row;
+    let col = root_col + rel_col;
+    let ctus_x = stride / 64;
+    let (corner0, above0, left0) = intra::get_reference_samples(
+        rec_y,
+        intra::LumaRefGeometry {
+            stride,
+            block_row: row,
+            block_col: col,
+            height: coded_yh,
+            n: size,
+            ctu: 64,
+            ctus_x,
+            min_pu: size,
+            neutral,
+        },
+    );
+    let (corner, above, left) = if intra::should_filter_refs(mode, size) {
+        let (above, left) = intra::filter_references(corner0, &above0, &left0, size);
+        let corner = ((above0[0] as i32 + 2 * corner0 as i32 + left0[0] as i32 + 2) >> 2) as u16;
+        (corner, above, left)
+    } else {
+        (corner0, above0, left0)
+    };
+    match mode {
+        0 => intra::predict_planar_into(&above, &left, size, &mut scratch.pred),
+        1 => intra::predict_dc_into(&above, &left, size, true, &mut scratch.pred),
+        _ => intra::predict_angular_into(
+            corner,
+            &above,
+            &left,
+            size,
+            mode,
+            true,
+            max_val as i32,
+            &mut scratch.pred,
+            &mut scratch.angular,
+        ),
+    }
+    for (r, residual) in scratch.residual[..len].chunks_exact_mut(size).enumerate() {
+        let source = (rel_row + r) * root_size + rel_col;
+        let prediction = r * size;
+        for (c, dst) in residual.iter_mut().enumerate() {
+            *dst = scratch.orig[source + c] as i32 - scratch.pred[prediction + c] as i32;
+        }
+    }
+    forward_lossless_rdpcm_into(
+        &scratch.residual[..len],
+        size,
+        implicit_rdpcm_mode(mode),
+        &mut scratch.levels,
+    );
+    let log2 = size.trailing_zeros();
+    let scan_idx = dct::scan_idx_for(mode, log2, true, false);
+    let scan = dct::coeff_scan(log2, scan_idx);
+    let packed = &mut scratch.tu_tree.y_zz[coeff_offset..coeff_offset + len];
+    let mut nonzero = false;
+    for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
+        *dst = scratch.levels[r * size + c];
+        nonzero |= *dst != 0;
+    }
+    scratch.tu_tree.node_y_nz[node] = nonzero;
+    scratch.tu_tree.node_y_scan_idx[node] = scan_idx;
+    if reconstruct {
+        for r in 0..size {
+            let source = (rel_row + r) * root_size + rel_col;
+            let destination = (row + r) * stride + col;
+            rec_y[destination..destination + size]
+                .copy_from_slice(&scratch.orig[source..source + size]);
+        }
+    }
+    nonzero
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_lossless_luma_tree(
+    scratch: &mut CompressionContext,
+    rec_y: &mut [u16],
+    stride: usize,
+    coded_yh: usize,
+    root_row: usize,
+    root_col: usize,
+    root_size: usize,
+    rel_row: usize,
+    rel_col: usize,
+    size: usize,
+    mode: u8,
+    neutral: u16,
+    max_val: u16,
+    coeff_offset: usize,
+    node: usize,
+    depth: usize,
+    base_ctx: &ContextSet,
+) -> (f32, ContextSet, bool) {
+    let nonzero = commit_lossless_luma_leaf(
+        scratch,
+        rec_y,
+        stride,
+        coded_yh,
+        root_row,
+        root_col,
+        root_size,
+        rel_row,
+        rel_col,
+        size,
+        mode,
+        neutral,
+        max_val,
+        coeff_offset,
+        node,
+        false,
+    );
+    let mut unsplit_ctx = base_ctx.clone();
+    let mut unsplit_rate = 0.0;
+    if size > 4 {
+        unsplit_rate +=
+            unsplit_ctx.split_transform_flag[split_transform_context(size)].estimate_and_update(0);
+    }
+    unsplit_rate +=
+        unsplit_ctx.cbf_luma[if depth == 0 { 1 } else { 0 }].estimate_and_update(nonzero as u8);
+    if nonzero {
+        unsplit_rate += estimate_residual_bits(
+            &mut unsplit_ctx,
+            &scratch.tu_tree.y_zz[coeff_offset..coeff_offset + size * size],
+            size.trailing_zeros(),
+            true,
+            scratch.tu_tree.node_y_scan_idx[node],
+            false,
+        );
+    }
+    if size == 4 {
+        let _ = commit_lossless_luma_leaf(
+            scratch,
+            rec_y,
+            stride,
+            coded_yh,
+            root_row,
+            root_col,
+            root_size,
+            rel_row,
+            rel_col,
+            size,
+            mode,
+            neutral,
+            max_val,
+            coeff_offset,
+            node,
+            true,
+        );
+        scratch.tu_tree.split[node] = false;
+        return (unsplit_rate, unsplit_ctx, nonzero);
+    }
+
+    let mut split_ctx = base_ctx.clone();
+    let mut split_rate =
+        split_ctx.split_transform_flag[split_transform_context(size)].estimate_and_update(1);
+    let child = size / 2;
+    let child_len = child * child;
+    let mut split_nonzero = false;
+    for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let (rate, next_ctx, nz) = choose_lossless_luma_tree(
+            scratch,
+            rec_y,
+            stride,
+            coded_yh,
+            root_row,
+            root_col,
+            root_size,
+            rel_row + dy * child,
+            rel_col + dx * child,
+            child,
+            mode,
+            neutral,
+            max_val,
+            coeff_offset + quadrant * child_len,
+            node * 4 + 1 + quadrant,
+            depth + 1,
+            &split_ctx,
+        );
+        split_rate += rate;
+        split_ctx = next_ctx;
+        split_nonzero |= nz;
+    }
+    if split_rate < unsplit_rate {
+        scratch.tu_tree.split[node] = true;
+        scratch.tu_tree.node_y_nz[node] = split_nonzero;
+        (split_rate, split_ctx, split_nonzero)
+    } else {
+        let nonzero = commit_lossless_luma_leaf(
+            scratch,
+            rec_y,
+            stride,
+            coded_yh,
+            root_row,
+            root_col,
+            root_size,
+            rel_row,
+            rel_col,
+            size,
+            mode,
+            neutral,
+            max_val,
+            coeff_offset,
+            node,
+            true,
+        );
+        scratch.tu_tree.split[node] = false;
+        (unsplit_rate, unsplit_ctx, nonzero)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_lossless_chroma_leaf(
+    scratch: &mut CompressionContext,
+    src_cb: &[u16],
+    src_cr: &[u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+    luma_row: usize,
+    luma_col: usize,
+    luma_size: usize,
+    chroma: crate::fmt::ChromaFormat,
+    mode: u8,
+    bit_depth: u8,
+    max_val: u16,
+    node: usize,
+    cursor: &mut usize,
+) {
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let side = luma_size / sub_w;
+    let len = side * side;
+    let stacked = chroma.chroma_tbs_per_cu();
+    let ch_row = luma_row / sub_h;
+    let ch_col = luma_col / sub_w;
+    let scan_idx = dct::scan_idx_for(
+        mode,
+        side.trailing_zeros(),
+        false,
+        matches!(chroma, crate::fmt::ChromaFormat::Yuv444),
+    );
+    let scan = dct::coeff_scan(side.trailing_zeros(), scan_idx);
+    scratch.tu_tree.node_chroma_side[node] = side as u8;
+    scratch.tu_tree.node_chroma_scan_idx[node] = scan_idx;
+    for t in 0..stacked {
+        scratch.tu_tree.node_chroma_offset[node][t] = (*cursor + t * len) as u16;
+    }
+
+    for component in 0..2 {
+        for t in 0..stacked {
+            let row = ch_row + t * side;
+            let source = if component == 0 { src_cb } else { src_cr };
+            let orig = if component == 0 {
+                &mut scratch.chroma_orig_cb[..len]
+            } else {
+                &mut scratch.chroma_orig_cr[..len]
+            };
+            extract_block_dyn_into(source, src_cw, src_ch, row, ch_col, side, orig);
+            let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                rec_cb,
+                rec_cr,
+                intra::ChromaRefGeometry {
+                    stride: cw_stride,
+                    block_row: row,
+                    block_col: ch_col,
+                    chroma_h: coded_ch_h,
+                    n: side,
+                    sub_w,
+                    sub_h,
+                    luma_w: yw_stride,
+                    luma_h: coded_yh,
+                    luma_ctus_x: yw_stride / 64,
+                    min_luma_pu: luma_size,
+                    cur_luma_row: luma_row + t * side * sub_h,
+                    cur_luma_col: luma_col,
+                    neutral: 1u16 << (bit_depth - 1),
+                },
+            );
+            let (corner, above, left) = if component == 0 {
+                (bc0, ba, bl)
+            } else {
+                (rc0, ra, rl)
+            };
+            intra::predict_chroma_tb_into(
+                mode,
+                corner,
+                &above,
+                &left,
+                side,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            );
+            let orig = if component == 0 {
+                &scratch.chroma_orig_cb[..len]
+            } else {
+                &scratch.chroma_orig_cr[..len]
+            };
+            intra::compute_residual_i32_into(
+                orig,
+                &scratch.pred[..len],
+                side,
+                &mut scratch.residual,
+            );
+            forward_lossless_rdpcm_into(
+                &scratch.residual[..len],
+                side,
+                implicit_rdpcm_mode(mode),
+                &mut scratch.levels,
+            );
+            let offset = *cursor + t * len;
+            let packed = if component == 0 {
+                &mut scratch.tu_tree.cb_zz[offset..offset + len]
+            } else {
+                &mut scratch.tu_tree.cr_zz[offset..offset + len]
+            };
+            let mut nonzero = false;
+            for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
+                *dst = scratch.levels[r * side + c];
+                nonzero |= *dst != 0;
+            }
+            if component == 0 {
+                scratch.tu_tree.node_cb_nz[node][t] = nonzero;
+            } else {
+                scratch.tu_tree.node_cr_nz[node][t] = nonzero;
+            }
+            let rec = if component == 0 {
+                &mut *rec_cb
+            } else {
+                &mut *rec_cr
+            };
+            for (src_row, dst_row) in orig
+                .chunks_exact(side)
+                .zip(rec[row * cw_stride + ch_col..].chunks_mut(cw_stride))
+            {
+                dst_row[..side].copy_from_slice(src_row);
+            }
+        }
+    }
+    *cursor += stacked * len;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_lossless_chroma_tree(
+    scratch: &mut CompressionContext,
+    src_cb: &[u16],
+    src_cr: &[u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+    luma_row: usize,
+    luma_col: usize,
+    size: usize,
+    chroma: crate::fmt::ChromaFormat,
+    mode: u8,
+    bit_depth: u8,
+    max_val: u16,
+    node: usize,
+    cursor: &mut usize,
+) {
+    if scratch.tu_tree.split[node] {
+        let child = size / 2;
+        for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            commit_lossless_chroma_tree(
+                scratch,
+                src_cb,
+                src_cr,
+                rec_cb,
+                rec_cr,
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                yw_stride,
+                coded_yh,
+                luma_row + dy * child,
+                luma_col + dx * child,
+                child,
+                chroma,
+                mode,
+                bit_depth,
+                max_val,
+                node * 4 + 1 + quadrant,
+                cursor,
+            );
+        }
+        if size == 8 && !matches!(chroma, crate::fmt::ChromaFormat::Yuv444) {
+            commit_lossless_chroma_leaf(
+                scratch, src_cb, src_cr, rec_cb, rec_cr, src_cw, src_ch, cw_stride, coded_ch_h,
+                yw_stride, coded_yh, luma_row, luma_col, size, chroma, mode, bit_depth, max_val,
+                node, cursor,
+            );
+        }
+    } else if size > 4 || matches!(chroma, crate::fmt::ChromaFormat::Yuv444) {
+        commit_lossless_chroma_leaf(
+            scratch, src_cb, src_cr, rec_cb, rec_cr, src_cw, src_ch, cw_stride, coded_ch_h,
+            yw_stride, coded_yh, luma_row, luma_col, size, chroma, mode, bit_depth, max_val, node,
+            cursor,
+        );
+    }
+}
+
+fn aggregate_lossless_chroma(
+    tree: &mut TuTreeScratch,
+    node: usize,
+    size: usize,
+    chroma: crate::fmt::ChromaFormat,
+) -> ([bool; 2], [bool; 2]) {
+    if !tree.split[node] || (size == 8 && !matches!(chroma, crate::fmt::ChromaFormat::Yuv444)) {
+        return (tree.node_cb_nz[node], tree.node_cr_nz[node]);
+    }
+    let mut cb = [false; 2];
+    let mut cr = [false; 2];
+    for quadrant in 0..4 {
+        let (child_cb, child_cr) =
+            aggregate_lossless_chroma(tree, node * 4 + 1 + quadrant, size / 2, chroma);
+        for t in 0..2 {
+            cb[t] |= child_cb[t];
+            cr[t] |= child_cr[t];
+        }
+    }
+    if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) && size > 8 {
+        cb = [cb[0] || cb[1]; 2];
+        cr = [cr[0] || cr[1]; 2];
+    }
+    tree.node_cb_nz[node] = cb;
+    tree.node_cr_nz[node] = cr;
+    (cb, cr)
+}
+
+fn advance_lossless_luma_tree_context(
+    tree: &TuTreeScratch,
+    node: usize,
+    size: usize,
+    depth: usize,
+    coeff_offset: usize,
+    ctx: &mut ContextSet,
+) {
+    if size > 4 && tree.split[node] {
+        let child = size / 2;
+        let child_len = child * child;
+        for quadrant in 0..4 {
+            advance_lossless_luma_tree_context(
+                tree,
+                node * 4 + 1 + quadrant,
+                child,
+                depth + 1,
+                coeff_offset + quadrant * child_len,
+                ctx,
+            );
+        }
+        return;
+    }
+    let nonzero = tree.node_y_nz[node];
+    let _ = ctx.cbf_luma[if depth == 0 { 1 } else { 0 }].estimate_and_update(nonzero as u8);
+    if nonzero {
+        advance_residual_contexts(
+            ctx,
+            &tree.y_zz[coeff_offset..coeff_offset + size * size],
+            size.trailing_zeros(),
+            true,
+            tree.node_y_scan_idx[node],
+            false,
+        );
+    }
+}
+
 fn commit_split_luma(
     scratch: &mut CompressionContext,
     rec_y: &mut [u16],
@@ -2785,6 +3304,7 @@ fn commit_split_luma(
         max_val,
         neutral,
         lambda,
+        lossless,
     } = coding;
     let child = parent / 2;
     let child_len = child * child;
@@ -2858,31 +3378,40 @@ fn commit_split_luma(
             }
         }
 
-        crate::hevc_transform::run_fwd_transform(
-            scratch.fwd_transform,
-            &scratch.residual[..child_len],
-            child,
-            bit_depth,
-            &mut scratch.coeff,
-            &mut scratch.transform_tmp,
-            true,
-        );
-        let tb = crate::hevc_transform::RdoqTb {
-            coeff: &scratch.coeff,
-            n: child,
-            qp,
-            bit_depth,
-            scan,
-            scan_idx,
-            lambda,
-        };
-        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
-            &tb,
-            1,
-            &residual_ctx,
-            &mut scratch.levels,
-            &mut scratch.rdoq,
-        );
+        if lossless {
+            forward_lossless_rdpcm_into(
+                &scratch.residual[..child_len],
+                child,
+                implicit_rdpcm_mode(mode),
+                &mut scratch.levels,
+            );
+        } else {
+            crate::hevc_transform::run_fwd_transform(
+                scratch.fwd_transform,
+                &scratch.residual[..child_len],
+                child,
+                bit_depth,
+                &mut scratch.coeff,
+                &mut scratch.transform_tmp,
+                true,
+            );
+            let tb = crate::hevc_transform::RdoqTb {
+                coeff: &scratch.coeff,
+                n: child,
+                qp,
+                bit_depth,
+                scan,
+                scan_idx,
+                lambda,
+            };
+            crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+                &tb,
+                1,
+                &residual_ctx,
+                &mut scratch.levels,
+                &mut scratch.rdoq,
+            );
+        }
 
         let packed_offset = index * child_len;
         let packed = &mut scratch.tu_tree.y_zz[packed_offset..packed_offset + child_len];
@@ -2897,41 +3426,56 @@ fn commit_split_luma(
         any_nonzero |= nonzero;
         let _ = residual_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
-            advance_residual_contexts(&mut residual_ctx, packed, log2_child, true, scan_idx, true);
+            advance_residual_contexts(
+                &mut residual_ctx,
+                packed,
+                log2_child,
+                true,
+                scan_idx,
+                !lossless,
+            );
         }
-
-        crate::hevc_transform::run_dequantize(
-            scratch.dequantize,
-            &scratch.levels,
-            child,
-            qp,
-            bit_depth,
-            &mut scratch.dequant,
-        );
-        crate::hevc_transform::run_inv_transform(
-            scratch.inv_transform,
-            &scratch.dequant,
-            child,
-            bit_depth,
-            &mut scratch.inverse,
-            &mut scratch.transform_tmp,
-            true,
-        );
 
         // Reconstruct pred + residual directly into the picture so subsequent
         // sibling TBs predict from it.
         let dst_start = row * stride + col;
-        for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
-            .chunks_exact(child)
-            .zip(scratch.pred[..child_len].chunks_exact(child))
-            .enumerate()
-        {
-            let base = dst_start + r * stride;
-            for (dst, (&prediction, &residual)) in rec_y[base..base + child]
-                .iter_mut()
-                .zip(pred_row.iter().zip(inv_row))
+        if lossless {
+            for r in 0..child {
+                let orig_base = (row_offset + r) * parent + col_offset;
+                let dst_base = dst_start + r * stride;
+                rec_y[dst_base..dst_base + child]
+                    .copy_from_slice(&scratch.orig[orig_base..orig_base + child]);
+            }
+        } else {
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
+                &scratch.levels,
+                child,
+                qp,
+                bit_depth,
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
+                &scratch.dequant,
+                child,
+                bit_depth,
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+                true,
+            );
+            for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
+                .chunks_exact(child)
+                .zip(scratch.pred[..child_len].chunks_exact(child))
+                .enumerate()
             {
-                *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+                let base = dst_start + r * stride;
+                for (dst, (&prediction, &residual)) in rec_y[base..base + child]
+                    .iter_mut()
+                    .zip(pred_row.iter().zip(inv_row))
+                {
+                    *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+                }
             }
         }
     }
@@ -2952,6 +3496,7 @@ fn commit_split_chroma(
     coding: ChromaCoding,
     mode: u8,
     ctx_after_luma: &ContextSet,
+    lossless: bool,
 ) {
     let ChromaPlanes {
         src_cb,
@@ -3001,12 +3546,11 @@ fn commit_split_chroma(
     // form independent prediction chains, so each component is processed in full.
     for component in 0..2 {
         let source_plane = if component == 0 { src_cb } else { src_cr };
-        for root_stack in 0..stacked {
-            for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
-                .into_iter()
-                .enumerate()
-            {
-                let c_row = ch_row + root_stack * parent_side + dy * child_side;
+        for child_index in 0..4 {
+            let dy = child_index / 2;
+            let dx = child_index % 2;
+            for stack_index in 0..stacked {
+                let c_row = ch_row + dy * parent_side + stack_index * child_side;
                 let c_col = ch_col + dx * child_side;
 
                 if component == 0 {
@@ -3093,37 +3637,41 @@ fn commit_split_chroma(
                         &mut scratch.residual,
                     );
                 }
-                crate::hevc_transform::run_fwd_transform(
-                    scratch.fwd_transform,
-                    &scratch.residual[..child_len],
-                    child_side,
-                    bit_depth,
-                    &mut scratch.coeff,
-                    &mut scratch.transform_tmp,
-                    false,
-                );
-                let tb = crate::hevc_transform::RdoqTb {
-                    coeff: &scratch.coeff,
-                    n: child_side,
-                    qp: chroma_qp,
-                    bit_depth,
-                    scan,
-                    scan_idx,
-                    lambda,
-                };
-                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
-                    &tb,
-                    1,
-                    &residual_ctx,
-                    &mut scratch.levels,
-                    &mut scratch.rdoq,
-                );
-
-                let (child_index, stack_index) = if stacked == 1 {
-                    (quadrant, 0)
+                if lossless {
+                    forward_lossless_rdpcm_into(
+                        &scratch.residual[..child_len],
+                        child_side,
+                        implicit_rdpcm_mode(mode),
+                        &mut scratch.levels,
+                    );
                 } else {
-                    (root_stack * 2 + dx, dy)
-                };
+                    crate::hevc_transform::run_fwd_transform(
+                        scratch.fwd_transform,
+                        &scratch.residual[..child_len],
+                        child_side,
+                        bit_depth,
+                        &mut scratch.coeff,
+                        &mut scratch.transform_tmp,
+                        false,
+                    );
+                    let tb = crate::hevc_transform::RdoqTb {
+                        coeff: &scratch.coeff,
+                        n: child_side,
+                        qp: chroma_qp,
+                        bit_depth,
+                        scan,
+                        scan_idx,
+                        lambda,
+                    };
+                    crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                        &tb,
+                        1,
+                        &residual_ctx,
+                        &mut scratch.levels,
+                        &mut scratch.rdoq,
+                    );
+                }
+
                 let block_index = child_index * stacked + stack_index;
                 let packed_offset = block_index * child_len;
                 let mut nonzero = false;
@@ -3160,44 +3708,58 @@ fn commit_split_chroma(
                         child_log2,
                         false,
                         scan_idx,
-                        true,
+                        !lossless,
                     );
                 }
 
-                crate::hevc_transform::run_dequantize(
-                    scratch.dequantize,
-                    &scratch.levels,
-                    child_side,
-                    chroma_qp,
-                    bit_depth,
-                    &mut scratch.dequant,
-                );
-                crate::hevc_transform::run_inv_transform(
-                    scratch.inv_transform,
-                    &scratch.dequant,
-                    child_side,
-                    bit_depth,
-                    &mut scratch.inverse,
-                    &mut scratch.transform_tmp,
-                    false,
-                );
                 let dst_start = c_row * cw_stride + c_col;
                 let rec_plane = if component == 0 {
                     &mut rec_cb[..]
                 } else {
                     &mut rec_cr[..]
                 };
-                for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
-                    .chunks_exact(child_side)
-                    .zip(scratch.pred[..child_len].chunks_exact(child_side))
-                    .enumerate()
-                {
-                    let base = dst_start + r * cw_stride;
-                    for (dst, (&prediction, &residual)) in rec_plane[base..base + child_side]
-                        .iter_mut()
-                        .zip(pred_row.iter().zip(inv_row))
+                if lossless {
+                    let orig = if component == 0 {
+                        &scratch.chroma_orig_cb[..child_len]
+                    } else {
+                        &scratch.chroma_orig_cr[..child_len]
+                    };
+                    for (src_row, dst_row) in orig
+                        .chunks_exact(child_side)
+                        .zip(rec_plane[dst_start..].chunks_mut(cw_stride))
                     {
-                        *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+                        dst_row[..child_side].copy_from_slice(src_row);
+                    }
+                } else {
+                    crate::hevc_transform::run_dequantize(
+                        scratch.dequantize,
+                        &scratch.levels,
+                        child_side,
+                        chroma_qp,
+                        bit_depth,
+                        &mut scratch.dequant,
+                    );
+                    crate::hevc_transform::run_inv_transform(
+                        scratch.inv_transform,
+                        &scratch.dequant,
+                        child_side,
+                        bit_depth,
+                        &mut scratch.inverse,
+                        &mut scratch.transform_tmp,
+                        false,
+                    );
+                    for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
+                        .chunks_exact(child_side)
+                        .zip(scratch.pred[..child_len].chunks_exact(child_side))
+                        .enumerate()
+                    {
+                        let base = dst_start + r * cw_stride;
+                        for (dst, (&prediction, &residual)) in rec_plane[base..base + child_side]
+                            .iter_mut()
+                            .zip(pred_row.iter().zip(inv_row))
+                        {
+                            *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+                        }
                     }
                 }
             }
@@ -4455,7 +5017,7 @@ fn encode_split_transform_tree<W: CabacWriter>(
     // 4:2:2 represents each rectangular chroma TU as two vertically stacked
     // square TUs. Consequently it has two root CBFs, one for the upper pair of
     // luma children and one for the lower pair. Other chroma formats have one.
-    let root_count = if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
+    let root_count = if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) && parent_luma == 8 {
         2
     } else {
         1
@@ -4496,6 +5058,13 @@ fn encode_split_transform_tree<W: CabacWriter>(
     }
 
     for child_index in 0..4 {
+        // The SPS permits recursion to depth three. This bounded one-level tree
+        // deliberately terminates each non-minimum child here.
+        if child > 4 {
+            let split_ctx = split_transform_context(child);
+            enc.encode_bin(0, &mut ctx.split_transform_flag[split_ctx]);
+        }
+
         if !chroma.is_monochrome() && !shared_chroma {
             let root_index = if root_count == 2 { child_index / 2 } else { 0 };
             if root_cb_nz[root_index] {
@@ -4531,44 +5100,42 @@ fn encode_split_transform_tree<W: CabacWriter>(
             continue;
         }
         if shared_chroma {
-            let emit = match chroma {
-                crate::fmt::ChromaFormat::Yuv420 => child_index == 3,
-                crate::fmt::ChromaFormat::Yuv422 => child_index == 1 || child_index == 3,
-                crate::fmt::ChromaFormat::Yuv444 | crate::fmt::ChromaFormat::Monochrome => false,
-            };
-            if !emit {
+            // When four 4x4 luma leaves share the parent chroma TU, HEVC emits
+            // chroma once after the last luma leaf.  For 4:2:2 that one chroma
+            // unit contains both stacked TBs, in component-major order.
+            if child_index != 3 {
                 continue;
             }
-            let stack_index = if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
-                child_index / 2
-            } else {
-                0
-            };
-            let tb = &scratch.chroma_tbs[stack_index];
             let side = parent_luma / chroma.sub_w();
             let len = side * side;
             let log2_side = side.trailing_zeros();
-            if tb.cb_nz {
-                encode_residual(
-                    enc,
-                    ctx,
-                    &tb.cb_zz[..len],
-                    log2_side,
-                    false,
-                    scratch.tu_tree.chroma_scan_idx[stack_index],
-                    sign_data_hiding,
-                );
+            for stack_index in 0..stacked {
+                let tb = &scratch.chroma_tbs[stack_index];
+                if tb.cb_nz {
+                    encode_residual(
+                        enc,
+                        ctx,
+                        &tb.cb_zz[..len],
+                        log2_side,
+                        false,
+                        scratch.tu_tree.chroma_scan_idx[stack_index],
+                        sign_data_hiding,
+                    );
+                }
             }
-            if tb.cr_nz {
-                encode_residual(
-                    enc,
-                    ctx,
-                    &tb.cr_zz[..len],
-                    log2_side,
-                    false,
-                    scratch.tu_tree.chroma_scan_idx[stack_index],
-                    sign_data_hiding,
-                );
+            for stack_index in 0..stacked {
+                let tb = &scratch.chroma_tbs[stack_index];
+                if tb.cr_nz {
+                    encode_residual(
+                        enc,
+                        ctx,
+                        &tb.cr_zz[..len],
+                        log2_side,
+                        false,
+                        scratch.tu_tree.chroma_scan_idx[stack_index],
+                        sign_data_hiding,
+                    );
+                }
             }
             continue;
         }
@@ -4607,6 +5174,169 @@ fn encode_split_transform_tree<W: CabacWriter>(
             }
         }
     }
+}
+
+fn encode_lossless_chroma_residuals<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    tree: &TuTreeScratch,
+    node: usize,
+    chroma: crate::fmt::ChromaFormat,
+) {
+    let side = tree.node_chroma_side[node] as usize;
+    if side == 0 {
+        return;
+    }
+    let len = side * side;
+    let log2 = side.trailing_zeros();
+    let stacked = chroma.chroma_tbs_per_cu();
+    for t in 0..stacked {
+        if tree.node_cb_nz[node][t] {
+            let offset = tree.node_chroma_offset[node][t] as usize;
+            encode_residual(
+                enc,
+                ctx,
+                &tree.cb_zz[offset..offset + len],
+                log2,
+                false,
+                tree.node_chroma_scan_idx[node],
+                false,
+            );
+        }
+    }
+    for t in 0..stacked {
+        if tree.node_cr_nz[node][t] {
+            let offset = tree.node_chroma_offset[node][t] as usize;
+            encode_residual(
+                enc,
+                ctx,
+                &tree.cr_zz[offset..offset + len],
+                log2,
+                false,
+                tree.node_chroma_scan_idx[node],
+                false,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_lossless_transform_node<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    tree: &TuTreeScratch,
+    node: usize,
+    parent_node: usize,
+    size: usize,
+    depth: usize,
+    quadrant: usize,
+    coeff_offset: usize,
+    chroma: crate::fmt::ChromaFormat,
+    parent_cb: [bool; 2],
+    parent_cr: [bool; 2],
+) {
+    let split = size > 4 && tree.split[node];
+    if size > 4 {
+        enc.encode_bin(
+            split as u8,
+            &mut ctx.split_transform_flag[split_transform_context(size)],
+        );
+    }
+
+    let mut cb = parent_cb;
+    let mut cr = parent_cr;
+    if !chroma.is_monochrome() && (size > 4 || matches!(chroma, crate::fmt::ChromaFormat::Yuv444)) {
+        cb = tree.node_cb_nz[node];
+        cr = tree.node_cr_nz[node];
+        let stacked = chroma.chroma_tbs_per_cu();
+        let signal_second =
+            matches!(chroma, crate::fmt::ChromaFormat::Yuv422) && (!split || size == 8);
+        for t in 0..stacked {
+            if t == 1 && !signal_second {
+                cb[1] = cb[0];
+                break;
+            }
+            if depth == 0 || parent_cb[t] {
+                encode_cbf_chroma(enc, ctx, cb[t], depth);
+            }
+        }
+        for t in 0..stacked {
+            if t == 1 && !signal_second {
+                cr[1] = cr[0];
+                break;
+            }
+            if depth == 0 || parent_cr[t] {
+                encode_cbf_chroma(enc, ctx, cr[t], depth);
+            }
+        }
+    }
+
+    if split {
+        let child = size / 2;
+        let child_len = child * child;
+        for child_index in 0..4 {
+            encode_lossless_transform_node(
+                enc,
+                ctx,
+                tree,
+                node * 4 + 1 + child_index,
+                node,
+                child,
+                depth + 1,
+                child_index,
+                coeff_offset + child_index * child_len,
+                chroma,
+                cb,
+                cr,
+            );
+        }
+        return;
+    }
+
+    let y_nz = tree.node_y_nz[node];
+    encode_cbf_luma(enc, ctx, y_nz, depth);
+    if y_nz {
+        encode_residual(
+            enc,
+            ctx,
+            &tree.y_zz[coeff_offset..coeff_offset + size * size],
+            size.trailing_zeros(),
+            true,
+            tree.node_y_scan_idx[node],
+            false,
+        );
+    }
+    if chroma.is_monochrome() {
+        return;
+    }
+    if size > 4 || matches!(chroma, crate::fmt::ChromaFormat::Yuv444) {
+        encode_lossless_chroma_residuals(enc, ctx, tree, node, chroma);
+    } else if quadrant == 3 {
+        encode_lossless_chroma_residuals(enc, ctx, tree, parent_node, chroma);
+    }
+}
+
+fn encode_lossless_transform_tree<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    scratch: &CompressionContext,
+    size: usize,
+    chroma: crate::fmt::ChromaFormat,
+) {
+    encode_lossless_transform_node(
+        enc,
+        ctx,
+        &scratch.tu_tree,
+        0,
+        0,
+        size,
+        0,
+        0,
+        0,
+        chroma,
+        [false; 2],
+        [false; 2],
+    );
 }
 
 fn encode_cu<W: CabacWriter>(
@@ -5028,13 +5758,10 @@ fn encode_cu<W: CabacWriter>(
         scratch.best_coeff[..num_luma].copy_from_slice(&saved_coeff);
     }
 
-    // The transform-tree shape (single TU vs. one split into four child TUs) is
-    // chosen by real rate–distortion below, after both candidates have been
-    // reconstructed. 4:2:2 is excluded: its rectangular chroma PB is coded as two
-    // stacked square TBs whose split decode order and per-TB reference
-    // availability differ from the square 4:2:0/4:4:4 layouts in
-    // commit_split_chroma, so it always keeps the single-transform path.
-    let split_allowed = !lossless && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422);
+    // Every supported chroma format uses the same luma quadtree. 4:2:2 maps each
+    // rectangular chroma region to two stacked square TBs; transquant-bypass
+    // children use direct residuals and inferred RDPCM.
+    let split_allowed = lu > 4;
 
     // ── cu_transquant_bypass_flag ────────────────────────────────────────────
     // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
@@ -5151,7 +5878,16 @@ fn encode_cu<W: CabacWriter>(
     // ── Split luma (if allowed): reconstruct into rec_y + tu_tree, cost it ──────
     // commit_split_luma leaves scratch.reconstructed / scratch.scanned untouched,
     // so the unsplit candidate above survives for a possible rollback.
-    let (tu_layout, y_nz) = if split_allowed {
+    let (tu_layout, y_nz) = if lossless {
+        scratch.tu_tree.split.fill(false);
+        scratch.tu_tree.node_y_nz.fill(false);
+        scratch.tu_tree.node_y_scan_idx.fill(0);
+        let (_, _, nonzero) = choose_lossless_luma_tree(
+            scratch, rec_y, yw_stride, coded_yh, lu_row, lu_col, lu, 0, 0, lu, luma_mode, neutral,
+            max_val, 0, 0, 0, ctx,
+        );
+        (TuLayout::Recursive, nonzero)
+    } else if split_allowed {
         let y_nz_split = commit_split_luma(
             scratch,
             rec_y,
@@ -5169,6 +5905,7 @@ fn encode_cu<W: CabacWriter>(
                 max_val,
                 neutral,
                 lambda,
+                lossless,
             },
             ctx,
         );
@@ -5198,7 +5935,7 @@ fn encode_cu<W: CabacWriter>(
                         log2_child,
                         true,
                         scratch.tu_tree.y_scan_idx[i],
-                        true,
+                        !lossless,
                     );
                 }
             }
@@ -5488,9 +6225,19 @@ fn encode_cu<W: CabacWriter>(
                         child_log2,
                         true,
                         scratch.tu_tree.y_scan_idx[index],
-                        true,
+                        !lossless,
                     );
                 }
+            }
+            TuLayout::Recursive => {
+                advance_lossless_luma_tree_context(
+                    &scratch.tu_tree,
+                    0,
+                    lu,
+                    0,
+                    0,
+                    &mut residual_ctx_after_luma,
+                );
             }
         }
 
@@ -5757,7 +6504,36 @@ fn encode_cu<W: CabacWriter>(
         };
 
         chroma_tb_scan_idx = dct::scan_idx_for(best_chroma.pred_mode, log2_ctb, false, is_444);
-        if shared_chroma {
+        if matches!(tu_layout, TuLayout::Recursive) {
+            scratch.tu_tree.node_cb_nz.fill([false; 2]);
+            scratch.tu_tree.node_cr_nz.fill([false; 2]);
+            scratch.tu_tree.node_chroma_side.fill(0);
+            let mut cursor = 0;
+            commit_lossless_chroma_tree(
+                scratch,
+                src_cb,
+                src_cr,
+                rec_cb,
+                rec_cr,
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                yw_stride,
+                coded_yh,
+                lu_row,
+                lu_col,
+                lu,
+                chroma,
+                best_chroma.pred_mode,
+                bit_depth.bits(),
+                max_val,
+                0,
+                &mut cursor,
+            );
+            debug_assert!(cursor <= 1024);
+            let _ = aggregate_lossless_chroma(&mut scratch.tu_tree, 0, lu, chroma);
+        } else if shared_chroma {
             for index in 0..n_chroma_tb {
                 scratch.tu_tree.chroma_scan_idx[index] = chroma_tb_scan_idx;
             }
@@ -5790,6 +6566,7 @@ fn encode_cu<W: CabacWriter>(
                 },
                 best_chroma.pred_mode,
                 &residual_ctx_after_luma,
+                lossless,
             );
         }
         encode_chroma_mode(enc, ictx, best_chroma.syntax_idx);
@@ -5798,9 +6575,8 @@ fn encode_cu<W: CabacWriter>(
     // ── CABAC: transform_tree() + transform_unit() ────────────────────────
     match tu_layout {
         TuLayout::Unsplit => {
-            // max_transform_hierarchy_depth_intra=1 makes the root flag present
-            // for every 8/16/32 PART_2Nx2N CU. The unsplit path codes zero and
-            // then retains the original component-major root-TU syntax.
+            // The root split flag is present for every 8/16/32 PART_2Nx2N CU.
+            // The unsplit path codes zero and retains the component-major root-TU syntax.
             let split_ctx = split_transform_context(lu);
             enc.encode_bin(0, &mut ctx.split_transform_flag[split_ctx]);
             for t in &scratch.chroma_tbs[..n_chroma_tb] {
@@ -5849,9 +6625,17 @@ fn encode_cu<W: CabacWriter>(
                 }
             }
         }
-        TuLayout::Split => {
-            encode_split_transform_tree(enc, ctx, scratch, lu, chroma, false, shared_chroma, true)
-        }
+        TuLayout::Split => encode_split_transform_tree(
+            enc,
+            ctx,
+            scratch,
+            lu,
+            chroma,
+            false,
+            shared_chroma,
+            !lossless,
+        ),
+        TuLayout::Recursive => encode_lossless_transform_tree(enc, ctx, scratch, lu, chroma),
     }
 }
 
