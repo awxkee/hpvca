@@ -40,6 +40,15 @@ static T4: [[i32; 4]; 4] = [
     [36, -83, 83, -36],
 ];
 
+/// HEVC 4×4 intra-luma integer DST matrix (spec Table 8-7). The transform is
+/// normative for 4×4 luma TUs in intra CUs; chroma and larger luma TUs keep DCT.
+static DST4: [[i32; 4]; 4] = [
+    [29, 55, 74, 84],
+    [74, 74, 0, -74],
+    [84, -29, -74, 55],
+    [55, -84, 74, -29],
+];
+
 /// 8×8 HEVC transform matrix.
 static T8: [[i32; 8]; 8] = [
     [64, 64, 64, 64, 64, 64, 64, 64],
@@ -155,6 +164,23 @@ pub(crate) fn fwd_transform_into(
         16 => fwd_transform_n::<16>(res, &T16, bit_depth, out, tmp),
         32 => fwd_transform_32(res, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
+    }
+}
+
+/// Forward transform for intra luma. HEVC substitutes the integer DST for the
+/// 4×4 case and uses the regular integer DCT for every larger transform size.
+#[inline]
+pub(crate) fn fwd_transform_intra_luma_into(
+    res: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+) {
+    if n == 4 {
+        fwd_transform_n::<4>(res, &DST4, bit_depth, out, tmp);
+    } else {
+        fwd_transform_into(res, n, bit_depth, out, tmp);
     }
 }
 
@@ -456,6 +482,7 @@ fn rdoq_with_sign_hiding_into(
     scan: &[(usize, usize)],
     scan_idx: u8,
     is_luma: bool,
+    cbf_depth: usize,
     lambda: f32,
     ctx: &ContextSet,
     levels: &mut [i16; MAX_TB],
@@ -690,9 +717,9 @@ fn rdoq_with_sign_hiding_into(
     // position down through trailing unit levels. HM stops once it reaches a
     // level greater than one because discarding it is rarely profitable.
     let cbf = if is_luma {
-        ctx.cbf_luma[1]
+        ctx.cbf_luma[if cbf_depth == 0 { 1 } else { 0 }]
     } else {
-        ctx.cbf_chroma[0]
+        ctx.cbf_chroma[cbf_depth.min(4)]
     };
     let mut best_cost = block_uncoded_cost + lambda * cbf.estimated_bits(0);
     base_cost += lambda * cbf.estimated_bits(1);
@@ -765,7 +792,7 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
     scratch: &mut RdoqScratch,
 ) {
     rdoq_with_sign_hiding_into(
-        coeff, n, qp, bit_depth, scan, scan_idx, true, lambda, ctx, levels, scratch,
+        coeff, n, qp, bit_depth, scan, scan_idx, true, 0, lambda, ctx, levels, scratch,
     );
 }
 
@@ -787,7 +814,69 @@ pub(crate) fn rdoq_chroma_with_sign_hiding_into(
     scratch: &mut RdoqScratch,
 ) {
     rdoq_with_sign_hiding_into(
-        coeff, n, qp, bit_depth, scan, scan_idx, false, lambda, ctx, levels, scratch,
+        coeff, n, qp, bit_depth, scan, scan_idx, false, 0, lambda, ctx, levels, scratch,
+    );
+}
+
+/// Depth-aware luma RDOQ used by child TUs in the transform quadtree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rdoq_luma_at_depth_with_sign_hiding_into(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+    scan_idx: u8,
+    trafo_depth: usize,
+    lambda: f32,
+    ctx: &ContextSet,
+    levels: &mut [i16; MAX_TB],
+    scratch: &mut RdoqScratch,
+) {
+    rdoq_with_sign_hiding_into(
+        coeff,
+        n,
+        qp,
+        bit_depth,
+        scan,
+        scan_idx,
+        true,
+        trafo_depth,
+        lambda,
+        ctx,
+        levels,
+        scratch,
+    );
+}
+
+/// Depth-aware chroma RDOQ used by child TUs in the transform quadtree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rdoq_chroma_at_depth_with_sign_hiding_into(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+    scan_idx: u8,
+    trafo_depth: usize,
+    lambda: f32,
+    ctx: &ContextSet,
+    levels: &mut [i16; MAX_TB],
+    scratch: &mut RdoqScratch,
+) {
+    rdoq_with_sign_hiding_into(
+        coeff,
+        n,
+        qp,
+        bit_depth,
+        scan,
+        scan_idx,
+        false,
+        trafo_depth,
+        lambda,
+        ctx,
+        levels,
+        scratch,
     );
 }
 
@@ -1027,6 +1116,22 @@ pub(crate) fn inv_transform_into(
         16 => inv_transform_n::<16>(coeff, &T16, bit_depth, out, tmp),
         32 => inv_transform_32(coeff, bit_depth, out, tmp),
         _ => panic!("unsupported transform size {n}"),
+    }
+}
+
+/// Inverse transform paired with [`fwd_transform_intra_luma_into`].
+#[inline]
+pub(crate) fn inv_transform_intra_luma_into(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    out: &mut [i32; MAX_TB],
+    tmp: &mut [i32; MAX_TB],
+) {
+    if n == 4 {
+        inv_transform_n::<4>(coeff, &DST4, bit_depth, out, tmp);
+    } else {
+        inv_transform_into(coeff, n, bit_depth, out, tmp);
     }
 }
 
@@ -1594,5 +1699,27 @@ mod tests {
                 "group {group}"
             );
         }
+    }
+
+    #[test]
+    fn intra_luma_4x4_uses_dst_not_dct() {
+        let residual = [
+            31, 12, -7, -19, 24, 8, -11, -27, 15, 2, -13, -22, 5, -3, -9, -16,
+        ];
+        let mut dct = [0i32; MAX_TB];
+        let mut dst = [0i32; MAX_TB];
+        let mut tmp = [0i32; MAX_TB];
+        fwd_transform_into(&residual, 4, 8, &mut dct, &mut tmp);
+        fwd_transform_intra_luma_into(&residual, 4, 8, &mut dst, &mut tmp);
+        assert_ne!(&dct[..16], &dst[..16]);
+
+        let mut reconstructed = [0i32; MAX_TB];
+        inv_transform_intra_luma_into(&dst, 4, 8, &mut reconstructed, &mut tmp);
+        assert!(
+            reconstructed[..16]
+                .iter()
+                .zip(residual)
+                .all(|(&a, b)| (a - b).abs() <= 1)
+        );
     }
 }

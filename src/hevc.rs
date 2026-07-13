@@ -29,8 +29,9 @@
 
 use crate::{
     cabac::{
-        CabacEncoder, CabacWriter, ContextSet, IntraModeContexts, advance_residual_contexts,
-        encode_cbf_chroma, encode_cbf_luma, encode_residual, estimate_residual_bits,
+        CabacEncoder, CabacEstimator, CabacWriter, ContextSet, IntraModeContexts,
+        advance_residual_contexts, encode_cbf_chroma, encode_cbf_luma, encode_residual,
+        estimate_residual_bits,
     },
     dct,
     error::EncodeError,
@@ -398,12 +399,15 @@ pub(crate) fn build_sps(
     bw.write_ue(0);
     // log2_diff_max_min_luma_transform_block_size = 3 → max TB = 32×32 (matches x265).
     bw.write_ue(3);
-    // max_transform_hierarchy_depth_intra = 0 (matches x265). With depth 0, an 8×8
-    // intra CU's transform tree is a single 8×8 TU and split_transform_flag is
-    // inferred (not coded).
-    bw.write_ue(0);
+    // HEVC §7.3.2.2.1 orders the transform-hierarchy depths inter-before-intra.
     // max_transform_hierarchy_depth_inter = 0 (matches x265).
     bw.write_ue(0);
+    // max_transform_hierarchy_depth_intra = 1. A CU may keep one transform
+    // matching its prediction block or split once into four child TUs. For an
+    // 8×8 PART_NxN CU the root split is inferred and yields four 4×4 luma TUs.
+    // Bounding the hierarchy to one optional level captures the important
+    // 32→16, 16→8 and 8→4 choices without an exponential transform search.
+    bw.write_ue(1);
 
     bw.write_bit(false); // scaling_list_enabled_flag
     bw.write_bit(false); // amp_enabled_flag
@@ -642,9 +646,12 @@ fn build_idr_slice(
     // Per-8×8-block quadtree depth (1/2/3 for 32/16/8 leaves); drives the
     // split_cu_flag context from the depths of the left and above neighbors.
     let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
-    // Per-8×8-block luma intra mode (for neighbor MPM derivation).
-    let blk_stride = w / 8;
-    let mut mode_map = vec![0u8; (w / 8) * (h / 8)];
+    // CU depths live on the SPS minimum-CU 8×8 grid, while intra prediction
+    // modes live on the minimum-PU 4×4 grid so an 8×8 PART_NxN CU can expose
+    // four independently coded luma modes to later neighbors.
+    let cu_stride = w / 8;
+    let mode_stride = w / 4;
+    let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
     // One reusable work area per independently encoded slice/tile. Boxing the
     // aggregate keeps the large 32×32 buffers out of the call stack.
     let mut scratch = Box::new(CompressionContext::new());
@@ -662,9 +669,9 @@ fn build_idr_slice(
     };
 
     // CTB grid: full 64×64 CTBs over the padded coded picture. The 64×64
-    // root is necessarily split because this encoder currently maps one TU to
-    // each leaf CU and HEVC limits a TU to 32×32. The representable 32→16→8
-    // subtree is selected by a QP-aware source proxy and then encoded once.
+    // root remains forced split because this encoder has no 64×64 prediction
+    // leaf. Each representable 32/16/8 leaf may independently keep its root TU
+    // or split once into four child TUs, selected before the committed encode.
     let ctb_size_y = 64usize;
     let ctus_x = w / ctb_size_y;
     let ctus_y = h / ctb_size_y;
@@ -714,20 +721,19 @@ fn build_idr_slice(
                 lambda,
                 mode_map: &mut mode_map,
                 cu_depth: &mut cu_depth,
-                blk_stride,
+                cu_stride,
+                mode_stride,
                 lossless,
                 scratch: &mut scratch,
             };
             for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                 let row = lu_row0 + dy * 32;
                 let col = lu_col0 + dx * 32;
-                // Structural selection is intentionally source-only. The former
-                // reconstructed branch search encoded both alternatives with scalar
-                // quantization and then encoded the selected tree again, making the
-                // "fast" quadtree cost more than a second complete encode. This
-                // QP-aware proxy scans the source only and the chosen tree is coded
-                // exactly once with the normal mode RDO and winner-only RDOQ.
-                let plan = fast_cu32_plan(&tree, row, col);
+                // Full rate–distortion CU-quadtree search: cost every 32/16/8
+                // candidate by actually encoding it (mode search + transform +
+                // reconstruction into rec, bits via the fractional estimator) and
+                // keep the cheapest tree, then commit it once for real.
+                let plan = rdo_cu32_plan(&mut tree, row, col, &ctx, &ictx);
                 commit_cu32_plan(&mut cab, &mut ctx, &mut ictx, &mut tree, row, col, 1, plan);
             }
 
@@ -1009,6 +1015,48 @@ fn encode_luma_mode<W: CabacWriter>(
     }
 }
 
+/// Code only `prev_intra_luma_pred_flag` (the context-coded bin) for one PU.
+/// HEVC PART_NxN codes all four flags before any `mpm_idx`/`rem_intra` bins, so
+/// the flag and remainder are split from `encode_luma_mode`.
+fn encode_luma_mode_flag<W: CabacWriter>(
+    enc: &mut W,
+    ictx: &mut IntraModeContexts,
+    mode: u8,
+    mpm: &[u8; 3],
+) {
+    let in_mpm = mpm.contains(&mode);
+    enc.encode_bin(in_mpm as u8, &mut ictx.prev_intra_luma_pred_flag);
+}
+
+/// Code the `mpm_idx` or `rem_intra_luma_pred_mode` bypass bins for one PU, the
+/// `prev_intra_luma_pred_flag` having already been coded by
+/// [`encode_luma_mode_flag`].
+fn encode_luma_mode_rem<W: CabacWriter>(enc: &mut W, mode: u8, mpm: &[u8; 3]) {
+    if let Some(idx) = mpm.iter().position(|&candidate| candidate == mode) {
+        match idx {
+            0 => enc.encode_bypass(0),
+            1 => {
+                enc.encode_bypass(1);
+                enc.encode_bypass(0);
+            }
+            _ => {
+                enc.encode_bypass(1);
+                enc.encode_bypass(1);
+            }
+        }
+    } else {
+        let mut rem = mode as i32;
+        for &candidate in mpm {
+            if candidate < mode {
+                rem -= 1;
+            }
+        }
+        for bit in (0..5).rev() {
+            enc.encode_bypass(((rem >> bit) & 1) as u8);
+        }
+    }
+}
+
 #[inline]
 fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
     orig[..n * n]
@@ -1019,6 +1067,22 @@ fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
             d * d
         })
         .sum::<i64>() as f32
+}
+
+/// SSE between a contiguous `n×n` original block and an `n×n` region of a strided
+/// reconstruction plane at (row, col).
+#[inline]
+fn sse_plane(orig: &[u16], plane: &[u16], row: usize, col: usize, stride: usize, n: usize) -> f32 {
+    let mut acc = 0i64;
+    for r in 0..n {
+        let orig_row = &orig[r * n..r * n + n];
+        let base = (row + r) * stride + col;
+        for (&a, &b) in orig_row.iter().zip(&plane[base..base + n]) {
+            let d = a as i64 - b as i64;
+            acc += d * d;
+        }
+    }
+    acc as f32
 }
 
 /// HEVC RExt implicit residual-DPCM direction for an intra prediction mode.
@@ -1398,8 +1462,8 @@ struct CuGeometry {
     cw_stride: usize,
     src_cw: usize,
     src_ch: usize,
-    /// Stride (in 8×8 blocks) of the per-CU luma `mode_map` used for MPM.
-    blk_stride: usize,
+    /// Stride of the 4×4 luma prediction-mode map used for MPM derivation.
+    mode_stride: usize,
 }
 
 /// The three entropy-coding state objects, threaded together so the per-CU
@@ -1429,8 +1493,8 @@ struct CuParams {
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    /// Luma CU/TU size: 8, 16, or 32. Drives part_mode presence, the
-    /// luma scan/transform size, and the chroma TB size.
+    /// Luma CU/prediction side: 8, 16, or 32. The root TU may either match
+    /// this size or split once into four child TUs.
     lu: usize,
     /// Frame-constant intra RD multiplier, precomputed once from the slice QP.
     lambda: f32,
@@ -1457,6 +1521,42 @@ impl ChromaTb {
     }
 }
 
+/// Packed coefficient storage for one bounded transform-tree split. Four luma
+/// leaves cover exactly the parent CU area; chroma storage is packed in child
+/// Z-order and, for 4:2:2, upper/lower TB order inside each child. Keeping this
+/// in the persistent compression context avoids per-CU allocation and clearing.
+struct TuTreeScratch {
+    y_zz: [i16; 1024],
+    cb_zz: [i16; 1024],
+    cr_zz: [i16; 1024],
+    y_nz: [bool; 4],
+    cb_nz: [bool; 8],
+    cr_nz: [bool; 8],
+    y_scan_idx: [u8; 4],
+    chroma_scan_idx: [u8; 8],
+}
+
+impl TuTreeScratch {
+    const fn new() -> Self {
+        Self {
+            y_zz: [0; 1024],
+            cb_zz: [0; 1024],
+            cr_zz: [0; 1024],
+            y_nz: [false; 4],
+            cb_nz: [false; 8],
+            cr_nz: [false; 8],
+            y_scan_idx: [0; 4],
+            chroma_scan_idx: [0; 8],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuLayout {
+    Unsplit,
+    Split,
+}
+
 /// Per-slice reusable working set for CU prediction, transform and RDO. Keeping
 /// the largest 32×32 buffers in one heap allocation removes repeated stack
 /// zeroing and return-value memmoves from every mode/CU while remaining safe and
@@ -1480,6 +1580,7 @@ struct CompressionContext {
     scanned: [i16; 1024],
     angular: intra::AngularScratch,
     chroma_tbs: [ChromaTb; 2],
+    tu_tree: TuTreeScratch,
     rdoq: crate::hevc_transform::RdoqScratch,
 }
 
@@ -1503,6 +1604,7 @@ impl CompressionContext {
             scanned: [0; 1024],
             angular: intra::AngularScratch::new(),
             chroma_tbs: [ChromaTb::new(), ChromaTb::new()],
+            tu_tree: TuTreeScratch::new(),
             rdoq: crate::hevc_transform::RdoqScratch::new(),
         }
     }
@@ -1536,7 +1638,8 @@ struct CuTreeState<'a> {
     lambda: f32,
     mode_map: &'a mut [u8],
     cu_depth: &'a mut [u8],
-    blk_stride: usize,
+    cu_stride: usize,
+    mode_stride: usize,
     lossless: bool,
     scratch: &'a mut CompressionContext,
 }
@@ -1589,24 +1692,21 @@ fn encode_cu_leaf(
         state.qp,
         state.lambda,
         &mut *state.mode_map,
-        state.blk_stride,
+        state.mode_stride,
         state.lossless,
         &mut *state.scratch,
     );
-    fill_cu_depth(
-        &mut *state.cu_depth,
-        row,
-        col,
-        size,
-        depth,
-        state.blk_stride,
-    );
+    fill_cu_depth(&mut *state.cu_depth, row, col, size, depth, state.cu_stride);
 }
 
 /// Source-only split proxy. `score >= 1` means the expected prediction
 /// improvement is large enough to pay for the extra CU syntax at the current QP.
 /// It is deliberately not a second encoder: no prediction buffers, transforms,
 /// quantization, reconstruction, CABAC contexts, or rollback are touched here.
+///
+/// Currently superseded by the full `rdo_cu32_plan` search; retained as the cheap
+/// pruner a production SATD-gated hybrid would run before paying for full RDO.
+#[allow(dead_code)]
 #[inline]
 fn fast_cu_split_score(state: &CuTreeState<'_>, row: usize, col: usize, size: usize) -> f32 {
     let shift = state.yuv.bit_depth.bits().saturating_sub(8) as u32;
@@ -1732,6 +1832,7 @@ fn fast_cu_split_score(state: &CuTreeState<'_>, row: usize, col: usize, size: us
 /// Build the complete representable 32→16→8 CU plan without coding either
 /// branch. Five source scans (one 32×32 and four 16×16) replace up to 21
 /// transform/quantize/reconstruct leaf trials from the previous implementation.
+#[allow(dead_code)]
 fn fast_cu32_plan(state: &CuTreeState<'_>, row: usize, col: usize) -> Cu32Plan {
     let parent_score = fast_cu_split_score(state, row, col, 32);
     // Flat/coherent 32×32 nodes dominate natural images. Avoid even the four
@@ -1763,6 +1864,166 @@ fn fast_cu32_plan(state: &CuTreeState<'_>, row: usize, col: usize) -> Cu32Plan {
     }
 }
 
+/// SSE (luma + chroma) between the reconstruction and the source over the
+/// `size×size` luma region at (row, col). Source reads are clamped to the true
+/// picture extent so partial edge CUs compare against replicated borders.
+fn cu_region_sse(tree: &CuTreeState<'_>, row: usize, col: usize, size: usize) -> f32 {
+    let s = tree.strides;
+    let mut sse = 0.0f64;
+    for r in 0..size {
+        let sy = (row + r).min(s.src_yh - 1);
+        for c in 0..size {
+            let sx = (col + c).min(s.src_yw - 1);
+            let src = tree.yuv.y[sy * s.src_yw + sx] as f64;
+            let rec = tree.rec_y[(row + r) * s.w + (col + c)] as f64;
+            let d = src - rec;
+            sse += d * d;
+        }
+    }
+    if !tree.rec_cb.is_empty() {
+        let cw_s = size / s.sub_w;
+        let ch_s = size / s.sub_h;
+        let cr0 = row / s.sub_h;
+        let cc0 = col / s.sub_w;
+        let planes: [(&[u16], &[u16]); 2] = [
+            (&tree.rec_cb[..], tree.yuv.cb.as_slice()),
+            (&tree.rec_cr[..], tree.yuv.cr.as_slice()),
+        ];
+        for (rec_plane, src_plane) in planes {
+            for r in 0..ch_s {
+                let sy = (cr0 + r).min(s.src_ch - 1);
+                for c in 0..cw_s {
+                    let sx = (cc0 + c).min(s.src_cw - 1);
+                    let src = src_plane[sy * s.src_cw + sx] as f64;
+                    let rec = rec_plane[(cr0 + r) * s.cw + (cc0 + c)] as f64;
+                    let d = src - rec;
+                    sse += d * d;
+                }
+            }
+        }
+    }
+    sse as f32
+}
+
+/// Trial-encode one CU into a fractional-bit estimator (real reconstruction into
+/// rec, but no bitstream/context commit) and return its RD cost J = SSE + λ·bits.
+/// Contexts are cloned so the caller's real state is untouched; the reconstruction
+/// left in rec is overwritten later when the chosen plan is committed for real.
+fn cost_leaf(
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    size: usize,
+    base_ctx: &ContextSet,
+    base_ictx: &IntraModeContexts,
+) -> f32 {
+    let mut est = CabacEstimator::default();
+    let mut ctx = base_ctx.clone();
+    let mut ictx = base_ictx.clone();
+    code_one_cu(
+        Entropy {
+            enc: &mut est,
+            ctx: &mut ctx,
+            ictx: &mut ictx,
+        },
+        tree.yuv,
+        &mut *tree.rec_y,
+        &mut *tree.rec_cb,
+        &mut *tree.rec_cr,
+        row,
+        col,
+        size,
+        tree.strides,
+        tree.qp,
+        tree.lambda,
+        &mut *tree.mode_map,
+        tree.mode_stride,
+        tree.lossless,
+        &mut *tree.scratch,
+    );
+    cu_region_sse(tree, row, col, size) + tree.lambda * est.bits()
+}
+
+/// Source-proxy confidence band for the hybrid CU-quadtree search. Full RDO is
+/// paid only where the cheap `fast_cu_split_score` is *ambiguous* about the 32×32
+/// node (score near the proxy's own split point of 1.0). Below the band the node
+/// is confidently a single 32 (no trials); above it the proxy's structural plan is
+/// trusted. This confines the expensive real trials to the small uncertain
+/// minority, keeping runtime close to the pure proxy while recovering most of the
+/// achievable RD gain.
+///
+/// (A cheaper SATD-domain estimator was tried in place of the real trials but did
+/// not help: with an uncoded region of `rec_y` holding the source, every block
+/// size predicts from near-perfect source neighbours, so SATD cannot see the
+/// split benefit — that signal only appears once real reconstruction + RDOQ +
+/// CABAC rate are measured, i.e. `cost_leaf`.)
+const CU_RDO_BAND_LOW: f32 = 0.25;
+const CU_RDO_BAND_HIGH: f32 = 3.0;
+/// Within an RDO'd 32, a 16 quadrant only trials its four-8 split when the proxy
+/// itself sees sub-block texture there.
+const CU_RDO_SPLIT8_GATE: f32 = 0.30;
+
+/// Hybrid rate–distortion CU-quadtree decision for one 32×32 region.
+/// - proxy score < LOW  → confidently flat: commit a single 32, no trials.
+/// - proxy score ≥ HIGH → confidently textured: trust the proxy's structural plan.
+/// - otherwise (ambiguous) → measure real J of {32} vs {four 16s, each the cheaper
+///   of 16 / four-8} by actually encoding each surviving candidate, and keep it.
+///
+/// The winning [`Cu32Plan`] is committed once by [`commit_cu32_plan`].
+fn rdo_cu32_plan(
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    ctx: &ContextSet,
+    ictx: &IntraModeContexts,
+) -> Cu32Plan {
+    let score = fast_cu_split_score(tree, row, col, 32);
+    if score < CU_RDO_BAND_LOW {
+        return Cu32Plan::default();
+    }
+    if score >= CU_RDO_BAND_HIGH {
+        return fast_cu32_plan(tree, row, col);
+    }
+
+    // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
+    let flag = tree.lambda;
+
+    let cost_32 = cost_leaf(tree, row, col, 32, ctx, ictx);
+
+    let mut cost_split = 0.0f32;
+    let mut split_16 = [false; 4];
+    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let r = row + dy * 16;
+        let c = col + dx * 16;
+        let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
+        // Only trial the four-8 split where the proxy sees real sub-block texture.
+        let cost_8 = if fast_cu_split_score(tree, r, c, 16) < CU_RDO_SPLIT8_GATE {
+            f32::INFINITY
+        } else {
+            let mut sum = flag;
+            for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                sum += cost_leaf(tree, r + ey * 8, c + ex * 8, 8, ctx, ictx);
+            }
+            sum
+        };
+        // Both sub-options pay this 16-level split_cu_flag (0 or 1).
+        split_16[index] = cost_8 < cost_16;
+        cost_split += flag + cost_16.min(cost_8);
+    }
+
+    if cost_32 <= cost_split {
+        Cu32Plan::default()
+    } else {
+        Cu32Plan {
+            split_32: true,
+            split_16,
+        }
+    }
+}
+
 /// Compact plan for one representable 32×32 subtree. `split_32 == false`
 /// ignores `split_16`; otherwise each bit selects four 8×8 children for the
 /// corresponding 16×16 quadrant in Z order.
@@ -1785,7 +2046,7 @@ fn commit_cu32_plan(
     depth: u8,
     plan: Cu32Plan,
 ) {
-    let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.blk_stride);
+    let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.cu_stride);
     if !plan.split_32 {
         cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
         encode_cu_leaf(cab, ctx, ictx, state, row, col, 32, depth);
@@ -1805,7 +2066,7 @@ fn commit_cu32_plan(
             child_row,
             child_col,
             child_depth,
-            state.blk_stride,
+            state.cu_stride,
         );
         if plan.split_16[index] {
             cab.encode_bin(1, &mut ctx.split_cu_flag[child_ctx]);
@@ -1824,6 +2085,1744 @@ fn commit_cu32_plan(
         } else {
             cab.encode_bin(0, &mut ctx.split_cu_flag[child_ctx]);
             encode_cu_leaf(cab, ctx, ictx, state, child_row, child_col, 16, child_depth);
+        }
+    }
+}
+
+#[inline]
+fn split_transform_context(size: usize) -> usize {
+    debug_assert!(matches!(size, 8 | 16 | 32));
+    (5usize - size.trailing_zeros() as usize).min(2)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_split_luma(
+    scratch: &mut CompressionContext,
+    rec_y: &mut [u16],
+    stride: usize,
+    coded_yh: usize,
+    block_row: usize,
+    block_col: usize,
+    parent: usize,
+    mode: u8,
+    qp: u8,
+    bit_depth: u8,
+    max_val: u16,
+    neutral: u16,
+    lambda: f32,
+    ctx: &ContextSet,
+) -> bool {
+    let child = parent / 2;
+    let child_len = child * child;
+    let log2_child = child.trailing_zeros();
+    let scan_idx = dct::scan_idx_for(mode, log2_child, true, false);
+    let scan = dct::coeff_scan(log2_child, scan_idx);
+    let ctus_x = stride / 64;
+    let mut residual_ctx = ctx.clone();
+    let mut any_nonzero = false;
+
+    // HEVC performs intra prediction per transform block, not once per CU: each
+    // child TB is predicted from the reconstructed samples of the TBs decoded
+    // before it (in Z-order, including its siblings inside this CU). Reconstruct
+    // straight into rec_y so the next child sees the updated neighbours, exactly
+    // as the decoder does.
+    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let row_offset = dy * child;
+        let col_offset = dx * child;
+        let row = block_row + row_offset;
+        let col = block_col + col_offset;
+
+        let (corner0, above0, left0) = intra::get_reference_samples(
+            rec_y,
+            intra::LumaRefGeometry {
+                stride,
+                block_row: row,
+                block_col: col,
+                height: coded_yh,
+                n: child,
+                ctu: 64,
+                ctus_x,
+                min_pu: child,
+                neutral,
+            },
+        );
+        let (corner, above, left) = if intra::should_filter_refs(mode, child) {
+            let (fa, fl) = intra::filter_references(corner0, &above0, &left0, child);
+            let cf = ((above0[0] as i32 + 2 * corner0 as i32 + left0[0] as i32 + 2) >> 2) as u16;
+            (cf, fa, fl)
+        } else {
+            (corner0, above0, left0)
+        };
+        match mode {
+            0 => intra::predict_planar_into(&above, &left, child, &mut scratch.pred),
+            1 => intra::predict_dc_into(&above, &left, child, true, &mut scratch.pred),
+            _ => intra::predict_angular_into(
+                corner,
+                &above,
+                &left,
+                child,
+                mode,
+                true,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            ),
+        }
+
+        // Residual = child original (a quadrant of the parent orig block) − pred.
+        for (r, res_row) in scratch.residual[..child_len]
+            .chunks_exact_mut(child)
+            .enumerate()
+        {
+            let orig_base = (row_offset + r) * parent + col_offset;
+            let pred_base = r * child;
+            for (c, dst) in res_row.iter_mut().enumerate() {
+                *dst = scratch.orig[orig_base + c] as i32 - scratch.pred[pred_base + c] as i32;
+            }
+        }
+
+        crate::hevc_transform::fwd_transform_intra_luma_into(
+            &scratch.residual[..child_len],
+            child,
+            bit_depth,
+            &mut scratch.coeff,
+            &mut scratch.transform_tmp,
+        );
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &scratch.coeff,
+            child,
+            qp,
+            bit_depth,
+            scan,
+            scan_idx,
+            1,
+            lambda,
+            &residual_ctx,
+            &mut scratch.levels,
+            &mut scratch.rdoq,
+        );
+
+        let packed_offset = index * child_len;
+        let packed = &mut scratch.tu_tree.y_zz[packed_offset..packed_offset + child_len];
+        let mut nonzero = false;
+        for (dst, &(scan_row, scan_col)) in packed.iter_mut().zip(scan) {
+            let level = scratch.levels[scan_row * child + scan_col];
+            *dst = level;
+            nonzero |= level != 0;
+        }
+        scratch.tu_tree.y_nz[index] = nonzero;
+        scratch.tu_tree.y_scan_idx[index] = scan_idx;
+        any_nonzero |= nonzero;
+        let _ = residual_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+        if nonzero {
+            advance_residual_contexts(&mut residual_ctx, packed, log2_child, true, scan_idx, true);
+        }
+
+        crate::hevc_transform::dequantize_into(
+            &scratch.levels,
+            child,
+            qp,
+            bit_depth,
+            &mut scratch.dequant,
+        );
+        crate::hevc_transform::inv_transform_intra_luma_into(
+            &scratch.dequant,
+            child,
+            bit_depth,
+            &mut scratch.inverse,
+            &mut scratch.transform_tmp,
+        );
+
+        // Reconstruct pred + residual directly into the picture so subsequent
+        // sibling TBs predict from it.
+        let dst_start = row * stride + col;
+        for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
+            .chunks_exact(child)
+            .zip(scratch.pred[..child_len].chunks_exact(child))
+            .enumerate()
+        {
+            let base = dst_start + r * stride;
+            for (dst, (&prediction, &residual)) in rec_y[base..base + child]
+                .iter_mut()
+                .zip(pred_row.iter().zip(inv_row))
+            {
+                *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+            }
+        }
+    }
+
+    any_nonzero
+}
+
+#[inline]
+fn split_chroma_is_shared(parent_luma: usize, chroma: crate::fmt::ChromaFormat) -> bool {
+    let child_luma = parent_luma / 2;
+    child_luma / chroma.sub_w() < 4 || child_luma / chroma.sub_h() < 4
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_split_chroma(
+    scratch: &mut CompressionContext,
+    src_cb: &[u16],
+    src_cr: &[u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    lu_row: usize,
+    lu_col: usize,
+    parent_luma: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+    chroma: crate::fmt::ChromaFormat,
+    mode: u8,
+    chroma_qp: u8,
+    bit_depth: u8,
+    max_val: u16,
+    lambda: f32,
+    ctx_after_luma: &ContextSet,
+) {
+    debug_assert!(!chroma.is_monochrome());
+    debug_assert!(!split_chroma_is_shared(parent_luma, chroma));
+
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let parent_side = parent_luma / sub_w;
+    let child_side = parent_side / 2;
+    let child_len = child_side * child_side;
+    let child_log2 = child_side.trailing_zeros();
+    let stacked = chroma.chroma_tbs_per_cu();
+    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
+    let scan_idx = dct::scan_idx_for(mode, child_log2, false, is_444);
+    let scan = dct::coeff_scan(child_log2, scan_idx);
+    let luma_ctus_x = yw_stride / 64;
+    let ch_row = lu_row / sub_h;
+    let ch_col = lu_col / sub_w;
+    let mut residual_ctx = ctx_after_luma.clone();
+
+    // HEVC predicts each chroma transform block from its own reconstructed
+    // neighbours, exactly like luma. Walk every child TB in decode order and
+    // reconstruct straight into rec_cb/rec_cr so later siblings see it. Cb and Cr
+    // form independent prediction chains, so each component is processed in full.
+    for component in 0..2 {
+        let source_plane = if component == 0 { src_cb } else { src_cr };
+        for root_stack in 0..stacked {
+            for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+                .into_iter()
+                .enumerate()
+            {
+                let c_row = ch_row + root_stack * parent_side + dy * child_side;
+                let c_col = ch_col + dx * child_side;
+
+                if component == 0 {
+                    extract_block_dyn_into(
+                        source_plane,
+                        src_cw,
+                        src_ch,
+                        c_row,
+                        c_col,
+                        child_side,
+                        &mut scratch.chroma_orig_cb[..child_len],
+                    );
+                } else {
+                    extract_block_dyn_into(
+                        source_plane,
+                        src_cw,
+                        src_ch,
+                        c_row,
+                        c_col,
+                        child_side,
+                        &mut scratch.chroma_orig_cr[..child_len],
+                    );
+                }
+
+                let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                    rec_cb,
+                    rec_cr,
+                    intra::ChromaRefGeometry {
+                        stride: cw_stride,
+                        block_row: c_row,
+                        block_col: c_col,
+                        chroma_h: coded_ch_h,
+                        n: child_side,
+                        sub_w,
+                        sub_h,
+                        luma_w: yw_stride,
+                        luma_h: coded_yh,
+                        luma_ctus_x,
+                        min_luma_pu: 4,
+                        cur_luma_row: c_row * sub_h,
+                        cur_luma_col: c_col * sub_w,
+                        neutral: 1u16 << (bit_depth - 1),
+                    },
+                );
+                let filter = child_side > 4 && intra::should_filter_refs(mode, child_side);
+                let (corner, above, left) = if component == 0 {
+                    if filter {
+                        let (a, l) = intra::filter_references(bc0, &ba, &bl, child_side);
+                        let cf = ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16;
+                        (cf, a, l)
+                    } else {
+                        (bc0, ba, bl)
+                    }
+                } else if filter {
+                    let (a, l) = intra::filter_references(rc0, &ra, &rl, child_side);
+                    let cf = ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16;
+                    (cf, a, l)
+                } else {
+                    (rc0, ra, rl)
+                };
+
+                intra::predict_chroma_tb_into(
+                    mode,
+                    corner,
+                    &above,
+                    &left,
+                    child_side,
+                    max_val as i32,
+                    &mut scratch.pred,
+                    &mut scratch.angular,
+                );
+                if component == 0 {
+                    intra::compute_residual_i32_into(
+                        &scratch.chroma_orig_cb[..child_len],
+                        &scratch.pred[..child_len],
+                        child_side,
+                        &mut scratch.residual,
+                    );
+                } else {
+                    intra::compute_residual_i32_into(
+                        &scratch.chroma_orig_cr[..child_len],
+                        &scratch.pred[..child_len],
+                        child_side,
+                        &mut scratch.residual,
+                    );
+                }
+                crate::hevc_transform::fwd_transform_into(
+                    &scratch.residual[..child_len],
+                    child_side,
+                    bit_depth,
+                    &mut scratch.coeff,
+                    &mut scratch.transform_tmp,
+                );
+                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                    &scratch.coeff,
+                    child_side,
+                    chroma_qp,
+                    bit_depth,
+                    scan,
+                    scan_idx,
+                    1,
+                    lambda,
+                    &residual_ctx,
+                    &mut scratch.levels,
+                    &mut scratch.rdoq,
+                );
+
+                let (child_index, stack_index) = if stacked == 1 {
+                    (quadrant, 0)
+                } else {
+                    (root_stack * 2 + dx, dy)
+                };
+                let block_index = child_index * stacked + stack_index;
+                let packed_offset = block_index * child_len;
+                let mut nonzero = false;
+                if component == 0 {
+                    let packed =
+                        &mut scratch.tu_tree.cb_zz[packed_offset..packed_offset + child_len];
+                    for (dst, &(sr, sc)) in packed.iter_mut().zip(scan) {
+                        let level = scratch.levels[sr * child_side + sc];
+                        *dst = level;
+                        nonzero |= level != 0;
+                    }
+                    scratch.tu_tree.cb_nz[block_index] = nonzero;
+                } else {
+                    let packed =
+                        &mut scratch.tu_tree.cr_zz[packed_offset..packed_offset + child_len];
+                    for (dst, &(sr, sc)) in packed.iter_mut().zip(scan) {
+                        let level = scratch.levels[sr * child_side + sc];
+                        *dst = level;
+                        nonzero |= level != 0;
+                    }
+                    scratch.tu_tree.cr_nz[block_index] = nonzero;
+                }
+                scratch.tu_tree.chroma_scan_idx[block_index] = scan_idx;
+                let _ = residual_ctx.cbf_chroma[1].estimate_and_update(nonzero as u8);
+                if nonzero {
+                    let packed = if component == 0 {
+                        &scratch.tu_tree.cb_zz[packed_offset..packed_offset + child_len]
+                    } else {
+                        &scratch.tu_tree.cr_zz[packed_offset..packed_offset + child_len]
+                    };
+                    advance_residual_contexts(
+                        &mut residual_ctx,
+                        packed,
+                        child_log2,
+                        false,
+                        scan_idx,
+                        true,
+                    );
+                }
+
+                crate::hevc_transform::dequantize_into(
+                    &scratch.levels,
+                    child_side,
+                    chroma_qp,
+                    bit_depth,
+                    &mut scratch.dequant,
+                );
+                crate::hevc_transform::inv_transform_into(
+                    &scratch.dequant,
+                    child_side,
+                    bit_depth,
+                    &mut scratch.inverse,
+                    &mut scratch.transform_tmp,
+                );
+                let dst_start = c_row * cw_stride + c_col;
+                let rec_plane = if component == 0 {
+                    &mut rec_cb[..]
+                } else {
+                    &mut rec_cr[..]
+                };
+                for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
+                    .chunks_exact(child_side)
+                    .zip(scratch.pred[..child_len].chunks_exact(child_side))
+                    .enumerate()
+                {
+                    let base = dst_start + r * cw_stride;
+                    for (dst, (&prediction, &residual)) in rec_plane[base..base + child_side]
+                        .iter_mut()
+                        .zip(pred_row.iter().zip(inv_row))
+                    {
+                        *dst = (prediction as i32 + residual).clamp(0, max_val as i32) as u16;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_chroma_mode(
+    candidate: ChromaModeCandidate,
+    estimate_rate: bool,
+    winner_rdoq: bool,
+    cost_limit: f32,
+    scratch: &mut CompressionContext,
+    src_cb: &[u16],
+    src_cr: &[u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    lu_row: usize,
+    lu_col: usize,
+    parent_luma: usize,
+    trafo_depth: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+    chroma: crate::fmt::ChromaFormat,
+    chroma_qp: u8,
+    bit_depth: u8,
+    max_val: u16,
+    lambda: f32,
+    residual_ctx_after_luma: &ContextSet,
+    ictx: &IntraModeContexts,
+) -> f32 {
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let side = parent_luma / sub_w;
+    let stacked = chroma.chroma_tbs_per_cu();
+    let block_len = side * side;
+    let log2_side = side.trailing_zeros();
+    let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
+    let scan_idx = dct::scan_idx_for(candidate.pred_mode, log2_side, false, is_444);
+    let scan = dct::coeff_scan(log2_side, scan_idx);
+    let luma_ctus_x = yw_stride / 64;
+    let ch_row = lu_row / sub_h;
+    let ch_col = lu_col / sub_w;
+    let mut distortion = 0.0f32;
+    let mut rdoq_ctx = residual_ctx_after_luma.clone();
+
+    for component in 0..2 {
+        for stack_index in 0..stacked {
+            let sub_ch_row = ch_row + stack_index * side;
+            if component == 0 {
+                extract_block_dyn_into(
+                    src_cb,
+                    src_cw,
+                    src_ch,
+                    sub_ch_row,
+                    ch_col,
+                    side,
+                    &mut scratch.chroma_orig_cb[..block_len],
+                );
+            } else {
+                extract_block_dyn_into(
+                    src_cr,
+                    src_cw,
+                    src_ch,
+                    sub_ch_row,
+                    ch_col,
+                    side,
+                    &mut scratch.chroma_orig_cr[..block_len],
+                );
+            }
+
+            let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                rec_cb,
+                rec_cr,
+                intra::ChromaRefGeometry {
+                    stride: cw_stride,
+                    block_row: sub_ch_row,
+                    block_col: ch_col,
+                    chroma_h: coded_ch_h,
+                    n: side,
+                    sub_w,
+                    sub_h,
+                    luma_w: yw_stride,
+                    luma_h: coded_yh,
+                    luma_ctus_x,
+                    // 4×4 PART_NxN chroma PUs (parent_luma == 4) need 4-sample
+                    // decode-order granularity so a PU sees its reconstructed
+                    // siblings; larger 2Nx2N chroma stays at the min-CU 8.
+                    min_luma_pu: parent_luma.min(8),
+                    // 4:2:2 stacks two square TBs; anchor each at its own luma row.
+                    cur_luma_row: lu_row + stack_index * side * sub_h,
+                    cur_luma_col: lu_col,
+                    neutral: 1u16 << (bit_depth - 1),
+                },
+            );
+            let filter = side > 4 && intra::should_filter_refs(candidate.pred_mode, side);
+            let (baf, blf, bcf) = if filter {
+                let (above, left) = intra::filter_references(bc0, &ba, &bl, side);
+                let corner = ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16;
+                (above, left, corner)
+            } else {
+                (ba, bl, bc0)
+            };
+            let (raf, rlf, rcf) = if filter {
+                let (above, left) = intra::filter_references(rc0, &ra, &rl, side);
+                let corner = ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16;
+                (above, left, corner)
+            } else {
+                (ra, rl, rc0)
+            };
+            let (corner, above, left) = if component == 0 {
+                (bcf, &baf[..], &blf[..])
+            } else {
+                (rcf, &raf[..], &rlf[..])
+            };
+            intra::predict_chroma_tb_into(
+                candidate.pred_mode,
+                corner,
+                above,
+                left,
+                side,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            );
+            let orig = if component == 0 {
+                &scratch.chroma_orig_cb[..block_len]
+            } else {
+                &scratch.chroma_orig_cr[..block_len]
+            };
+            intra::compute_residual_i32_into(
+                orig,
+                &scratch.pred[..block_len],
+                side,
+                &mut scratch.residual,
+            );
+            crate::hevc_transform::fwd_transform_into(
+                &scratch.residual[..block_len],
+                side,
+                bit_depth,
+                &mut scratch.coeff,
+                &mut scratch.transform_tmp,
+            );
+            if winner_rdoq {
+                crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                    &scratch.coeff,
+                    side,
+                    chroma_qp,
+                    bit_depth,
+                    scan,
+                    scan_idx,
+                    trafo_depth,
+                    lambda,
+                    &rdoq_ctx,
+                    &mut scratch.levels,
+                    &mut scratch.rdoq,
+                );
+            } else {
+                crate::hevc_transform::quantize_with_sign_hiding_into(
+                    &scratch.coeff,
+                    side,
+                    chroma_qp,
+                    bit_depth,
+                    scan,
+                    &mut scratch.levels,
+                );
+            }
+
+            let tb = &mut scratch.chroma_tbs[stack_index];
+            let (packed, nonzero) = if component == 0 {
+                (&mut tb.cb_zz, &mut tb.cb_nz)
+            } else {
+                (&mut tb.cr_zz, &mut tb.cr_nz)
+            };
+            *nonzero = false;
+            for (dst, &(scan_row, scan_col)) in packed[..block_len].iter_mut().zip(scan) {
+                let level = scratch.levels[scan_row * side + scan_col];
+                *dst = level;
+                *nonzero |= level != 0;
+            }
+            if winner_rdoq {
+                let _ = rdoq_ctx.cbf_chroma[trafo_depth.min(4)].estimate_and_update(*nonzero as u8);
+                if *nonzero {
+                    advance_residual_contexts(
+                        &mut rdoq_ctx,
+                        &packed[..block_len],
+                        log2_side,
+                        false,
+                        scan_idx,
+                        true,
+                    );
+                }
+            }
+
+            crate::hevc_transform::dequantize_into(
+                &scratch.levels,
+                side,
+                chroma_qp,
+                bit_depth,
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::inv_transform_into(
+                &scratch.dequant,
+                side,
+                bit_depth,
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+            );
+            intra::reconstruct_into(
+                &scratch.pred[..block_len],
+                &scratch.inverse[..block_len],
+                side,
+                max_val,
+                &mut scratch.reconstructed,
+            );
+            distortion += block_sse(orig, &scratch.reconstructed[..block_len], side);
+            if estimate_rate && distortion >= cost_limit {
+                return distortion;
+            }
+            let rec_plane = if component == 0 {
+                &mut rec_cb[..]
+            } else {
+                &mut rec_cr[..]
+            };
+            let dst_start = sub_ch_row * cw_stride + ch_col;
+            for (src_row, dst_row) in scratch.reconstructed[..block_len]
+                .chunks_exact(side)
+                .zip(rec_plane[dst_start..].chunks_mut(cw_stride))
+            {
+                dst_row[..side].copy_from_slice(src_row);
+            }
+        }
+    }
+
+    if !estimate_rate || distortion >= cost_limit {
+        return distortion;
+    }
+    let mut trial_ctx = residual_ctx_after_luma.clone();
+    let mut trial_ictx = ictx.clone();
+    let mut rate = estimate_chroma_mode_bits(&mut trial_ictx, candidate.syntax_idx);
+    for tb in &scratch.chroma_tbs[..stacked] {
+        rate += trial_ctx.cbf_chroma[trafo_depth.min(4)].estimate_and_update(tb.cb_nz as u8);
+    }
+    for tb in &scratch.chroma_tbs[..stacked] {
+        rate += trial_ctx.cbf_chroma[trafo_depth.min(4)].estimate_and_update(tb.cr_nz as u8);
+    }
+    for tb in &scratch.chroma_tbs[..stacked] {
+        if tb.cb_nz {
+            rate += estimate_residual_bits(
+                &mut trial_ctx,
+                &tb.cb_zz[..block_len],
+                log2_side,
+                false,
+                scan_idx,
+                true,
+            );
+        }
+    }
+    for tb in &scratch.chroma_tbs[..stacked] {
+        if tb.cr_nz {
+            rate += estimate_residual_bits(
+                &mut trial_ctx,
+                &tb.cr_zz[..block_len],
+                log2_side,
+                false,
+                scan_idx,
+                true,
+            );
+        }
+    }
+    distortion + lambda * rate
+}
+
+#[inline]
+fn choose_nxn_proxy(orig: &[u16], parent_pred: &[u16], lambda: f32, bit_depth: u8) -> bool {
+    debug_assert!(orig.len() >= 64 && parent_pred.len() >= 64);
+
+    // PART_NxN is expensive only after it has been selected: four independent
+    // luma mode searches, DSTs and residuals. Keep the gate itself to two tiny
+    // source/residual passes. Per-quadrant residual means estimate the gain from
+    // independent predictors, while gradient-orientation spread identifies edges
+    // that one 8×8 direction cannot represent well.
+    let depth_scale = 1u64 << bit_depth.saturating_sub(8);
+    let parent_satd = satd_block(&orig[..64], &parent_pred[..64], 8) as f32;
+    let satd_floor = 48.0 * depth_scale as f32 + lambda.sqrt() * 8.0;
+    if parent_satd <= satd_floor {
+        return false;
+    }
+
+    let mut residual_sum = [0i64; 4];
+    let mut residual_abs = [0u64; 4];
+    let mut gradient_x = [0u64; 4];
+    let mut gradient_y = [0u64; 4];
+
+    for row in 0..8 {
+        let quadrant_row = (row >= 4) as usize * 2;
+        let orig_row = &orig[row * 8..row * 8 + 8];
+        let pred_row = &parent_pred[row * 8..row * 8 + 8];
+        for col in 0..8 {
+            let quadrant = quadrant_row + (col >= 4) as usize;
+            let residual = orig_row[col] as i32 - pred_row[col] as i32;
+            residual_sum[quadrant] += residual as i64;
+            residual_abs[quadrant] += residual.unsigned_abs() as u64;
+
+            // Do not cross a 4×4 quadrant boundary: each statistic describes the
+            // direction preferred by one prospective child PU.
+            if col & 3 != 0 {
+                gradient_x[quadrant] += orig_row[col].abs_diff(orig_row[col - 1]) as u64;
+            }
+            if row & 3 != 0 {
+                gradient_y[quadrant] += orig_row[col].abs_diff(orig[(row - 1) * 8 + col]) as u64;
+            }
+        }
+    }
+
+    let total_abs: u64 = residual_abs.into_iter().sum();
+    if total_abs == 0 {
+        return false;
+    }
+
+    let means = residual_sum.map(|sum| {
+        if sum >= 0 {
+            ((sum + 8) / 16) as i32
+        } else {
+            ((sum - 8) / 16) as i32
+        }
+    });
+    let mut adjusted_abs = 0u64;
+    for row in 0..8 {
+        let quadrant_row = (row >= 4) as usize * 2;
+        let orig_row = &orig[row * 8..row * 8 + 8];
+        let pred_row = &parent_pred[row * 8..row * 8 + 8];
+        for col in 0..8 {
+            let quadrant = quadrant_row + (col >= 4) as usize;
+            let residual = orig_row[col] as i32 - pred_row[col] as i32;
+            adjusted_abs += residual.abs_diff(means[quadrant]) as u64;
+        }
+    }
+    let dc_gain = total_abs.saturating_sub(adjusted_abs);
+
+    let mut min_orientation = 256u64;
+    let mut max_orientation = 0u64;
+    let mut active_quadrants = 0usize;
+    let mut total_gradient = 0u64;
+    let activity_floor = 12 * depth_scale;
+    for (&gx, &gy) in gradient_x.iter().zip(&gradient_y) {
+        let activity = gx + gy;
+        total_gradient += activity;
+        if activity < activity_floor {
+            continue;
+        }
+        active_quadrants += 1;
+        let orientation = (gx * 256 + activity / 2) / activity;
+        min_orientation = min_orientation.min(orientation);
+        max_orientation = max_orientation.max(orientation);
+    }
+
+    let min_mean = means.into_iter().min().unwrap_or(0);
+    let max_mean = means.into_iter().max().unwrap_or(0);
+    let mean_span = max_mean.abs_diff(min_mean) as u64;
+    let gain_floor = (lambda.sqrt() * 18.0) as u64 * depth_scale;
+    let useful_dc_gain =
+        dc_gain > gain_floor.max(8 * depth_scale) && dc_gain * 100 >= total_abs * 15;
+    let mixed_direction = active_quadrants >= 2
+        && max_orientation.saturating_sub(min_orientation) >= 88
+        && total_gradient >= 64 * depth_scale;
+    let piecewise_offset = mean_span >= 5 * depth_scale;
+
+    // The gate is deliberately conservative. A false negative merely keeps the
+    // normal 2Nx2N path; a false positive triggers four complete mode searches.
+    useful_dc_gain && (piecewise_offset || mixed_direction)
+}
+
+struct NxNChroma444<'a> {
+    src_cb: &'a [u16],
+    src_cr: &'a [u16],
+    rec_cb: &'a mut [u16],
+    rec_cr: &'a mut [u16],
+    src_cw: usize,
+    src_ch: usize,
+    cw_stride: usize,
+    coded_ch_h: usize,
+    lu_row: usize,
+    lu_col: usize,
+    yw_stride: usize,
+    coded_yh: usize,
+    qp_slice: u8,
+    bit_depth: crate::fmt::BitDepth,
+    lambda: f32,
+    luma_modes: [u8; 4],
+    residual_ctx_after_luma: &'a ContextSet,
+}
+
+/// 4:4:4 keeps four chroma PUs in an 8×8 PART_NxN CU. Select and reconstruct
+/// each 4×4 chroma mode in luma-PU coding order, then retain its winner-only
+/// RDOQ coefficients for the inferred split transform tree.
+fn encode_nxn_chroma_444<W: CabacWriter>(
+    enc: &mut W,
+    ictx: &mut IntraModeContexts,
+    scratch: &mut CompressionContext,
+    job: NxNChroma444<'_>,
+) {
+    const SIDE: usize = 4;
+    const LEN: usize = SIDE * SIDE;
+
+    let NxNChroma444 {
+        src_cb,
+        src_cr,
+        rec_cb,
+        rec_cr,
+        src_cw,
+        src_ch,
+        cw_stride,
+        coded_ch_h,
+        lu_row,
+        lu_col,
+        yw_stride,
+        coded_yh,
+        qp_slice,
+        bit_depth,
+        lambda,
+        luma_modes,
+        residual_ctx_after_luma,
+    } = job;
+    let chroma = crate::fmt::ChromaFormat::Yuv444;
+    let chroma_qp = chroma_qp_for(qp_slice, chroma) + bit_depth.qp_bd_offset();
+    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+    let max_val = bit_depth.max_val();
+    let neutral = bit_depth.neutral();
+    let mut residual_ctx = residual_ctx_after_luma.clone();
+
+    for (child_index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let row = lu_row + dy * SIDE;
+        let col = lu_col + dx * SIDE;
+        extract_block_dyn_into(
+            src_cb,
+            src_cw,
+            src_ch,
+            row,
+            col,
+            SIDE,
+            &mut scratch.chroma_orig_cb[..LEN],
+        );
+        extract_block_dyn_into(
+            src_cr,
+            src_cw,
+            src_ch,
+            row,
+            col,
+            SIDE,
+            &mut scratch.chroma_orig_cr[..LEN],
+        );
+        let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+            rec_cb,
+            rec_cr,
+            intra::ChromaRefGeometry {
+                stride: cw_stride,
+                block_row: row,
+                block_col: col,
+                chroma_h: coded_ch_h,
+                n: SIDE,
+                sub_w: 1,
+                sub_h: 1,
+                luma_w: yw_stride,
+                luma_h: coded_yh,
+                luma_ctus_x: yw_stride / 64,
+                min_luma_pu: 4,
+                cur_luma_row: row,
+                cur_luma_col: col,
+                neutral,
+            },
+        );
+
+        let mut ranked = [ChromaModeCandidate {
+            pred_mode: 0,
+            syntax_idx: 0,
+            cost: f32::MAX,
+        }; 5];
+        for mut candidate in chroma_mode_candidates(luma_modes[child_index], chroma) {
+            let mut cost =
+                chroma_lambda.sqrt() * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
+            intra::predict_chroma_tb_into(
+                candidate.pred_mode,
+                bc0,
+                &ba,
+                &bl,
+                SIDE,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            );
+            cost += satd_block(&scratch.chroma_orig_cb[..LEN], &scratch.pred[..LEN], SIDE) as f32;
+            intra::predict_chroma_tb_into(
+                candidate.pred_mode,
+                rc0,
+                &ra,
+                &rl,
+                SIDE,
+                max_val as i32,
+                &mut scratch.pred,
+                &mut scratch.angular,
+            );
+            cost += satd_block(&scratch.chroma_orig_cr[..LEN], &scratch.pred[..LEN], SIDE) as f32;
+            candidate.cost = cost;
+            update_chroma_candidate(&mut ranked, candidate);
+        }
+
+        let exact_count = full_rdo_chroma_count(&ranked, chroma);
+        let mut best = ranked[0];
+        if exact_count > 1 {
+            let mut best_cost = f32::MAX;
+            for &candidate in &ranked[..exact_count] {
+                let cost = evaluate_chroma_mode(
+                    candidate,
+                    true,
+                    false,
+                    best_cost,
+                    scratch,
+                    src_cb,
+                    src_cr,
+                    rec_cb,
+                    rec_cr,
+                    src_cw,
+                    src_ch,
+                    cw_stride,
+                    coded_ch_h,
+                    row,
+                    col,
+                    SIDE,
+                    1,
+                    yw_stride,
+                    coded_yh,
+                    chroma,
+                    chroma_qp,
+                    bit_depth.bits(),
+                    max_val,
+                    chroma_lambda,
+                    &residual_ctx,
+                    ictx,
+                );
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = candidate;
+                }
+            }
+        }
+        let _ = evaluate_chroma_mode(
+            best,
+            false,
+            true,
+            f32::MAX,
+            scratch,
+            src_cb,
+            src_cr,
+            rec_cb,
+            rec_cr,
+            src_cw,
+            src_ch,
+            cw_stride,
+            coded_ch_h,
+            row,
+            col,
+            SIDE,
+            1,
+            yw_stride,
+            coded_yh,
+            chroma,
+            chroma_qp,
+            bit_depth.bits(),
+            max_val,
+            chroma_lambda,
+            &residual_ctx,
+            ictx,
+        );
+
+        let offset = child_index * LEN;
+        let (cb_nz, cr_nz) = {
+            let tb = &scratch.chroma_tbs[0];
+            scratch.tu_tree.cb_zz[offset..offset + LEN].copy_from_slice(&tb.cb_zz[..LEN]);
+            scratch.tu_tree.cr_zz[offset..offset + LEN].copy_from_slice(&tb.cr_zz[..LEN]);
+            (tb.cb_nz, tb.cr_nz)
+        };
+        scratch.tu_tree.cb_nz[child_index] = cb_nz;
+        scratch.tu_tree.cr_nz[child_index] = cr_nz;
+        let scan_idx = dct::scan_idx_for(best.pred_mode, 2, false, true);
+        scratch.tu_tree.chroma_scan_idx[child_index] = scan_idx;
+        encode_chroma_mode(enc, ictx, best.syntax_idx);
+
+        let _ = residual_ctx.cbf_chroma[1].estimate_and_update(cb_nz as u8);
+        let _ = residual_ctx.cbf_chroma[1].estimate_and_update(cr_nz as u8);
+        if cb_nz {
+            advance_residual_contexts(
+                &mut residual_ctx,
+                &scratch.tu_tree.cb_zz[offset..offset + LEN],
+                2,
+                false,
+                scan_idx,
+                true,
+            );
+        }
+        if cr_nz {
+            advance_residual_contexts(
+                &mut residual_ctx,
+                &scratch.tu_tree.cr_zz[offset..offset + LEN],
+                2,
+                false,
+                scan_idx,
+                true,
+            );
+        }
+    }
+
+    // The real transform-tree syntax is emitted after all prediction modes.
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_cu_nxn<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    src_y: &[u16],
+    src_cb: &[u16],
+    src_cr: &[u16],
+    rec_y: &mut [u16],
+    rec_cb: &mut [u16],
+    rec_cr: &mut [u16],
+    lu_row: usize,
+    lu_col: usize,
+    yw_stride: usize,
+    src_yw: usize,
+    src_yh: usize,
+    cw_stride: usize,
+    src_cw: usize,
+    src_ch: usize,
+    coded_yh: usize,
+    coded_ch_h: usize,
+    qp_slice: u8,
+    qp: u8,
+    chroma: crate::fmt::ChromaFormat,
+    bit_depth: crate::fmt::BitDepth,
+    lambda: f32,
+    mode_map: &mut [u8],
+    mode_stride: usize,
+    challenger_cost: f32,
+    scratch: &mut CompressionContext,
+) -> bool {
+    const PU: usize = 4;
+    const PU_LEN: usize = 16;
+    let max_val = bit_depth.max_val();
+    let neutral = bit_depth.neutral();
+    let mut rdoq_ctx = ctx.clone();
+    let mut luma_modes = [0u8; 4];
+    // Each PU's MPM list, captured at decision time so the luma mode syntax can
+    // be emitted in HEVC order (all four flags, then all four remainders) after
+    // every PU has been reconstructed.
+    let mut pu_mpm = [[0u8; 3]; 4];
+    // Accumulated luma J = SSE + λ·rate across the four PUs; compared against the
+    // 2Nx2N luma cost so PART_NxN is committed only when it is actually cheaper.
+    // The per-PU loop below touches only rec_y / mode_map / cloned contexts (never
+    // the real `enc`/`ctx`/`ictx`), so a losing NxN candidate leaves no bitstream
+    // side effects and the 2Nx2N path overwrites its scratch reconstruction.
+    let mut nxn_cost = 0.0f32;
+
+    for (pu_index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let row = lu_row + dy * PU;
+        let col = lu_col + dx * PU;
+        extract_block_n_into::<PU>(src_y, src_yw, src_yh, row, col, &mut scratch.orig);
+
+        let internal_left = dx != 0;
+        let internal_above = dy != 0;
+        let avail_left =
+            col > 0 && (internal_left || is_block_decoded(row, col - 1, row, col, 64, yw_stride));
+        let above_in_same_ctb = row > 0 && row > (row / 64) * 64;
+        let avail_above = row > 0
+            && above_in_same_ctb
+            && (internal_above || is_block_decoded(row - 1, col, row, col, 64, yw_stride));
+        let mode_at = |r: usize, c: usize| mode_map[(r / 4) * mode_stride + c / 4];
+        let cand_a = if avail_left { mode_at(row, col - 1) } else { 1 };
+        let cand_b = if avail_above {
+            mode_at(row - 1, col)
+        } else {
+            1
+        };
+        let mpm = mpm_list(cand_a, cand_b);
+
+        let (corner, above, left) = intra::get_reference_samples(
+            rec_y,
+            intra::LumaRefGeometry {
+                stride: yw_stride,
+                block_row: row,
+                block_col: col,
+                height: coded_yh,
+                n: PU,
+                ctu: 64,
+                ctus_x: yw_stride / 64,
+                min_pu: 4,
+                neutral,
+            },
+        );
+        let predict =
+            |mode: u8, dst: &mut [u16; 1024], angular: &mut intra::AngularScratch| match mode {
+                0 => intra::predict_planar_into(&above, &left, PU, dst),
+                1 => intra::predict_dc_into(&above, &left, PU, true, dst),
+                _ => intra::predict_angular_into(
+                    corner,
+                    &above,
+                    &left,
+                    PU,
+                    mode,
+                    true,
+                    max_val as i32,
+                    dst,
+                    angular,
+                ),
+            };
+
+        let mut rmd = [IntraModeCandidate {
+            mode: 0,
+            cost: f32::MAX,
+        }; 8];
+        let mut mode_costs = [f32::MAX; 35];
+        let mut tested = [false; 35];
+        let lambda_mode = lambda.sqrt();
+        let mut test_mode = |mode: u8| -> Option<f32> {
+            let index = mode as usize;
+            if tested[index] {
+                return None;
+            }
+            tested[index] = true;
+            predict(mode, &mut scratch.pred, &mut scratch.angular);
+            let cost = satd_block(&scratch.orig[..PU_LEN], &scratch.pred[..PU_LEN], PU) as f32
+                + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
+            mode_costs[index] = cost;
+            update_intra_candidate(&mut rmd, mode, cost);
+            Some(cost)
+        };
+
+        // Four 4×4 PUs are reached only behind the conservative NxN gate, but a
+        // full 35-direction RMD for each child would still dominate those CUs.
+        // Sample the angular space at four-mode intervals, then refine ±1/±2
+        // around the best coarse direction and always include every MPM.
+        static COARSE_MODES: [u8; 11] = [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34];
+        let mut coarse_mode = 0u8;
+        let mut coarse_cost = f32::MAX;
+        for mode in COARSE_MODES {
+            if let Some(cost) = test_mode(mode)
+                && cost < coarse_cost
+            {
+                coarse_cost = cost;
+                coarse_mode = mode;
+            }
+        }
+        if coarse_mode >= 2 {
+            for delta in [-2i16, -1, 1, 2] {
+                let mode = coarse_mode as i16 + delta;
+                if (2..=34).contains(&mode) {
+                    let _ = test_mode(mode as u8);
+                }
+            }
+        }
+        for &mode in &mpm {
+            let _ = test_mode(mode);
+        }
+
+        let mut candidates = [IntraModeCandidate {
+            mode: 0,
+            cost: f32::MAX,
+        }; 11];
+        let mut candidate_count = 0usize;
+        for candidate in rmd {
+            push_sorted_unique_candidate(&mut candidates, &mut candidate_count, candidate);
+        }
+        for mode in mpm {
+            push_sorted_unique_candidate(
+                &mut candidates,
+                &mut candidate_count,
+                IntraModeCandidate {
+                    mode,
+                    cost: mode_costs[mode as usize],
+                },
+            );
+        }
+        let full_count = full_rdo_candidate_count(&candidates[..candidate_count], PU);
+        let mut best_mode = candidates[0].mode;
+        let mut best_cost = f32::MAX;
+
+        for candidate in &candidates[..full_count] {
+            let mode = candidate.mode;
+            let scan_idx = dct::scan_idx_for(mode, 2, true, false);
+            let scan = dct::coeff_scan(2, scan_idx);
+            let mut trial_ctx = rdoq_ctx.clone();
+            let mut trial_ictx = ictx.clone();
+            let mut rate = estimate_luma_mode_bits(&mut trial_ictx, mode, &mpm);
+            predict(mode, &mut scratch.pred, &mut scratch.angular);
+            intra::compute_residual_i32_into(
+                &scratch.orig[..PU_LEN],
+                &scratch.pred[..PU_LEN],
+                PU,
+                &mut scratch.residual,
+            );
+            crate::hevc_transform::fwd_transform_intra_luma_into(
+                &scratch.residual[..PU_LEN],
+                PU,
+                bit_depth.bits(),
+                &mut scratch.coeff,
+                &mut scratch.transform_tmp,
+            );
+            crate::hevc_transform::quantize_with_sign_hiding_into(
+                &scratch.coeff,
+                PU,
+                qp,
+                bit_depth.bits(),
+                scan,
+                &mut scratch.levels,
+            );
+            let mut nonzero = false;
+            for (dst, &(scan_row, scan_col)) in scratch.scanned[..PU_LEN].iter_mut().zip(scan) {
+                let level = scratch.levels[scan_row * PU + scan_col];
+                *dst = level;
+                nonzero |= level != 0;
+            }
+            rate += trial_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+            if nonzero {
+                rate += estimate_residual_bits(
+                    &mut trial_ctx,
+                    &scratch.scanned[..PU_LEN],
+                    2,
+                    true,
+                    scan_idx,
+                    true,
+                );
+            }
+            let rate_cost = lambda * rate;
+            if rate_cost >= best_cost {
+                continue;
+            }
+            crate::hevc_transform::dequantize_into(
+                &scratch.levels,
+                PU,
+                qp,
+                bit_depth.bits(),
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::inv_transform_intra_luma_into(
+                &scratch.dequant,
+                PU,
+                bit_depth.bits(),
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+            );
+            intra::reconstruct_into(
+                &scratch.pred[..PU_LEN],
+                &scratch.inverse[..PU_LEN],
+                PU,
+                max_val,
+                &mut scratch.reconstructed,
+            );
+            let cost = block_sse(
+                &scratch.orig[..PU_LEN],
+                &scratch.reconstructed[..PU_LEN],
+                PU,
+            ) + rate_cost;
+            if cost < best_cost {
+                best_cost = cost;
+                best_mode = mode;
+                core::mem::swap(&mut scratch.pred, &mut scratch.best_pred);
+                core::mem::swap(&mut scratch.coeff, &mut scratch.best_coeff);
+            }
+        }
+
+        // Syntax is emitted after the loop; here only record the decision so the
+        // next PU's MPM derivation sees this PU's reconstructed mode.
+        mode_map[(row / 4) * mode_stride + col / 4] = best_mode;
+        luma_modes[pu_index] = best_mode;
+        pu_mpm[pu_index] = mpm;
+        nxn_cost += best_cost;
+
+        let scan_idx = dct::scan_idx_for(best_mode, 2, true, false);
+        let scan = dct::coeff_scan(2, scan_idx);
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &scratch.best_coeff,
+            PU,
+            qp,
+            bit_depth.bits(),
+            scan,
+            scan_idx,
+            1,
+            lambda,
+            &rdoq_ctx,
+            &mut scratch.levels,
+            &mut scratch.rdoq,
+        );
+        let offset = pu_index * PU_LEN;
+        let packed = &mut scratch.tu_tree.y_zz[offset..offset + PU_LEN];
+        let mut nonzero = false;
+        for (dst, &(scan_row, scan_col)) in packed.iter_mut().zip(scan) {
+            let level = scratch.levels[scan_row * PU + scan_col];
+            *dst = level;
+            nonzero |= level != 0;
+        }
+        scratch.tu_tree.y_nz[pu_index] = nonzero;
+        scratch.tu_tree.y_scan_idx[pu_index] = scan_idx;
+        let _ = rdoq_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+        if nonzero {
+            advance_residual_contexts(&mut rdoq_ctx, packed, 2, true, scan_idx, true);
+        }
+
+        crate::hevc_transform::dequantize_into(
+            &scratch.levels,
+            PU,
+            qp,
+            bit_depth.bits(),
+            &mut scratch.dequant,
+        );
+        crate::hevc_transform::inv_transform_intra_luma_into(
+            &scratch.dequant,
+            PU,
+            bit_depth.bits(),
+            &mut scratch.inverse,
+            &mut scratch.transform_tmp,
+        );
+        intra::reconstruct_into(
+            &scratch.best_pred[..PU_LEN],
+            &scratch.inverse[..PU_LEN],
+            PU,
+            max_val,
+            &mut scratch.reconstructed,
+        );
+        let dst_start = row * yw_stride + col;
+        for (src_row, dst_row) in scratch.reconstructed[..PU_LEN]
+            .as_chunks::<PU>()
+            .0
+            .iter()
+            .zip(rec_y[dst_start..].chunks_mut(yw_stride))
+        {
+            dst_row[..PU].copy_from_slice(src_row);
+        }
+    }
+
+    // Real RD decision: keep PART_NxN only if its four-PU luma cost beats the
+    // 2Nx2N winner. Nothing has been written to the bitstream yet, so bailing out
+    // here simply hands control back to the 2Nx2N commit path.
+    if nxn_cost >= challenger_cost {
+        return false;
+    }
+
+    // min-CU intra part_mode: zero means PART_NxN. The root transform split is
+    // then inferred by HEVC and is not separately CABAC-coded.
+    enc.encode_bin(0, &mut ictx.part_mode);
+
+    // HEVC §7.3.8.5: for PART_NxN all four prev_intra_luma_pred_flag bins are
+    // coded first, then all four mpm_idx/rem_intra_luma_pred_mode bins.
+    for pu in 0..4 {
+        encode_luma_mode_flag(enc, ictx, luma_modes[pu], &pu_mpm[pu]);
+    }
+    for pu in 0..4 {
+        encode_luma_mode_rem(enc, luma_modes[pu], &pu_mpm[pu]);
+    }
+
+    let shared_chroma = !chroma.is_monochrome() && split_chroma_is_shared(8, chroma);
+    if matches!(chroma, crate::fmt::ChromaFormat::Yuv444) {
+        encode_nxn_chroma_444(
+            enc,
+            ictx,
+            scratch,
+            NxNChroma444 {
+                src_cb,
+                src_cr,
+                rec_cb,
+                rec_cr,
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                lu_row,
+                lu_col,
+                yw_stride,
+                coded_yh,
+                qp_slice,
+                bit_depth,
+                lambda,
+                luma_modes,
+                residual_ctx_after_luma: &rdoq_ctx,
+            },
+        );
+    } else if !chroma.is_monochrome() {
+        debug_assert!(shared_chroma);
+        let chroma_qp = chroma_qp_for(qp_slice, chroma) + bit_depth.qp_bd_offset();
+        let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+        let candidates = chroma_mode_candidates(luma_modes[0], chroma);
+        let mut ranked = [ChromaModeCandidate {
+            pred_mode: 0,
+            syntax_idx: 0,
+            cost: f32::MAX,
+        }; 5];
+        let side = 8 / chroma.sub_w();
+        let stacked = chroma.chroma_tbs_per_cu();
+        let block_len = side * side;
+        let ch_row = lu_row / chroma.sub_h();
+        let ch_col = lu_col / chroma.sub_w();
+
+        for mut candidate in candidates {
+            let mut cost =
+                chroma_lambda.sqrt() * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
+            for stack_index in 0..stacked {
+                let sub_ch_row = ch_row + stack_index * side;
+                let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                    rec_cb,
+                    rec_cr,
+                    intra::ChromaRefGeometry {
+                        stride: cw_stride,
+                        block_row: sub_ch_row,
+                        block_col: ch_col,
+                        chroma_h: coded_ch_h,
+                        n: side,
+                        sub_w: chroma.sub_w(),
+                        sub_h: chroma.sub_h(),
+                        luma_w: yw_stride,
+                        luma_h: coded_yh,
+                        luma_ctus_x: yw_stride / 64,
+                        min_luma_pu: 8,
+                        // 4:2:2 stacks two square TBs; anchor each at its own luma row.
+                        cur_luma_row: lu_row + stack_index * side * chroma.sub_h(),
+                        cur_luma_col: lu_col,
+                        neutral,
+                    },
+                );
+                for component in 0..2 {
+                    let (source_plane, corner, above, left, orig) = if component == 0 {
+                        (src_cb, bc0, &ba[..], &bl[..], &mut scratch.chroma_orig_cb)
+                    } else {
+                        (src_cr, rc0, &ra[..], &rl[..], &mut scratch.chroma_orig_cr)
+                    };
+                    extract_block_dyn_into(
+                        source_plane,
+                        src_cw,
+                        src_ch,
+                        sub_ch_row,
+                        ch_col,
+                        side,
+                        &mut orig[..block_len],
+                    );
+                    intra::predict_chroma_tb_into(
+                        candidate.pred_mode,
+                        corner,
+                        above,
+                        left,
+                        side,
+                        max_val as i32,
+                        &mut scratch.pred,
+                        &mut scratch.angular,
+                    );
+                    cost += satd_block(&orig[..block_len], &scratch.pred[..block_len], side) as f32;
+                }
+            }
+            candidate.cost = cost;
+            update_chroma_candidate(&mut ranked, candidate);
+        }
+
+        let exact_count = full_rdo_chroma_count(&ranked, chroma);
+        let mut best = ranked[0];
+        if exact_count > 1 {
+            let mut best_cost = f32::MAX;
+            for &candidate in &ranked[..exact_count] {
+                let cost = evaluate_chroma_mode(
+                    candidate,
+                    true,
+                    false,
+                    best_cost,
+                    scratch,
+                    src_cb,
+                    src_cr,
+                    rec_cb,
+                    rec_cr,
+                    src_cw,
+                    src_ch,
+                    cw_stride,
+                    coded_ch_h,
+                    lu_row,
+                    lu_col,
+                    8,
+                    0,
+                    yw_stride,
+                    coded_yh,
+                    chroma,
+                    chroma_qp,
+                    bit_depth.bits(),
+                    max_val,
+                    chroma_lambda,
+                    &rdoq_ctx,
+                    ictx,
+                );
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = candidate;
+                }
+            }
+        }
+
+        let _ = evaluate_chroma_mode(
+            best,
+            false,
+            true,
+            f32::MAX,
+            scratch,
+            src_cb,
+            src_cr,
+            rec_cb,
+            rec_cr,
+            src_cw,
+            src_ch,
+            cw_stride,
+            coded_ch_h,
+            lu_row,
+            lu_col,
+            8,
+            0,
+            yw_stride,
+            coded_yh,
+            chroma,
+            chroma_qp,
+            bit_depth.bits(),
+            max_val,
+            chroma_lambda,
+            &rdoq_ctx,
+            ictx,
+        );
+        let scan_idx = dct::scan_idx_for(best.pred_mode, side.trailing_zeros(), false, false);
+        for index in 0..stacked {
+            scratch.tu_tree.chroma_scan_idx[index] = scan_idx;
+        }
+        encode_chroma_mode(enc, ictx, best.syntax_idx);
+    }
+
+    encode_split_transform_tree(enc, ctx, scratch, 8, chroma, true, shared_chroma, true);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_split_transform_tree<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    scratch: &CompressionContext,
+    parent_luma: usize,
+    chroma: crate::fmt::ChromaFormat,
+    inferred_root_split: bool,
+    shared_chroma: bool,
+    sign_data_hiding: bool,
+) {
+    if !inferred_root_split {
+        let split_ctx = split_transform_context(parent_luma);
+        enc.encode_bin(1, &mut ctx.split_transform_flag[split_ctx]);
+    }
+
+    let child = parent_luma / 2;
+    let child_len = child * child;
+    let child_log2 = child.trailing_zeros();
+    let stacked = chroma.chroma_tbs_per_cu();
+
+    // 4:2:2 represents each rectangular chroma TU as two vertically stacked
+    // square TUs. Consequently it has two root CBFs, one for the upper pair of
+    // luma children and one for the lower pair. Other chroma formats have one.
+    let root_count = if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
+        2
+    } else {
+        1
+    };
+    let mut root_cb_nz = [false; 2];
+    let mut root_cr_nz = [false; 2];
+    if !chroma.is_monochrome() {
+        if shared_chroma {
+            for root_index in 0..root_count {
+                root_cb_nz[root_index] = scratch.chroma_tbs[root_index].cb_nz;
+                root_cr_nz[root_index] = scratch.chroma_tbs[root_index].cr_nz;
+            }
+        } else if root_count == 2 {
+            for root_index in 0..2 {
+                for child_index in root_index * 2..root_index * 2 + 2 {
+                    for stack_index in 0..stacked {
+                        let index = child_index * stacked + stack_index;
+                        root_cb_nz[root_index] |= scratch.tu_tree.cb_nz[index];
+                        root_cr_nz[root_index] |= scratch.tu_tree.cr_nz[index];
+                    }
+                }
+            }
+        } else {
+            root_cb_nz[0] = scratch.tu_tree.cb_nz[..4 * stacked]
+                .iter()
+                .any(|&nonzero| nonzero);
+            root_cr_nz[0] = scratch.tu_tree.cr_nz[..4 * stacked]
+                .iter()
+                .any(|&nonzero| nonzero);
+        }
+
+        for &nonzero in &root_cb_nz[..root_count] {
+            encode_cbf_chroma(enc, ctx, nonzero, 0);
+        }
+        for &nonzero in &root_cr_nz[..root_count] {
+            encode_cbf_chroma(enc, ctx, nonzero, 0);
+        }
+    }
+
+    for child_index in 0..4 {
+        if !chroma.is_monochrome() && !shared_chroma {
+            let root_index = if root_count == 2 { child_index / 2 } else { 0 };
+            if root_cb_nz[root_index] {
+                for stack_index in 0..stacked {
+                    let index = child_index * stacked + stack_index;
+                    encode_cbf_chroma(enc, ctx, scratch.tu_tree.cb_nz[index], 1);
+                }
+            }
+            if root_cr_nz[root_index] {
+                for stack_index in 0..stacked {
+                    let index = child_index * stacked + stack_index;
+                    encode_cbf_chroma(enc, ctx, scratch.tu_tree.cr_nz[index], 1);
+                }
+            }
+        }
+
+        let y_nz = scratch.tu_tree.y_nz[child_index];
+        encode_cbf_luma(enc, ctx, y_nz, 1);
+        if y_nz {
+            let offset = child_index * child_len;
+            encode_residual(
+                enc,
+                ctx,
+                &scratch.tu_tree.y_zz[offset..offset + child_len],
+                child_log2,
+                true,
+                scratch.tu_tree.y_scan_idx[child_index],
+                sign_data_hiding,
+            );
+        }
+
+        if chroma.is_monochrome() {
+            continue;
+        }
+        if shared_chroma {
+            let emit = match chroma {
+                crate::fmt::ChromaFormat::Yuv420 => child_index == 3,
+                crate::fmt::ChromaFormat::Yuv422 => child_index == 1 || child_index == 3,
+                crate::fmt::ChromaFormat::Yuv444 | crate::fmt::ChromaFormat::Monochrome => false,
+            };
+            if !emit {
+                continue;
+            }
+            let stack_index = if matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
+                child_index / 2
+            } else {
+                0
+            };
+            let tb = &scratch.chroma_tbs[stack_index];
+            let side = parent_luma / chroma.sub_w();
+            let len = side * side;
+            let log2_side = side.trailing_zeros();
+            if tb.cb_nz {
+                encode_residual(
+                    enc,
+                    ctx,
+                    &tb.cb_zz[..len],
+                    log2_side,
+                    false,
+                    scratch.tu_tree.chroma_scan_idx[stack_index],
+                    sign_data_hiding,
+                );
+            }
+            if tb.cr_nz {
+                encode_residual(
+                    enc,
+                    ctx,
+                    &tb.cr_zz[..len],
+                    log2_side,
+                    false,
+                    scratch.tu_tree.chroma_scan_idx[stack_index],
+                    sign_data_hiding,
+                );
+            }
+            continue;
+        }
+
+        let side = child / chroma.sub_w();
+        let len = side * side;
+        let log2_side = side.trailing_zeros();
+        for stack_index in 0..stacked {
+            let index = child_index * stacked + stack_index;
+            if scratch.tu_tree.cb_nz[index] {
+                let offset = index * len;
+                encode_residual(
+                    enc,
+                    ctx,
+                    &scratch.tu_tree.cb_zz[offset..offset + len],
+                    log2_side,
+                    false,
+                    scratch.tu_tree.chroma_scan_idx[index],
+                    sign_data_hiding,
+                );
+            }
+        }
+        for stack_index in 0..stacked {
+            let index = child_index * stacked + stack_index;
+            if scratch.tu_tree.cr_nz[index] {
+                let offset = index * len;
+                encode_residual(
+                    enc,
+                    ctx,
+                    &scratch.tu_tree.cr_zz[offset..offset + len],
+                    log2_side,
+                    false,
+                    scratch.tu_tree.chroma_scan_idx[index],
+                    sign_data_hiding,
+                );
+            }
         }
     }
 }
@@ -1849,7 +3848,7 @@ fn encode_cu<W: CabacWriter>(
         cw_stride,
         src_cw,
         src_ch,
-        blk_stride,
+        mode_stride,
     } = *geo;
     let CuSrcPlanes {
         y: src_y,
@@ -1901,7 +3900,7 @@ fn encode_cu<W: CabacWriter>(
     let avail_above = lu_row > 0
         && above_in_same_ctb
         && is_block_decoded(lu_row - 1, lu_col, lu_row, lu_col, ctb, yw_stride);
-    let mode_at = |r: usize, c: usize| mode_map[(r / 8) * blk_stride + c / 8];
+    let mode_at = |r: usize, c: usize| mode_map[(r / 4) * mode_stride + c / 4];
     let cand_a = if avail_left {
         mode_at(lu_row, lu_col - 1)
     } else {
@@ -1924,6 +3923,7 @@ fn encode_cu<W: CabacWriter>(
             n: lu,
             ctu: 64,
             ctus_x: yw_stride / 64,
+            min_pu: 8,
             neutral,
         },
     );
@@ -2165,39 +4165,106 @@ fn encode_cu<W: CabacWriter>(
         }
     }
 
+    // PART_NxN is considered only for the minimum 8×8 CU and only after the
+    // regular 2Nx2N winner is known. `choose_nxn_proxy` is a cheap gate that keeps
+    // the expensive four-PU search off smooth/ordinary blocks; encode_cu_nxn then
+    // makes the real rate–distortion decision, committing PART_NxN only when its
+    // four-PU luma J beats the 2Nx2N winner (`best_rd_cost`) and otherwise leaving
+    // the bitstream untouched so the 2Nx2N path below runs.
+    // PART_NxN's inferred transform split reaches four 4×4 chroma TBs. For 4:2:2
+    // those TBs use the stacked square layout that the split path does not yet
+    // model, so NxN is likewise restricted to the square 4:2:0/4:4:4 chroma
+    // formats (and monochrome).
+    if lu == 8
+        && !lossless
+        && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422)
+        && choose_nxn_proxy(
+            &scratch.orig[..num_luma],
+            &scratch.best_pred[..num_luma],
+            lambda,
+            bit_depth.bits(),
+        )
+    {
+        // The NxN search reuses scratch.orig / best_pred / best_coeff, so snapshot
+        // the 2Nx2N winner state and restore it if NxN loses the RD comparison.
+        let mut saved_orig = [0u16; 64];
+        let mut saved_pred = [0u16; 64];
+        let mut saved_coeff = [0i32; 64];
+        saved_orig.copy_from_slice(&scratch.orig[..num_luma]);
+        saved_pred.copy_from_slice(&scratch.best_pred[..num_luma]);
+        saved_coeff.copy_from_slice(&scratch.best_coeff[..num_luma]);
+        if encode_cu_nxn(
+            enc,
+            ctx,
+            ictx,
+            src_y,
+            src_cb,
+            src_cr,
+            rec_y,
+            rec_cb,
+            rec_cr,
+            lu_row,
+            lu_col,
+            yw_stride,
+            src_yw,
+            src_yh,
+            cw_stride,
+            src_cw,
+            src_ch,
+            coded_yh,
+            coded_ch_h,
+            qp_slice,
+            qp,
+            chroma,
+            bit_depth,
+            lambda,
+            mode_map,
+            mode_stride,
+            best_rd_cost,
+            scratch,
+        ) {
+            return;
+        }
+        scratch.orig[..num_luma].copy_from_slice(&saved_orig);
+        scratch.best_pred[..num_luma].copy_from_slice(&saved_pred);
+        scratch.best_coeff[..num_luma].copy_from_slice(&saved_coeff);
+    }
+
+    // The transform-tree shape (single TU vs. one split into four child TUs) is
+    // chosen by real rate–distortion below, after both candidates have been
+    // reconstructed. 4:2:2 is excluded: its rectangular chroma PB is coded as two
+    // stacked square TBs whose split decode order and per-TB reference
+    // availability differ from the square 4:2:0/4:4:4 layouts in
+    // commit_split_chroma, so it always keeps the single-transform path.
+    let split_allowed = !lossless && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422);
+
     // ── cu_transquant_bypass_flag ────────────────────────────────────────────
     // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
     // when the PPS sets transquant_bypass_enabled_flag (i.e. lossless coding).
-    // We code 1 for every CU, so transform + quantization are skipped. With the
-    // SPS RExt flag, horizontal/vertical modes additionally use inferred RDPCM.
     if lossless {
         enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
     }
 
     // ── part_mode ──────────────────────────────────────────────────────────
-    // Present only when the CU equals the SPS minimum luma CB (8×8); we always
-    // use PART_2Nx2N → single context bin = 1 when present.
+    // The regular path is PART_2Nx2N. PART_NxN is handled by the dedicated 8×8
+    // path below, where four independent 4×4 prediction modes are signalled.
     if lu == 8 {
         enc.encode_bin(1, &mut ictx.part_mode);
     }
-    let _ = &ictx.part_mode;
 
     // ── Luma intra pred mode syntax ──────────────────────────────────────────
     encode_luma_mode(enc, ictx, luma_mode, &mpm);
 
-    // Record this CU's luma mode for neighbors' MPM derivation.
-    for br in 0..(lu / 8) {
-        for bc in 0..(lu / 8) {
-            mode_map[((lu_row / 8) + br) * blk_stride + (lu_col / 8) + bc] = luma_mode;
-        }
+    // Record this CU's luma mode on the minimum-PU 4×4 grid.
+    for br in 0..(lu / 4) {
+        let row = (lu_row / 4 + br) * mode_stride + lu_col / 4;
+        mode_map[row..row + lu / 4].fill(luma_mode);
     }
 
-    // ── HEVC integer transform + quantize: luma LU×LU ─────────────────────
-    // Mode-dependent scan for residual_coding. 8×8 luma uses a vertical/horizontal
-    // scan for modes 6..=14 / 22..=30 (else diagonal); larger TUs are diagonal.
     let luma_log2_ts = lu.trailing_zeros();
     let luma_scan_idx = dct::scan_idx_for(luma_mode, luma_log2_ts, true, false);
     let luma_scan = dct::coeff_scan(luma_log2_ts, luma_scan_idx);
+    // ── Unsplit luma: reconstruct into scratch (rec_y written only if it wins) ──
     if lossless {
         forward_lossless_rdpcm_into(
             &scratch.best_residual[..num_luma],
@@ -2219,18 +4286,13 @@ fn encode_cu<W: CabacWriter>(
             &mut scratch.rdoq,
         );
     }
-    let mut y_nz = false;
+    let mut y_nz_unsplit = false;
     for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(luma_scan) {
         let level = scratch.levels[row * lu + col];
         *dst = level;
-        y_nz |= level != 0;
+        y_nz_unsplit |= level != 0;
     }
-
     if lossless {
-        // RDPCM changes only the coded residual representation. The decoded
-        // cumulative sum is exactly the original prediction residual, which is
-        // already cached for the selected mode, so reconstruction needs no
-        // encoder-side inverse-DPCM pass.
         for (dst, &residual) in scratch.inverse[..num_luma]
             .iter_mut()
             .zip(&scratch.best_residual[..num_luma])
@@ -2260,12 +4322,102 @@ fn encode_cu<W: CabacWriter>(
         max_val,
         &mut scratch.reconstructed,
     );
-    for (src_row, dst_row) in scratch.reconstructed[..num_luma]
-        .chunks_exact(lu)
-        .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
-    {
-        dst_row[..lu].copy_from_slice(src_row);
-    }
+    let d_unsplit = block_sse(
+        &scratch.orig[..num_luma],
+        &scratch.reconstructed[..num_luma],
+        lu,
+    );
+    let r_unsplit = {
+        let mut tctx = ctx.clone();
+        let mut r = tctx.split_transform_flag[split_transform_context(lu)].estimate_and_update(0);
+        r += tctx.cbf_luma[1].estimate_and_update(y_nz_unsplit as u8);
+        if y_nz_unsplit {
+            r += estimate_residual_bits(
+                &mut tctx,
+                &scratch.scanned[..num_luma],
+                luma_log2_ts,
+                true,
+                luma_scan_idx,
+                !lossless,
+            );
+        }
+        r
+    };
+
+    // ── Split luma (if allowed): reconstruct into rec_y + tu_tree, cost it ──────
+    // commit_split_luma leaves scratch.reconstructed / scratch.scanned untouched,
+    // so the unsplit candidate above survives for a possible rollback.
+    let (tu_layout, y_nz) = if split_allowed {
+        let y_nz_split = commit_split_luma(
+            scratch,
+            rec_y,
+            yw_stride,
+            coded_yh,
+            lu_row,
+            lu_col,
+            lu,
+            luma_mode,
+            qp,
+            bit_depth.bits(),
+            max_val,
+            neutral,
+            lambda,
+            ctx,
+        );
+        let d_split = sse_plane(
+            &scratch.orig[..num_luma],
+            rec_y,
+            lu_row,
+            lu_col,
+            yw_stride,
+            lu,
+        );
+        let r_split = {
+            let mut tctx = ctx.clone();
+            let mut r =
+                tctx.split_transform_flag[split_transform_context(lu)].estimate_and_update(1);
+            let child = lu / 2;
+            let child_len = child * child;
+            let log2_child = child.trailing_zeros();
+            for i in 0..4 {
+                let nz = scratch.tu_tree.y_nz[i];
+                r += tctx.cbf_luma[0].estimate_and_update(nz as u8);
+                if nz {
+                    let off = i * child_len;
+                    r += estimate_residual_bits(
+                        &mut tctx,
+                        &scratch.tu_tree.y_zz[off..off + child_len],
+                        log2_child,
+                        true,
+                        scratch.tu_tree.y_scan_idx[i],
+                        true,
+                    );
+                }
+            }
+            r
+        };
+        if d_split + lambda * r_split < d_unsplit + lambda * r_unsplit {
+            (TuLayout::Split, y_nz_split)
+        } else {
+            // Unsplit wins: restore its reconstruction into the picture. Its
+            // coefficients are still in scratch.scanned for the CABAC writer.
+            for (src_row, dst_row) in scratch.reconstructed[..num_luma]
+                .chunks_exact(lu)
+                .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
+            {
+                dst_row[..lu].copy_from_slice(src_row);
+            }
+            (TuLayout::Unsplit, y_nz_unsplit)
+        }
+    } else {
+        for (src_row, dst_row) in scratch.reconstructed[..num_luma]
+            .chunks_exact(lu)
+            .zip(rec_y[lu_row * yw_stride + lu_col..].chunks_mut(yw_stride))
+        {
+            dst_row[..lu].copy_from_slice(src_row);
+        }
+        (TuLayout::Unsplit, y_nz_unsplit)
+    };
     // ── Independent chroma intra-mode RDO ──────────────────────────────────
     // HEVC exposes four explicit chroma modes plus DM_CHROMA. As in HM, a
     // duplicate explicit mode is replaced by angular mode 34. All five modes are
@@ -2284,6 +4436,11 @@ fn encode_cu<W: CabacWriter>(
     let n_ch = ctb * ctb;
 
     let mut chroma_tb_scan_idx = 0u8;
+    let shared_chroma = matches!(tu_layout, TuLayout::Split)
+        && !chroma.is_monochrome()
+        && split_chroma_is_shared(lu, chroma);
+    let split_chroma_tree =
+        matches!(tu_layout, TuLayout::Split) && !chroma.is_monochrome() && !shared_chroma;
 
     if !chroma.is_monochrome() {
         // Seed the not-yet-coded chroma region with source samples only for the
@@ -2360,6 +4517,7 @@ fn encode_cu<W: CabacWriter>(
                 luma_w: yw_stride,
                 luma_h: coded_yh,
                 luma_ctus_x,
+                min_luma_pu: 8,
                 cur_luma_row: lu_row,
                 cur_luma_col: lu_col,
                 neutral,
@@ -2381,7 +4539,10 @@ fn encode_cu<W: CabacWriter>(
                     luma_w: yw_stride,
                     luma_h: coded_yh,
                     luma_ctus_x,
-                    cur_luma_row: lu_row,
+                    min_luma_pu: 8,
+                    // 4:2:2 lower TB: anchor decode-order at its own luma row so the
+                    // reconstructed upper TB counts as an available above-neighbour.
+                    cur_luma_row: lu_row + ctb * sub_h,
                     cur_luma_col: lu_col,
                     neutral,
                 },
@@ -2488,19 +4649,41 @@ fn encode_cu<W: CabacWriter>(
             full_rdo_chroma_count(&ranked, chroma)
         };
         let mut residual_ctx_after_luma = ctx.clone();
-        if y_nz {
-            // Chroma RDOQ needs the contexts after the already-selected luma
-            // residual, but its bit count is constant across chroma modes. Walk
-            // the syntax with a context-only sink rather than paying for f32
-            // entropy accumulation on every CU.
-            advance_residual_contexts(
-                &mut residual_ctx_after_luma,
-                &scratch.scanned[..num_luma],
-                luma_log2_ts,
-                true,
-                luma_scan_idx,
-                !lossless,
-            );
+        match tu_layout {
+            TuLayout::Unsplit => {
+                let _ = residual_ctx_after_luma.cbf_luma[1].estimate_and_update(y_nz as u8);
+                if y_nz {
+                    advance_residual_contexts(
+                        &mut residual_ctx_after_luma,
+                        &scratch.scanned[..num_luma],
+                        luma_log2_ts,
+                        true,
+                        luma_scan_idx,
+                        !lossless,
+                    );
+                }
+            }
+            TuLayout::Split => {
+                let child = lu / 2;
+                let child_len = child * child;
+                let child_log2 = child.trailing_zeros();
+                for index in 0..4 {
+                    let nonzero = scratch.tu_tree.y_nz[index];
+                    let _ = residual_ctx_after_luma.cbf_luma[0].estimate_and_update(nonzero as u8);
+                    if !nonzero {
+                        continue;
+                    }
+                    let offset = index * child_len;
+                    advance_residual_contexts(
+                        &mut residual_ctx_after_luma,
+                        &scratch.tu_tree.y_zz[offset..offset + child_len],
+                        child_log2,
+                        true,
+                        scratch.tu_tree.y_scan_idx[index],
+                        true,
+                    );
+                }
+            }
         }
 
         let mut evaluate_chroma = |candidate: ChromaModeCandidate,
@@ -2530,7 +4713,10 @@ fn encode_cu<W: CabacWriter>(
                         luma_w: yw_stride,
                         luma_h: coded_yh,
                         luma_ctus_x,
-                        cur_luma_row: lu_row,
+                        min_luma_pu: 8,
+                        // 4:2:2 lower TB (t=1) anchors decode-order at its own luma
+                        // row so the reconstructed upper TB is an available neighbour.
+                        cur_luma_row: lu_row + t * ctb * sub_h,
                         cur_luma_col: lu_col,
                         neutral,
                     },
@@ -2733,16 +4919,12 @@ fn encode_cu<W: CabacWriter>(
         };
 
         let best_chroma = if full_rd_count == 1 {
-            // The proxy winner is clearly separated. Commit it directly with
-            // winner-only chroma RDOQ, avoiding the old scalar trial followed by
-            // an identical prediction/transform/reconstruction replay.
             let winner = ranked[0];
-            let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            if !split_chroma_tree {
+                let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            }
             winner
         } else {
-            // Only genuinely ambiguous blocks pay for one challenger. Trial
-            // modes use scalar quantization; the chosen mode is then replayed
-            // once with winner-only RDOQ.
             let mut winner = ranked[0];
             let mut best_cost = f32::MAX;
             for &candidate in &ranked[..full_rd_count] {
@@ -2752,68 +4934,101 @@ fn encode_cu<W: CabacWriter>(
                     winner = candidate;
                 }
             }
-            let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            if !split_chroma_tree {
+                let _ = evaluate_chroma(winner, false, true, f32::MAX);
+            }
             winner
         };
 
         chroma_tb_scan_idx = dct::scan_idx_for(best_chroma.pred_mode, log2_ctb, false, is_444);
+        if shared_chroma {
+            for index in 0..n_chroma_tb {
+                scratch.tu_tree.chroma_scan_idx[index] = chroma_tb_scan_idx;
+            }
+        } else if split_chroma_tree {
+            commit_split_chroma(
+                scratch,
+                src_cb,
+                src_cr,
+                rec_cb,
+                rec_cr,
+                src_cw,
+                src_ch,
+                cw_stride,
+                coded_ch_h,
+                lu_row,
+                lu_col,
+                lu,
+                yw_stride,
+                coded_yh,
+                chroma,
+                best_chroma.pred_mode,
+                chroma_qp,
+                bit_depth.bits(),
+                max_val,
+                chroma_lambda,
+                &residual_ctx_after_luma,
+            );
+        }
         encode_chroma_mode(enc, ictx, best_chroma.syntax_idx);
     }
 
-    // ── CABAC: transform_tree() syntax ─────────────────────────────────────
-    // split_transform_flag is inferred 0 (max_transform_hierarchy_depth_intra = 0),
-    // so it is not coded — matching x265's parsing.
-    //
-    // cbf order (HEVC §7.3.8.8): for ChromaArrayType==2 (4:2:2) the two stacked
-    // chroma TBs each have their own cbf, signaled cb[0],cb[1] then cr[0],cr[1],
-    // before cbf_luma. For 4:2:0 there is one of each.
-    for t in &scratch.chroma_tbs[..n_chroma_tb] {
-        encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
-    }
-    for t in &scratch.chroma_tbs[..n_chroma_tb] {
-        encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
-    }
-    encode_cbf_luma(enc, ctx, y_nz, 0);
+    // ── CABAC: transform_tree() + transform_unit() ────────────────────────
+    match tu_layout {
+        TuLayout::Unsplit => {
+            // max_transform_hierarchy_depth_intra=1 makes the root flag present
+            // for every 8/16/32 PART_2Nx2N CU. The unsplit path codes zero and
+            // then retains the original component-major root-TU syntax.
+            let split_ctx = split_transform_context(lu);
+            enc.encode_bin(0, &mut ctx.split_transform_flag[split_ctx]);
+            for t in &scratch.chroma_tbs[..n_chroma_tb] {
+                encode_cbf_chroma(enc, ctx, t.cb_nz, 0);
+            }
+            for t in &scratch.chroma_tbs[..n_chroma_tb] {
+                encode_cbf_chroma(enc, ctx, t.cr_nz, 0);
+            }
+            encode_cbf_luma(enc, ctx, y_nz, 0);
 
-    // ── CABAC: residuals (HEVC §7.3.8.11) ─────────────────────────────────
-    // Order: luma, then all Cb chroma TBs, then all Cr chroma TBs (component-major).
-    // Chroma TB size is log2_ctb (2 for 4:2:0/4:2:2, 3 for 4:4:4).
-    if y_nz {
-        encode_residual(
-            enc,
-            ctx,
-            &scratch.scanned[..num_luma],
-            luma_log2_ts,
-            true,
-            luma_scan_idx,
-            !lossless,
-        );
-    }
-    let chroma_scan_idx = chroma_tb_scan_idx;
-    for t in &scratch.chroma_tbs[..n_chroma_tb] {
-        if t.cb_nz {
-            encode_residual(
-                enc,
-                ctx,
-                &t.cb_zz[..ctb * ctb],
-                log2_ctb,
-                false,
-                chroma_scan_idx,
-                !lossless,
-            );
+            if y_nz {
+                encode_residual(
+                    enc,
+                    ctx,
+                    &scratch.scanned[..num_luma],
+                    luma_log2_ts,
+                    true,
+                    luma_scan_idx,
+                    !lossless,
+                );
+            }
+            for t in &scratch.chroma_tbs[..n_chroma_tb] {
+                if t.cb_nz {
+                    encode_residual(
+                        enc,
+                        ctx,
+                        &t.cb_zz[..ctb * ctb],
+                        log2_ctb,
+                        false,
+                        chroma_tb_scan_idx,
+                        !lossless,
+                    );
+                }
+            }
+            for t in &scratch.chroma_tbs[..n_chroma_tb] {
+                if t.cr_nz {
+                    encode_residual(
+                        enc,
+                        ctx,
+                        &t.cr_zz[..ctb * ctb],
+                        log2_ctb,
+                        false,
+                        chroma_tb_scan_idx,
+                        !lossless,
+                    );
+                }
+            }
         }
-    }
-    for t in &scratch.chroma_tbs[..n_chroma_tb] {
-        if t.cr_nz {
-            encode_residual(
-                enc,
-                ctx,
-                &t.cr_zz[..ctb * ctb],
-                log2_ctb,
-                false,
-                chroma_scan_idx,
-                !lossless,
-            );
+        TuLayout::Split => {
+            encode_split_transform_tree(enc, ctx, scratch, lu, chroma, false, shared_chroma, true)
         }
     }
 }
@@ -2834,7 +5049,7 @@ fn code_one_cu<W: CabacWriter>(
     qp: u8,
     lambda: f32,
     mode_map: &mut [u8],
-    blk_stride: usize,
+    mode_stride: usize,
     lossless: bool,
     scratch: &mut CompressionContext,
 ) {
@@ -2860,7 +5075,7 @@ fn code_one_cu<W: CabacWriter>(
         cw_stride: cw,
         src_cw,
         src_ch,
-        blk_stride,
+        mode_stride,
     };
     let src = CuSrcPlanes {
         y: &yuv.y,
@@ -3236,6 +5451,43 @@ mod tests {
             &levels[..16],
             &[1, 3, 6, 10, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6]
         );
+    }
+
+    #[test]
+    fn split_transform_context_matches_hevc_size_context() {
+        assert_eq!(split_transform_context(32), 0);
+        assert_eq!(split_transform_context(16), 1);
+        assert_eq!(split_transform_context(8), 2);
+    }
+
+    #[test]
+    fn split_chroma_sharing_stops_below_minimum_tb() {
+        use crate::fmt::ChromaFormat::{Yuv420, Yuv422, Yuv444};
+
+        assert!(split_chroma_is_shared(8, Yuv420));
+        assert!(split_chroma_is_shared(8, Yuv422));
+        assert!(!split_chroma_is_shared(8, Yuv444));
+        assert!(!split_chroma_is_shared(16, Yuv420));
+    }
+
+    #[test]
+    fn nxn_proxy_rejects_flat_and_accepts_piecewise_residual() {
+        let flat = [96u16; 64];
+        assert!(!choose_nxn_proxy(&flat, &flat, 4.0, 8));
+
+        let mut piecewise = [0u16; 64];
+        for row in 0..8 {
+            for col in 0..8 {
+                piecewise[row * 8 + col] = match (row >= 4, col >= 4) {
+                    (false, false) => 48,
+                    (false, true) => 112,
+                    (true, false) => 176,
+                    (true, true) => 240,
+                };
+            }
+        }
+        let parent = [128u16; 64];
+        assert!(choose_nxn_proxy(&piecewise, &parent, 4.0, 8));
     }
 
     #[test]

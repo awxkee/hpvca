@@ -34,7 +34,7 @@ use super::{
 /// Encode cbf_luma (trafo_depth 0 or 1).
 /// ffmpeg: GET_CABAC(elem_offset[CBF_LUMA] + !trafo_depth)
 /// cbf_luma[0] = trafo_depth != 0, cbf_luma[1] = trafo_depth == 0 (i.e. root TU).
-/// We always call at trafo_depth=0 (root), so use cbf_luma[1].
+/// Root TUs use slot 1; child TUs at any nonzero depth use slot 0.
 pub(crate) fn encode_cbf_luma<W: CabacWriter>(
     enc: &mut W,
     ctx: &mut ContextSet,

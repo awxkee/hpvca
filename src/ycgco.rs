@@ -285,3 +285,56 @@ pub(crate) fn rgb_to_ycgco(
         bit_depth,
     }
 }
+
+pub(crate) fn rgb_to_gbr(
+    rgb: &[u16],
+    width: u32,
+    height: u32,
+    chroma: ChromaFormat,
+    bit_depth: BitDepth,
+) -> Yuv {
+    if chroma.is_monochrome() {
+        return rgb_to_ycgco(rgb, width, height, chroma, bit_depth);
+    }
+    let n = (width as usize) * (height as usize);
+    let channels = rgb.len() / n;
+    let mut g = vec![0u16; n];
+    let mut b = vec![0u16; n];
+    let mut r = vec![0u16; n];
+    match channels {
+        3 => {
+            let (src, _remainder) = rgb.as_chunks::<3>();
+            for (&[red, green, blue], (r, (g, b))) in src
+                .iter()
+                .zip(r.iter_mut().zip(g.iter_mut().zip(b.iter_mut())))
+            {
+                *r = red;
+                *g = green;
+                *b = blue;
+            }
+        }
+        4 => {
+            let (src, _remainder) = rgb.as_chunks::<4>();
+            for (&[red, green, blue, _alpha], (r, (g, b))) in src
+                .iter()
+                .zip(r.iter_mut().zip(g.iter_mut().zip(b.iter_mut())))
+            {
+                *r = red;
+                *g = green;
+                *b = blue;
+            }
+        }
+        _ => unreachable!("unsupported channel count: {channels}"),
+    }
+    Yuv {
+        y: g,
+        cb: b,
+        cr: r,
+        width,
+        height,
+        display_w: width,
+        display_h: height,
+        chroma: ChromaFormat::Yuv444,
+        bit_depth,
+    }
+}

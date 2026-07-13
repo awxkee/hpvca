@@ -552,41 +552,41 @@ fn encode_rgb_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    let mut local_cfg = cfg.clone();
+    if local_cfg.lossless {
+        // Lossless RGB round-trips exactly only as 4:4:4 GBR under the Identity
+        // matrix: chroma subsampling and the YCgCo transform both discard
+        // information (and common decoders can't even invert YCgCo). Force both.
+        local_cfg.chroma = ChromaFormat::Yuv444;
+        force_identity_matrix(&mut local_cfg.color);
+    }
+    let cfg = &local_cfg;
     if needs_tiling(width, height) {
         return encode_rgb_tiled(rgb, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
-    let mut local_cfg = cfg.clone();
     let mut yuv = if enc_w != width || enc_h != height {
         let padded = pad_buf::<3>(rgb, width, height, enc_w, enc_h);
-        if local_cfg.lossless {
-            ycgco::rgb_to_ycgco(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
+        if cfg.lossless {
+            ycgco::rgb_to_gbr(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
         } else {
             yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
         }
+    } else if cfg.lossless {
+        ycgco::rgb_to_gbr(rgb, width, height, cfg.chroma, bit_depth)
     } else {
-        if local_cfg.lossless {
-            ycgco::rgb_to_ycgco(rgb, width, height, cfg.chroma, bit_depth)
-        } else {
-            yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
-        }
+        yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
     };
     yuv = yuv.with_display(width, height);
-    if local_cfg.lossless {
-        force_ycgco_matrix(&mut local_cfg.color);
-    }
-    encode_yuv_raw(&yuv, &local_cfg)
+    encode_yuv_raw(&yuv, cfg)
 }
 
-/// Override the CICP matrix to YCgCo for the lossless RGB path, preserving the
-/// configured primaries/transfer (defaulting to BT.709/sRGB) and **leaving any ICC
-/// profile in place** so a co-set `prof` box still travels with the image.
-fn force_ycgco_matrix(color: &mut ColorMetadata) {
+fn force_identity_matrix(color: &mut ColorMetadata) {
     let base = color.cicp.unwrap_or_else(Cicp::srgb);
     color.cicp = Some(Cicp {
         primaries: base.primaries,
         transfer: base.transfer,
-        matrix: MatrixCoefficients::YCgCo,
+        matrix: MatrixCoefficients::Identity,
         full_range: true,
     });
 }
@@ -924,7 +924,10 @@ fn encode_rgb_tiled(
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
 
     if cfg.lossless {
-        force_ycgco_matrix(&mut cfg.color);
+        // The caller (encode_rgb_wide) has already forced 4:4:4 + Identity; keep
+        // this idempotent guard so a direct call stays lossless too.
+        cfg.chroma = ChromaFormat::Yuv444;
+        force_identity_matrix(&mut cfg.color);
     }
 
     let n = (cols * rows) as usize;
@@ -933,7 +936,7 @@ fn encode_rgb_tiled(
         let col = idx as u32 % cols;
         let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
         let yuv = if cfg.lossless {
-            ycgco::rgb_to_ycgco(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
+            ycgco::rgb_to_gbr(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
         } else {
             yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
         };

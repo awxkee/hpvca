@@ -526,11 +526,6 @@ fn is_available(
 /// `ctu` is the CTU size in this plane and `ctus_x` the CTUs per row; together
 /// with the block size `n` these drive the decode-order availability test so the
 /// encoder never references a neighbor the decoder has not yet reconstructed.
-/// Public wrapper exposing luma decode order for chroma availability mapping.
-pub(crate) fn luma_decode_order(r: usize, c: usize, ctus_x: usize) -> i64 {
-    decode_order(r, c, 8, 64, ctus_x)
-}
-
 /// Shared reference-sample substitution (HEVC §8.4.4.2.1): fill unavailable
 /// reference positions from their available neighbors along the scan order
 /// (bottom-left → corner → top-right). `above`/`left` carry the raw samples;
@@ -604,6 +599,9 @@ pub(crate) struct ChromaRefGeometry {
     pub(crate) luma_w: usize,
     pub(crate) luma_h: usize,
     pub(crate) luma_ctus_x: usize,
+    /// Minimum luma PU side for decode-order availability. Normal CUs use 8;
+    /// 4:4:4 PART_NxN uses 4 for its four chroma PUs.
+    pub(crate) min_luma_pu: usize,
     pub(crate) cur_luma_row: usize,
     pub(crate) cur_luma_col: usize,
     pub(crate) neutral: u16,
@@ -631,6 +629,7 @@ pub(crate) fn get_reference_samples_chroma_pair(
         luma_w,
         luma_h,
         luma_ctus_x,
+        min_luma_pu,
         cur_luma_row,
         cur_luma_col,
         neutral,
@@ -648,7 +647,7 @@ pub(crate) fn get_reference_samples_chroma_pair(
     let mut cr_corner = 0u16;
     let mut avail_corner = false;
 
-    let cur_luma = luma_decode_order(cur_luma_row, cur_luma_col, luma_ctus_x);
+    let cur_luma = decode_order(cur_luma_row, cur_luma_col, min_luma_pu, 64, luma_ctus_x);
     let avail = |nr: i64, nc: i64, block_row: usize| -> bool {
         if nr < 0 || nc < 0 || nr as usize >= chroma_h || nc as usize >= width {
             return false;
@@ -658,7 +657,7 @@ pub(crate) fn get_reference_samples_chroma_pair(
         if lr >= luma_h || lc >= luma_w {
             return false;
         }
-        let nb_luma = luma_decode_order(lr, lc, luma_ctus_x);
+        let nb_luma = decode_order(lr, lc, min_luma_pu, 64, luma_ctus_x);
         if nb_luma < cur_luma {
             return true;
         }
@@ -735,6 +734,9 @@ pub(crate) struct LumaRefGeometry {
     pub(crate) n: usize,
     pub(crate) ctu: usize,
     pub(crate) ctus_x: usize,
+    /// Minimum prediction-unit side used by the decode-order test. Normal
+    /// 2Nx2N CUs use 8; an 8×8 NxN CU uses 4 for its four luma PUs.
+    pub(crate) min_pu: usize,
     pub(crate) neutral: u16,
 }
 
@@ -750,6 +752,7 @@ pub(crate) fn get_reference_samples(
         n,
         ctu,
         ctus_x,
+        min_pu,
         neutral,
     } = geo;
     let width = stride;
@@ -767,7 +770,9 @@ pub(crate) fn get_reference_samples(
     {
         let nr = block_row as i64 - 1;
         let nc = block_col as i64 - 1;
-        if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
+        if is_available(
+            nr, nc, block_row, block_col, min_pu, ctu, ctus_x, width, height,
+        ) {
             corner = plane[(nr as usize) * stride + nc as usize];
             avail_corner = true;
         }
@@ -777,7 +782,9 @@ pub(crate) fn get_reference_samples(
         let nr = block_row as i64 - 1;
         for i in 0..=ext {
             let nc = block_col as i64 + i as i64;
-            if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
+            if is_available(
+                nr, nc, block_row, block_col, min_pu, ctu, ctus_x, width, height,
+            ) {
                 above[i] = plane[(nr as usize) * stride + nc as usize];
                 avail_above[i] = true;
             }
@@ -788,7 +795,9 @@ pub(crate) fn get_reference_samples(
         let nc = block_col as i64 - 1;
         for i in 0..=ext {
             let nr = block_row as i64 + i as i64;
-            if is_available(nr, nc, block_row, block_col, 8, ctu, ctus_x, width, height) {
+            if is_available(
+                nr, nc, block_row, block_col, min_pu, ctu, ctus_x, width, height,
+            ) {
                 left[i] = plane[(nr as usize) * stride + nc as usize];
                 avail_left[i] = true;
             }
@@ -880,6 +889,38 @@ pub(crate) fn reconstruct_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chroma_444_nxn_uses_four_sample_decode_order() {
+        let mut cb = [0u16; 64 * 64];
+        let mut cr = [0u16; 64 * 64];
+        cb[3] = 77;
+        cr[3] = 91;
+
+        let ((_, _, cb_left), (_, _, cr_left)) = get_reference_samples_chroma_pair(
+            &cb,
+            &cr,
+            ChromaRefGeometry {
+                stride: 64,
+                block_row: 0,
+                block_col: 4,
+                chroma_h: 64,
+                n: 4,
+                sub_w: 1,
+                sub_h: 1,
+                luma_w: 64,
+                luma_h: 64,
+                luma_ctus_x: 1,
+                min_luma_pu: 4,
+                cur_luma_row: 0,
+                cur_luma_col: 4,
+                neutral: 0,
+            },
+        );
+
+        assert_eq!(cb_left[0], 77);
+        assert_eq!(cr_left[0], 91);
+    }
 
     #[inline]
     pub(crate) fn predict_angular(
