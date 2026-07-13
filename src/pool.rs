@@ -27,21 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! A small persistent worker pool with a scoped, borrow-friendly API.
-//!
-//! Encoding a picture fans out into many short-lived tasks — grid tiles, HEVC
-//! tiles, and WPP CTU rows. One pool is created per encode (context-local, not a
-//! process-wide global) and feeds all of that encode's parallel regions from a
-//! single queue, so whenever a wavefront stalls its worker simply picks up the
-//! next ready task from any region (e.g. another tile's WPP row) — cores stay
-//! saturated. The pool's threads are joined when it is dropped at the end of the
-//! encode, so no worker threads outlive the work they serve.
-//!
-//! [`ThreadPool::scoped`] mirrors [`std::thread::scope`]: spawned closures may
-//! borrow the caller's stack, and the call blocks (the caller helping to run
-//! tasks) until every task of that scope has finished. That completion barrier is
-//! what makes the internal lifetime erasure sound.
-
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
