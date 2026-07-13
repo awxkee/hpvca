@@ -41,6 +41,7 @@ mod intra;
 mod isobmff;
 mod metadata;
 mod pool;
+mod sao;
 mod ycgco;
 mod yuv;
 

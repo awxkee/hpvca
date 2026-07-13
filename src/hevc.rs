@@ -712,6 +712,7 @@ fn encode_wpp_parallel(
     threads: usize,
     is_last_region: bool,
     pool: &crate::pool::ThreadPool,
+    sao_params: Option<&[crate::sao::SaoParam]>,
 ) -> Vec<Vec<u8>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -826,6 +827,7 @@ fn encode_wpp_parallel(
                     },
                     r,
                     col,
+                    sao_params,
                 );
                 if col == 1 {
                     let _ = sync_ctx[r].set((ctx.clone(), ictx.clone()));
@@ -873,6 +875,7 @@ fn code_one_ctu(
     coding: SliceCoding,
     ctu_row: usize,
     ctu_col: usize,
+    sao_params: Option<&[crate::sao::SaoParam]>,
 ) {
     let Entropy {
         enc: cab,
@@ -898,17 +901,19 @@ fn code_one_ctu(
     let lu_row0 = ctu_row * 64;
     let lu_col0 = ctu_col * 64;
 
-    // SAO is enabled in the SPS/slice but explicitly disabled per CTU.
-    if ctu_col > 0 {
-        cab.encode_bin(0, &mut ctx.sao_merge_flag);
-    }
-    if ctu_row > 0 {
-        cab.encode_bin(0, &mut ctx.sao_merge_flag);
-    }
-    cab.encode_bin(0, &mut ctx.sao_type_idx);
-    if !yuv.chroma.is_monochrome() {
-        cab.encode_bin(0, &mut ctx.sao_type_idx);
-    }
+    let sao_cols = strides.w / 64;
+    let sao = sao_params
+        .and_then(|params| params.get(ctu_row * sao_cols + ctu_col))
+        .copied()
+        .unwrap_or_default();
+    crate::sao::encode_luma(
+        cab,
+        ctx,
+        sao,
+        ctu_col > 0,
+        ctu_row > 0,
+        yuv.bit_depth.bits(),
+    );
 
     // The 64×64 root cannot be a leaf until the encoder has a 64-CU / four-32-TU
     // transform-tree path, so signal the root split and code four 32×32 quadtrees.
@@ -950,7 +955,7 @@ struct RegionOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_region_substreams(
+fn encode_region_pass(
     yuv: &Yuv,
     width: u32,
     height: u32,
@@ -960,6 +965,7 @@ fn encode_region_substreams(
     threads: usize,
     is_last_region: bool,
     pool: &crate::pool::ThreadPool,
+    sao_params: Option<&[crate::sao::SaoParam]>,
 ) -> RegionOutput {
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
@@ -1034,6 +1040,7 @@ fn encode_region_substreams(
                     },
                     ctu_row,
                     ctu_col,
+                    sao_params,
                 );
                 let last = is_last_region && ctu_row == ctus_y - 1 && ctu_col == ctus_x - 1;
                 cab.encode_terminate(last as u8); // end_of_slice_segment_flag
@@ -1068,6 +1075,7 @@ fn encode_region_substreams(
             threads,
             is_last_region,
             pool,
+            sao_params,
         )
     } else {
         let mut substreams: Vec<Vec<u8>> = Vec::with_capacity(ctus_y);
@@ -1109,6 +1117,7 @@ fn encode_region_substreams(
                     },
                     ctu_row,
                     ctu_col,
+                    sao_params,
                 );
                 if ctu_col == 1 {
                     this_sync = Some((ctx.clone(), ictx.clone()));
@@ -1157,6 +1166,91 @@ fn encode_region_substreams(
         #[cfg(test)]
         unfiltered_y,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_region_substreams(
+    yuv: &Yuv,
+    width: u32,
+    height: u32,
+    qp: u8,
+    lossless: bool,
+    wpp: bool,
+    threads: usize,
+    is_last_region: bool,
+    pool: &crate::pool::ThreadPool,
+) -> RegionOutput {
+    if lossless {
+        return encode_region_pass(
+            yuv,
+            width,
+            height,
+            qp,
+            true,
+            wpp,
+            threads,
+            is_last_region,
+            pool,
+            None,
+        );
+    }
+
+    // SAO syntax precedes coding_tree_unit(), while its statistics are defined
+    // on the fully reconstructed, deblocked picture. A deterministic analysis
+    // pass resolves that ordering without feeding SAO pixels into intra
+    // prediction. The real pass then writes the selected CTU parameters.
+    let analysis = encode_region_pass(
+        yuv,
+        width,
+        height,
+        qp,
+        false,
+        wpp,
+        threads,
+        is_last_region,
+        pool,
+        None,
+    );
+    let stride = ((width + 63) & !63) as usize;
+    let coded_h = ((height + 63) & !63) as usize;
+    let original = pad_plane(
+        &yuv.y,
+        yuv.width as usize,
+        yuv.height as usize,
+        stride,
+        coded_h,
+    );
+    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
+    let params = crate::sao::analyze_luma(
+        &original,
+        &analysis.y,
+        stride,
+        width as usize,
+        height as usize,
+        yuv.bit_depth.bits(),
+        lambda,
+    );
+    let mut output = encode_region_pass(
+        yuv,
+        width,
+        height,
+        qp,
+        false,
+        wpp,
+        threads,
+        is_last_region,
+        pool,
+        Some(&params),
+    );
+    crate::sao::apply_luma(
+        &mut output.y,
+        stride,
+        width as usize,
+        height as usize,
+        yuv.bit_depth.bits(),
+        &params,
+    );
+    output
 }
 
 /// Post-emulation-prevention byte length of each substream as it will appear in the
@@ -1247,7 +1341,7 @@ fn build_idr_slice(
     // §7.3.6.1), so it is omitted for monochrome.
     hdr.write_bit(true); // slice_sao_luma_flag   = 1
     if !yuv.chroma.is_monochrome() {
-        hdr.write_bit(true); // slice_sao_chroma_flag = 1
+        hdr.write_bit(false); // slice_sao_chroma_flag = 0 (luma SAO search only)
     }
     // QP is carried fully in the PPS init_qp_minus26, so slice_qp_delta = 0.
     hdr.write_se(0); // slice_qp_delta
