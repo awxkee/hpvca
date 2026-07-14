@@ -1056,6 +1056,7 @@ fn encode_region_pass(
     sao_params: Option<&[crate::sao::SaoParam]>,
     aq_offsets: &[i8],
     sao_enabled: bool,
+    scratch: &mut CompressionContext,
 ) -> RegionOutput {
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
@@ -1074,7 +1075,6 @@ fn encode_region_pass(
     let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
     let mut edge_v = vec![false; (w / 4) * (h / 4)];
     let mut edge_h = vec![false; (w / 4) * (h / 4)];
-    let mut scratch = Box::new(CompressionContext::new());
     let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
     let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
         (Vec::new(), Vec::new())
@@ -1130,7 +1130,7 @@ fn encode_region_pass(
                         cu_stride,
                         mode_stride,
                     },
-                    &mut scratch,
+                    scratch,
                     strides,
                     SliceCoding {
                         qp,
@@ -1221,7 +1221,7 @@ fn encode_region_pass(
                         cu_stride,
                         mode_stride,
                     },
-                    &mut scratch,
+                    scratch,
                     strides,
                     SliceCoding {
                         qp,
@@ -1321,12 +1321,21 @@ fn encode_region_substreams(
     sao_enabled: bool,
     variance_boost: crate::VarianceBoost,
 ) -> RegionOutput {
+    let mut scratch = Box::new(CompressionContext::new());
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact CTU-offset table.
     let ctus_x = (((width + 63) & !63) / 64) as usize;
     let ctus_y = (((height + 63) & !63) / 64) as usize;
     let aq_offsets = if activity_aq_enabled(qp, lossless) {
-        activity_qp_offsets(yuv, ctus_x, ctus_y, qp, false, variance_boost)
+        activity_qp_offsets(
+            yuv,
+            ctus_x,
+            ctus_y,
+            qp,
+            false,
+            variance_boost,
+            scratch.ctu_activity,
+        )
     } else {
         Vec::new()
     };
@@ -1344,6 +1353,7 @@ fn encode_region_substreams(
             None,
             &aq_offsets,
             false,
+            &mut scratch,
         );
     }
 
@@ -1364,6 +1374,7 @@ fn encode_region_substreams(
         None,
         &aq_offsets,
         true,
+        &mut scratch,
     );
     let stride = ((width + 63) & !63) as usize;
     let coded_h = ((height + 63) & !63) as usize;
@@ -1397,6 +1408,7 @@ fn encode_region_substreams(
         Some(&params),
         &aq_offsets,
         true,
+        &mut scratch,
     );
     crate::sao::apply_luma(
         &mut output.y,
@@ -2649,6 +2661,7 @@ enum TuLayout {
 #[repr(align(64))]
 struct CompressionContext {
     satd: crate::cost::SatdFn,
+    ctu_activity: crate::aq::CtuActivityFn,
     fwd_transform: crate::hevc_transform::FwdTransformFn,
     inv_transform: crate::hevc_transform::InvTransformFn,
     dequantize: crate::hevc_transform::DequantizeFn,
@@ -2678,6 +2691,7 @@ impl CompressionContext {
     fn new() -> Self {
         Self {
             satd: crate::cost::resolve_satd(),
+            ctu_activity: crate::aq::resolve_ctu_activity(),
             fwd_transform: crate::hevc_transform::resolve_fwd_transform(),
             inv_transform: crate::hevc_transform::resolve_inv_transform(),
             dequantize: crate::hevc_transform::resolve_dequantize(),
@@ -5611,12 +5625,13 @@ fn encode_split_transform_tree<W: CabacWriter>(
         let mut need_qp = y_nz;
         if !chroma.is_monochrome() {
             if shared_chroma {
-                if child_index == 3 {
-                    need_qp = need_qp
-                        || scratch.chroma_tbs[..stacked]
-                            .iter()
-                            .any(|tb| tb.cb_nz || tb.cr_nz);
-                }
+                // The root chroma CBF applies to every child transform unit.
+                // Consequently cu_qp_delta is present at the first child even
+                // though the shared chroma coefficients themselves are emitted
+                // after the fourth luma child.
+                need_qp = need_qp
+                    || root_cb_nz[..root_count].iter().any(|&nonzero| nonzero)
+                    || root_cr_nz[..root_count].iter().any(|&nonzero| nonzero);
             } else {
                 for stack_index in 0..stacked {
                     let index = child_index * stacked + stack_index;
@@ -7352,6 +7367,58 @@ mod tests {
         encode_cu_qp_delta(&mut trace, &mut ctx, &mut aq);
         assert_eq!(trace.regular, [1, 1, 1, 0]);
         assert_eq!(trace.bypass, [1]);
+        assert!(aq.coded);
+    }
+
+    #[test]
+    fn shared_chroma_codes_qp_delta_at_first_luma_leaf() {
+        struct Trace {
+            qp_context: *const crate::cabac::engine::CtxModel,
+            regular_bins: usize,
+            qp_bin_at: Option<usize>,
+        }
+        impl CabacWriter for Trace {
+            fn encode_bin(&mut self, bin_val: u8, ctx: &mut crate::cabac::engine::CtxModel) {
+                if std::ptr::eq(ctx, self.qp_context) && self.qp_bin_at.is_none() {
+                    self.qp_bin_at = Some(self.regular_bins);
+                }
+                self.regular_bins += 1;
+                ctx.update(bin_val);
+            }
+            fn encode_bypass(&mut self, _bin_val: u8) {}
+        }
+
+        let mut ctx = ContextSet::init_islice(38);
+        let mut trace = Trace {
+            qp_context: std::ptr::addr_of!(ctx.cu_qp_delta_abs[0]),
+            regular_bins: 0,
+            qp_bin_at: None,
+        };
+        let mut scratch = CompressionContext::new();
+        scratch.chroma_tbs[0].cb_nz = true;
+        scratch.chroma_tbs[0].cb_zz[0] = 1;
+        let mut aq = AqCtuState {
+            enabled: true,
+            predictor: 38,
+            target: 35,
+            coded: false,
+        };
+
+        encode_split_transform_tree(
+            &mut trace,
+            &mut ctx,
+            &scratch,
+            8,
+            crate::fmt::ChromaFormat::Yuv420,
+            true,
+            true,
+            false,
+            &mut aq,
+        );
+
+        // root cbf_cb, root cbf_cr, then the first child's cbf_luma. The QP
+        // delta must immediately follow, before any residual syntax.
+        assert_eq!(trace.qp_bin_at, Some(3));
         assert!(aq.coded);
     }
 

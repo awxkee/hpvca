@@ -319,7 +319,7 @@ pub(crate) fn ctu_activity_scalar(
 }
 
 #[inline]
-fn resolve_ctu_activity() -> CtuActivityFn {
+pub(crate) fn resolve_ctu_activity() -> CtuActivityFn {
     *CTU_ACTIVITY.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
@@ -344,11 +344,6 @@ fn resolve_ctu_activity() -> CtuActivityFn {
 }
 
 #[inline]
-fn ctu_activity(yuv: &Yuv, ctu_row: usize, ctu_col: usize, octile: u8) -> CtuActivity {
-    unsafe { resolve_ctu_activity()(yuv, ctu_row, ctu_col, octile) }
-}
-
-#[inline]
 pub(crate) fn activity_aq_enabled(qp: u8, lossless: bool) -> bool {
     !lossless && qp >= 24
 }
@@ -360,6 +355,7 @@ pub(crate) fn activity_qp_offsets(
     qp: u8,
     lossless: bool,
     variance_boost: VarianceBoost,
+    ctu_activity: CtuActivityFn,
 ) -> Vec<i8> {
     if !activity_aq_enabled(qp, lossless) {
         return Vec::new();
@@ -367,7 +363,9 @@ pub(crate) fn activity_qp_offsets(
     let mut activity = Vec::with_capacity(ctus_x * ctus_y);
     for row in 0..ctus_y {
         for col in 0..ctus_x {
-            activity.push(ctu_activity(yuv, row, col, variance_boost.octile));
+            // SAFETY: dispatch targets share the slice-based scalar contract and
+            // handle partial CTUs at the coded-picture edges.
+            activity.push(unsafe { ctu_activity(yuv, row, col, variance_boost.octile) });
         }
     }
     let mean = activity
@@ -444,7 +442,15 @@ mod tests {
             chroma: ChromaFormat::Monochrome,
             bit_depth: BitDepth::Eight,
         };
-        let offsets = activity_qp_offsets(&yuv, 2, 1, 38, false, VarianceBoost::default());
+        let offsets = activity_qp_offsets(
+            &yuv,
+            2,
+            1,
+            38,
+            false,
+            VarianceBoost::default(),
+            ctu_activity_scalar,
+        );
         assert!(
             offsets[0] < 0,
             "flat CTU should spend more bits: {offsets:?}"
