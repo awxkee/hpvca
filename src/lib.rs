@@ -82,6 +82,27 @@ pub enum ParallelismStrategy {
     GridWpp,
 }
 
+/// Variance-boost controls for low-contrast detail preservation.
+#[derive(Clone, Copy, Debug)]
+pub struct VarianceBoost {
+    /// Ranked 8x8 variance octile selected inside each 64x64 CTU (1..=8).
+    pub octile: u8,
+    /// Boost curve strength (0 disables variance boost; 1..=4 are typical).
+    pub strength: f32,
+    /// Apply only negative QP boosts instead of combining them with activity AQ.
+    pub boost_only: bool,
+}
+
+impl Default for VarianceBoost {
+    fn default() -> Self {
+        Self {
+            octile: 6,
+            strength: 2.0,
+            boost_only: false,
+        }
+    }
+}
+
 impl ParallelismStrategy {
     /// Whether a picture large enough to tile is coded as a HEIF grid.
     fn uses_grid(self) -> bool {
@@ -139,6 +160,8 @@ pub struct EncodeConfig {
     /// analysis encode before the final encode, so disabling it nearly halves
     /// the transform/RDO work at a small compression-efficiency cost.
     pub sao: bool,
+    /// Low-contrast variance-boost settings.
+    pub variance_boost: VarianceBoost,
 }
 
 impl Default for EncodeConfig {
@@ -152,6 +175,7 @@ impl Default for EncodeConfig {
             threads: 0, // auto-detect
             parallelism: ParallelismStrategy::GridWpp,
             sao: true,
+            variance_boost: VarianceBoost::default(),
         }
     }
 }
@@ -183,6 +207,18 @@ impl EncodeConfig {
     /// Enable or disable luma Sample Adaptive Offset filtering.
     pub fn with_sao(mut self, sao: bool) -> Self {
         self.sao = sao;
+        self
+    }
+
+    /// Configure low-contrast variance boost. `octile` is 1..=8, typical
+    /// `strength` values are 1..=4 (0 disables it), and `boost_only` disables
+    /// the ordinary activity-masking redistribution.
+    pub fn with_variance_boost(mut self, octile: u8, strength: f32, boost_only: bool) -> Self {
+        self.variance_boost = VarianceBoost {
+            octile,
+            strength,
+            boost_only,
+        };
         self
     }
 
@@ -240,7 +276,14 @@ impl EncodeConfig {
     }
 
     fn validate(&self) -> Result<(), EncodeError> {
-        validate_quality(self.quality)
+        validate_quality(self.quality)?;
+        if !(1..=8).contains(&self.variance_boost.octile)
+            || !self.variance_boost.strength.is_finite()
+            || !(0.0..=4.0).contains(&self.variance_boost.strength)
+        {
+            return Err(EncodeError::InvalidInput);
+        }
+        Ok(())
     }
 }
 
@@ -693,6 +736,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -704,6 +748,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -790,6 +835,7 @@ fn encode_gray_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -801,6 +847,7 @@ fn encode_gray_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -839,6 +886,7 @@ pub fn encode_yuv_with_alpha(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -858,6 +906,7 @@ pub fn encode_yuv_with_alpha(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
+        cfg.variance_boost,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -886,6 +935,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         cfg.parallelism.single_tiles(),
         resolve_threads(cfg.threads),
         cfg.sao,
+        cfg.variance_boost,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -981,11 +1031,24 @@ fn encode_cell(
     cicp: Option<Cicp>,
     cell_wpp: bool,
     sao: bool,
+    variance_boost: VarianceBoost,
 ) -> Result<hevc::NaluStream, EncodeError> {
     if cell_wpp {
-        hevc::encode_intra_opts(yuv, w, h, quality, lossless, cicp, true, false, 1, sao)
+        hevc::encode_intra_opts(
+            yuv,
+            w,
+            h,
+            quality,
+            lossless,
+            cicp,
+            true,
+            false,
+            1,
+            sao,
+            variance_boost,
+        )
     } else {
-        hevc::encode_intra(yuv, w, h, quality, lossless, cicp, sao)
+        hevc::encode_intra(yuv, w, h, quality, lossless, cicp, sao, variance_boost)
     }
 }
 
@@ -1031,6 +1094,7 @@ fn encode_rgb_tiled(
             cfg.color.cicp,
             cell_wpp,
             cfg.sao,
+            cfg.variance_boost,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1086,6 +1150,7 @@ fn encode_gray_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1170,6 +1235,7 @@ fn encode_yuv_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1190,6 +1256,7 @@ fn encode_yuv_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1283,6 +1350,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cfg.color.cicp,
             cell_wpp,
             cfg.sao,
+            cfg.variance_boost,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1349,6 +1417,7 @@ fn encode_rgba_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1368,6 +1437,7 @@ fn encode_rgba_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1444,6 +1514,7 @@ fn encode_gray_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1462,6 +1533,7 @@ fn encode_gray_alpha_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cfg.sao,
+            cfg.variance_boost,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
@@ -1646,6 +1718,25 @@ mod tests {
         assert!(cfg().with_quality(101).validate().is_err());
         assert!(cfg().with_quality(1).validate().is_ok());
         assert!(cfg().with_quality(100).validate().is_ok());
+    }
+
+    #[test]
+    fn validates_variance_boost_options() {
+        assert!(cfg().with_variance_boost(6, 2.0, false).validate().is_ok());
+        assert!(cfg().with_variance_boost(0, 2.0, false).validate().is_err());
+        assert!(cfg().with_variance_boost(9, 2.0, false).validate().is_err());
+        assert!(
+            cfg()
+                .with_variance_boost(6, -1.0, false)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg()
+                .with_variance_boost(6, f32::NAN, false)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
