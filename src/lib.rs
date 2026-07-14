@@ -150,11 +150,11 @@ pub struct EncodeConfig {
     pub color: ColorMetadata,
     /// Optional image metadata (orientation, HDR light level, EXIF).
     pub metadata: Metadata,
-    /// Preferred number of worker threads for encoding large images that are
-    /// split into a grid of tiles. Tiles are independent, so they are encoded in
-    /// parallel; the output is identical regardless of this value. `0` means
-    /// "auto": use the number of hardware threads reported by the platform
-    /// (falling back to 1). Images small enough not to be tiled ignore this.
+    /// Preferred total encoder parallelism. Grid cells are encoded concurrently;
+    /// with [`ParallelismStrategy::GridWpp`], spare capacity is divided between
+    /// their WPP row encoders without exceeding this total. The output is
+    /// identical regardless of this value. `0` means "auto": use the number of
+    /// hardware threads reported by the platform (falling back to 1).
     pub threads: usize,
     /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
     /// defaults to [`ParallelismStrategy::Auto`].
@@ -991,16 +991,24 @@ fn parallel_try_map<T, E, F>(n: usize, threads: usize, f: F) -> Result<Vec<T>, E
 where
     T: Send,
     E: Send,
-    F: Fn(usize) -> Result<T, E> + Sync,
+    F: Fn(usize, usize) -> Result<T, E> + Sync,
 {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let nthreads = resolve_threads(threads).clamp(1, n);
+    let total_threads = resolve_threads(threads);
+    let nthreads = total_threads.clamp(1, n);
     if nthreads == 1 {
         // Sequential fast path: no scheduling, no allocation of slots.
-        return (0..n).map(&f).collect();
+        return (0..n).map(|index| f(index, total_threads)).collect();
     }
+
+    // Grid cells are the outer scheduling units. When there are fewer cells
+    // than available threads, divide the unused capacity between their WPP row
+    // encoders. The sum of all simultaneously active cell budgets is at most
+    // `total_threads`, so nested pools do not oversubscribe the machine.
+    let threads_per_item = total_threads / nthreads;
+    let extra_threads = total_threads % nthreads;
 
     // One task per item on a context-local pool; `slots.iter_mut()` hands each task
     // a disjoint slot, and the pool load-balances items of uneven cost across cores.
@@ -1010,8 +1018,9 @@ where
     let pool = pool::ThreadPool::new(nthreads.saturating_sub(1));
     pool.scoped(|scope| {
         for (i, slot) in slots.iter_mut().enumerate() {
+            let item_threads = threads_per_item + usize::from(i < extra_threads);
             scope.spawn(move || {
-                *slot = Some(f(i));
+                *slot = Some(f(i, item_threads));
             });
         }
     });
@@ -1033,10 +1042,15 @@ fn encode_cell(
     lossless: bool,
     cicp: Option<Cicp>,
     cell_wpp: bool,
+    threads: usize,
     sao: bool,
     variance_boost: VarianceBoost,
 ) -> Result<hevc::NaluStream, EncodeError> {
     if cell_wpp {
+        // A WPP picture cannot run more CTU rows concurrently than it has.
+        // Capping here avoids creating idle nested workers on high-core-count
+        // systems encoding the fixed 512-pixel grid cells.
+        let wpp_threads = threads.min(h.div_ceil(64) as usize).max(1);
         hevc::encode_intra_opts(
             yuv,
             w,
@@ -1046,7 +1060,7 @@ fn encode_cell(
             cicp,
             true,
             false,
-            1,
+            wpp_threads,
             sao,
             variance_boost,
         )
@@ -1079,7 +1093,7 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
-    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
@@ -1096,6 +1110,7 @@ fn encode_rgb_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )
@@ -1130,9 +1145,10 @@ fn encode_gray_tiled(
     validate_buf_u16(gray, width, height, 1)?;
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
-    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         let luma = extract_plane_tile(
@@ -1145,13 +1161,15 @@ fn encode_gray_tiled(
             TILE_SIZE as usize,
         );
         let yuv = build_mono_yuv(luma, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth);
-        hevc::encode_intra(
+        encode_cell(
             &yuv,
             TILE_SIZE,
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )
@@ -1179,6 +1197,7 @@ fn encode_yuv_alpha_tiled(
     alpha: &[u16],
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
     let cols = yuv.display_w.div_ceil(TILE_SIZE);
     let rows = yuv.display_h.div_ceil(TILE_SIZE);
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, yuv.chroma);
@@ -1193,7 +1212,7 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+    let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         let x0 = (col * TILE_SIZE) as usize;
@@ -1230,13 +1249,15 @@ fn encode_yuv_alpha_tiled(
             chroma: yuv.chroma,
             bit_depth: yuv.bit_depth,
         };
-        let color = hevc::encode_intra(
+        let color = encode_cell(
             &tile_yuv,
             enc_tw,
             enc_th,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1251,13 +1272,15 @@ fn encode_yuv_alpha_tiled(
             enc_th as usize,
         );
         let alpha_yuv = build_mono_yuv(alpha_tile, enc_tw, enc_th, enc_tw, enc_th, yuv.bit_depth);
-        let alpha = hevc::encode_intra(
+        let alpha = encode_cell(
             &alpha_yuv,
             enc_tw,
             enc_th,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1307,7 +1330,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let tile_streams = parallel_try_map(n, cfg.threads, |idx| {
+    let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         let x0 = (col * TILE_SIZE) as usize;
@@ -1352,6 +1375,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cfg.lossless,
             cfg.color.cicp,
             cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )
@@ -1383,13 +1407,14 @@ fn encode_rgba_alpha_tiled(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+    let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         // Extract a TILE_SIZE×TILE_SIZE RGBA tile (4 ch) with edge replication.
@@ -1412,13 +1437,15 @@ fn encode_rgba_alpha_tiled(
         }
 
         let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_tw, enc_th, cfg.chroma, bit_depth);
-        let color = hevc::encode_intra(
+        let color = encode_cell(
             &color_yuv,
             enc_tw,
             enc_th,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1432,13 +1459,15 @@ fn encode_rgba_alpha_tiled(
             TILE_SIZE,
             bit_depth,
         );
-        let alpha = hevc::encode_intra(
+        let alpha = encode_cell(
             &alpha_yuv,
             TILE_SIZE,
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1483,10 +1512,11 @@ fn encode_gray_alpha_tiled(
     validate_buf_u16(ya, width, height, 2)?;
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
+    let cell_wpp = cfg.parallelism.grid_cell_wpp();
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let pairs = parallel_try_map(n, cfg.threads, |idx| {
+    let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
         // Extract a TILE_SIZE×TILE_SIZE YA tile (2 ch) with edge replication.
@@ -1509,13 +1539,15 @@ fn encode_gray_alpha_tiled(
         let luma_yuv = build_mono_yuv(
             luma_plane, TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE, bit_depth,
         );
-        let luma = hevc::encode_intra(
+        let luma = encode_cell(
             &luma_yuv,
             TILE_SIZE,
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1528,13 +1560,15 @@ fn encode_gray_alpha_tiled(
             TILE_SIZE,
             bit_depth,
         );
-        let alpha = hevc::encode_intra(
+        let alpha = encode_cell(
             &alpha_yuv,
             TILE_SIZE,
             TILE_SIZE,
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cell_wpp,
+            cell_threads,
             cfg.sao,
             cfg.variance_boost,
         )?;
@@ -1696,6 +1730,19 @@ fn pad_buf<const N: usize>(src: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_thread_budgets_use_capacity_without_oversubscription() {
+        let four_cells = parallel_try_map::<usize, (), _>(4, 10, |_, budget| Ok(budget)).unwrap();
+        assert_eq!(four_cells, [3, 3, 2, 2]);
+        assert_eq!(four_cells.iter().sum::<usize>(), 10);
+
+        let many_cells = parallel_try_map::<usize, (), _>(12, 8, |_, budget| Ok(budget)).unwrap();
+        assert_eq!(many_cells, [1; 12]);
+
+        let one_cell = parallel_try_map::<usize, (), _>(1, 8, |_, budget| Ok(budget)).unwrap();
+        assert_eq!(one_cell, [8]);
+    }
 
     fn cfg() -> EncodeConfig {
         EncodeConfig::new()

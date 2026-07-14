@@ -34,16 +34,49 @@ pub(crate) unsafe fn satd_avx2(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     assert!(matches!(n, 4 | 8 | 16 | 32));
     assert!(orig.len() >= n * n && pred.len() >= n * n);
 
+    if n == 4 {
+        return unsafe { satd_4x4(orig.as_ptr(), pred.as_ptr(), 4) };
+    }
+
     let mut total = 0u32;
     for by in (0..n).step_by(4) {
-        for bx in (0..n).step_by(4) {
+        for bx in (0..n).step_by(8) {
             let offset = by * n + bx;
             // SAFETY: the slice checks above and 4-pixel tiling guarantee that
-            // every 64-bit row load is in bounds. The resolver checks AVX2.
-            total += unsafe { satd_4x4(orig.as_ptr().add(offset), pred.as_ptr().add(offset), n) };
+            // every 128-bit row load is in bounds. The resolver checks AVX2.
+            total += unsafe { satd_4x8(orig.as_ptr().add(offset), pred.as_ptr().add(offset), n) };
         }
     }
     total
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn hadamard4x2(row: __m256i) -> __m256i {
+    let opposite = _mm256_shuffle_epi32(row, 0b01_00_11_10);
+    let pair_add = _mm256_add_epi32(row, opposite);
+    let pair_sub = _mm256_sub_epi32(row, opposite);
+    let butterfly = _mm256_unpacklo_epi64(pair_add, pair_sub);
+    let adjacent = _mm256_shuffle_epi32(butterfly, 0b10_11_00_01);
+    let sum = _mm256_add_epi32(butterfly, adjacent);
+    let difference = _mm256_sub_epi32(butterfly, adjacent);
+    let difference = _mm256_shuffle_epi32(difference, 0b10_10_00_00);
+    _mm256_blend_epi32(sum, difference, 0b1010_1010)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn transpose4x2(rows: [__m256i; 4]) -> [__m256i; 4] {
+    let t0 = _mm256_unpacklo_epi32(rows[0], rows[1]);
+    let t1 = _mm256_unpackhi_epi32(rows[0], rows[1]);
+    let t2 = _mm256_unpacklo_epi32(rows[2], rows[3]);
+    let t3 = _mm256_unpackhi_epi32(rows[2], rows[3]);
+    [
+        _mm256_unpacklo_epi64(t0, t2),
+        _mm256_unpackhi_epi64(t0, t2),
+        _mm256_unpacklo_epi64(t1, t3),
+        _mm256_unpackhi_epi64(t1, t3),
+    ]
 }
 
 #[inline]
@@ -100,6 +133,27 @@ unsafe fn satd_4x4(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
     (sum + 1) >> 1
 }
 
+#[target_feature(enable = "avx2")]
+unsafe fn satd_4x8(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
+    let mut rows = [_mm256_setzero_si256(); 4];
+    for (row, dst) in rows.iter_mut().enumerate() {
+        let o16 = unsafe { _mm_loadu_si128(orig.add(row * stride).cast()) };
+        let p16 = unsafe { _mm_loadu_si128(pred.add(row * stride).cast()) };
+        let difference = _mm256_sub_epi32(_mm256_cvtepu16_epi32(o16), _mm256_cvtepu16_epi32(p16));
+        *dst = hadamard4x2(difference);
+    }
+
+    let mut coefficients = _mm256_setzero_si256();
+    for row in transpose4x2(rows) {
+        coefficients = _mm256_add_epi32(coefficients, _mm256_abs_epi32(hadamard4x2(row)));
+    }
+    let pairs = _mm256_hadd_epi32(coefficients, coefficients);
+    let sums = _mm256_hadd_epi32(pairs, pairs);
+    let first = _mm_cvtsi128_si32(_mm256_castsi256_si128(sums)) as u32;
+    let second = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(sums)) as u32;
+    ((first + 1) >> 1) + ((second + 1) >> 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,14 +165,27 @@ mod tests {
         }
         let mut orig = [0u16; 1024];
         let mut pred = [0u16; 1024];
-        for i in 0..orig.len() {
-            orig[i] = ((i * 251 + i / 5 * 17 + 4095) & 4095) as u16;
-            pred[i] = ((i * 43 + i / 11 * 197) & 4095) as u16;
-        }
-        for n in [4, 8, 16, 32] {
-            let scalar = unsafe { crate::cost::satd_scalar(&orig[..n * n], &pred[..n * n], n) };
-            let simd = unsafe { satd_avx2(&orig[..n * n], &pred[..n * n], n) };
-            assert_eq!(simd, scalar, "SATD mismatch for {n}x{n}");
+        for seed in 0..32u32 {
+            let mut state = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+            for (index, (orig, pred)) in orig.iter_mut().zip(&mut pred).enumerate() {
+                state = state.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                *orig = if seed == 0 {
+                    4095
+                } else {
+                    ((state >> 16) & 4095) as u16
+                };
+                state ^= (index as u32).wrapping_mul(277_803_737);
+                *pred = if seed == 0 {
+                    0
+                } else {
+                    ((state >> 12) & 4095) as u16
+                };
+            }
+            for n in [4, 8, 16, 32] {
+                let scalar = crate::cost::satd_scalar(&orig[..n * n], &pred[..n * n], n);
+                let simd = unsafe { satd_avx2(&orig[..n * n], &pred[..n * n], n) };
+                assert_eq!(simd, scalar, "SATD mismatch for seed={seed}, {n}x{n}");
+            }
         }
     }
 }

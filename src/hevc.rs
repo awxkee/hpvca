@@ -6001,13 +6001,6 @@ fn encode_cu<W: CabacWriter>(
         },
     );
 
-    // Two-stage intra mode decision:
-    //   1. rank all 35 modes with SATD + sqrt(lambda) * estimated mode bins;
-    //   2. reconstruction-RDO an adaptively bounded subset of the HM-style
-    //      shortlist using fractional CABAC costs, not the real arithmetic coder.
-    //
-    // The selected winner alone enters RDOQ. Its prediction, residual, and forward
-    // transform are cached here so committing the CU does not repeat that work.
     let num_luma = lu * lu;
     match lu {
         32 => extract_block_n_into::<32>(src_y, src_yw, src_yh, lu_row, lu_col, &mut scratch.orig),
@@ -6050,16 +6043,58 @@ fn encode_cu<W: CabacWriter>(
         cost: f32::MAX,
     }; MAX_RMD_MODES];
     let mut mode_costs = [f32::MAX; 35];
-
-    // Every mode is visited exactly once, so avoid the tested-mode bitmap and
-    // closure dispatch from the previous implementation.
-    for mode in 0u8..35 {
+    let mut tested = [false; 35];
+    let mut test_mode = |mode: u8| {
+        let index = mode as usize;
+        if tested[index] {
+            return mode_costs[index];
+        }
+        tested[index] = true;
         predict_luma(mode, &mut scratch.pred, &mut scratch.angular);
         let satd = scratch.satd(&scratch.orig[..num_luma], &scratch.pred[..num_luma], lu) as f32;
         let cost = satd + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
-        mode_costs[mode as usize] = cost;
+        mode_costs[index] = cost;
         update_intra_candidate(&mut rmd[..fast_mode_count], mode, cost);
+        cost
+    };
+
+    // The angular SATD surface is locally smooth. Sample it every four modes,
+    // then refine the strongest coarse directions by ±1/±2. 8x8 blocks retain
+    // one extra direction because their larger RMD shortlist is more sensitive
+    // to local texture. Planar, DC, horizontal and vertical are in the coarse
+    // set, and every MPM is added explicitly below.
+    const COARSE_MODES: [u8; 11] = [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34];
+    let refined_directions = if lu == 8 { 3 } else { 2 };
+    let mut coarse_directions = [IntraModeCandidate {
+        mode: 2,
+        cost: f32::MAX,
+    }; 3];
+    for mode in COARSE_MODES {
+        let cost = test_mode(mode);
+        if mode >= 2 {
+            update_intra_candidate(&mut coarse_directions[..refined_directions], mode, cost);
+        }
     }
+    for candidate in &coarse_directions[..refined_directions] {
+        for delta in [-2i16, -1, 1, 2] {
+            let mode = candidate.mode as i16 + delta;
+            if (2..=34).contains(&mode) {
+                test_mode(mode as u8);
+            }
+        }
+    }
+    for &mode in &mpm {
+        test_mode(mode);
+    }
+    debug_assert!(mpm.iter().all(|&mode| tested[mode as usize]));
+    debug_assert!(
+        rmd[..fast_mode_count]
+            .iter()
+            .all(|candidate| candidate.cost.is_finite())
+    );
+    debug_assert!(
+        tested.iter().filter(|&&was_tested| was_tested).count() <= if lu == 8 { 26 } else { 22 }
+    );
 
     let mut rd_candidates = [IntraModeCandidate {
         mode: PLANAR,
