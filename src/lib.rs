@@ -135,6 +135,10 @@ pub struct EncodeConfig {
     /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
     /// defaults to [`ParallelismStrategy::Auto`].
     pub parallelism: ParallelismStrategy,
+    /// Enable luma Sample Adaptive Offset filtering. SAO currently requires an
+    /// analysis encode before the final encode, so disabling it nearly halves
+    /// the transform/RDO work at a small compression-efficiency cost.
+    pub sao: bool,
 }
 
 impl Default for EncodeConfig {
@@ -147,6 +151,7 @@ impl Default for EncodeConfig {
             metadata: Metadata::default(),
             threads: 0, // auto-detect
             parallelism: ParallelismStrategy::GridWpp,
+            sao: true,
         }
     }
 }
@@ -172,6 +177,12 @@ impl EncodeConfig {
     /// In this mode [`quality`](Self::quality) is ignored.
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
+        self
+    }
+
+    /// Enable or disable luma Sample Adaptive Offset filtering.
+    pub fn with_sao(mut self, sao: bool) -> Self {
+        self.sao = sao;
         self
     }
 
@@ -681,6 +692,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -691,6 +703,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -776,6 +789,7 @@ fn encode_gray_alpha_wide(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -786,6 +800,7 @@ fn encode_gray_alpha_wide(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -823,6 +838,7 @@ pub fn encode_yuv_with_alpha(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -841,6 +857,7 @@ pub fn encode_yuv_with_alpha(
         cfg.quality,
         cfg.lossless,
         cfg.color.cicp,
+        cfg.sao,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -868,6 +885,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         cfg.parallelism.single_wpp(),
         cfg.parallelism.single_tiles(),
         resolve_threads(cfg.threads),
+        cfg.sao,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -953,10 +971,7 @@ where
     Ok(out)
 }
 
-/// Encode one grid cell as an independent HEVC image. With `cell_wpp` the cell is
-/// WPP-coded (its CTU rows become CABAC substreams) — still a plain single-image WPP
-/// stream, decodable everywhere. Cells already run in parallel across the grid, so
-/// each cell is coded on a single thread (no nested wavefront pool).
+#[allow(clippy::too_many_arguments)]
 fn encode_cell(
     yuv: &Yuv,
     w: u32,
@@ -965,11 +980,12 @@ fn encode_cell(
     lossless: bool,
     cicp: Option<Cicp>,
     cell_wpp: bool,
+    sao: bool,
 ) -> Result<hevc::NaluStream, EncodeError> {
     if cell_wpp {
-        hevc::encode_intra_opts(yuv, w, h, quality, lossless, cicp, true, false, 1)
+        hevc::encode_intra_opts(yuv, w, h, quality, lossless, cicp, true, false, 1, sao)
     } else {
-        hevc::encode_intra(yuv, w, h, quality, lossless, cicp)
+        hevc::encode_intra(yuv, w, h, quality, lossless, cicp, sao)
     }
 }
 
@@ -1014,6 +1030,7 @@ fn encode_rgb_tiled(
             cfg.lossless,
             cfg.color.cicp,
             cell_wpp,
+            cfg.sao,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1068,6 +1085,7 @@ fn encode_gray_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1151,6 +1169,7 @@ fn encode_yuv_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1170,6 +1189,7 @@ fn encode_yuv_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1262,6 +1282,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cfg.lossless,
             cfg.color.cicp,
             cell_wpp,
+            cfg.sao,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1327,6 +1348,7 @@ fn encode_rgba_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1345,6 +1367,7 @@ fn encode_rgba_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1420,6 +1443,7 @@ fn encode_gray_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1437,6 +1461,7 @@ fn encode_gray_alpha_tiled(
             cfg.quality,
             cfg.lossless,
             cfg.color.cicp,
+            cfg.sao,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
@@ -1640,6 +1665,14 @@ mod tests {
     }
 
     #[test]
+    fn encode_rgb8_without_sao_produces_heic() {
+        let pixels: Vec<u8> = (0..128 * 128 * 3).map(|i| (i & 255) as u8).collect();
+        let out = encode_rgb(&pixels, 128, 128, &cfg().with_quality(30).with_sao(false)).unwrap();
+        assert!(out.len() > 100);
+        assert_eq!(&out[4..8], b"ftyp");
+    }
+
+    #[test]
     fn encode_rgba8_strips_alpha() {
         let out = encode_rgba(&vec![100u8; 16 * 16 * 4], 16, 16, &cfg()).unwrap();
         assert!(out.len() > 100);
@@ -1789,9 +1822,10 @@ mod tests {
 
     #[test]
     fn tiled_rgb8_produces_grid_heic() {
-        // 1024×768 triggers 2×2 grid tiling.
+        // 1024×768 triggers 2×2 GridWpp tiling. Quality 30 also exercises
+        // activity AQ independently inside every WPP-coded grid cell.
         let px: Vec<u8> = (0u32..1024 * 768 * 3).map(|i| (i % 256) as u8).collect();
-        let out = encode_rgb(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgb(&px, 1024, 768, &cfg().with_quality(30)).unwrap();
         assert!(out.len() > 1000);
         assert_eq!(&out[4..8], b"ftyp");
         // A grid HEIC has a 'grid' item type in iinf.

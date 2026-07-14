@@ -71,6 +71,7 @@ fn chroma_qp(qpi: i32, chroma: crate::fmt::ChromaFormat) -> i32 {
 /// (`w/2`×`h/2`, 4:2:0). `qp` is the (constant) luma QP. All dimensions are the
 /// coded dimensions (multiples of the CTU size).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn deblock(
     y: &mut [u16],
     w: usize,
@@ -85,10 +86,81 @@ pub(crate) fn deblock(
     edge_v: &[bool],
     edge_h: &[bool],
 ) {
+    deblock_impl(
+        y, w, h, cb, cr, cw, ch, qp, bit_depth, chroma, edge_v, edge_h, None, 0,
+    );
+}
+
+/// Deblock using the reconstructed per-4x4 luma QP map produced by adaptive
+/// quantization. HEVC derives beta/tc from the average QP on the two sides of
+/// each edge, so a single slice QP is insufficient when CU QP deltas are used.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deblock_with_qp_map(
+    y: &mut [u16],
+    w: usize,
+    h: usize,
+    cb: &mut [u16],
+    cr: &mut [u16],
+    cw: usize,
+    ch: usize,
+    qp: u8,
+    bit_depth: crate::fmt::BitDepth,
+    chroma: crate::fmt::ChromaFormat,
+    edge_v: &[bool],
+    edge_h: &[bool],
+    qp_map: &[u8],
+    qp_stride: usize,
+) {
+    deblock_impl(
+        y,
+        w,
+        h,
+        cb,
+        cr,
+        cw,
+        ch,
+        qp,
+        bit_depth,
+        chroma,
+        edge_v,
+        edge_h,
+        Some(qp_map),
+        qp_stride,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deblock_impl(
+    y: &mut [u16],
+    w: usize,
+    h: usize,
+    cb: &mut [u16],
+    cr: &mut [u16],
+    cw: usize,
+    ch: usize,
+    qp: u8,
+    bit_depth: crate::fmt::BitDepth,
+    chroma: crate::fmt::ChromaFormat,
+    edge_v: &[bool],
+    edge_h: &[bool],
+    qp_map: Option<&[u8]>,
+    qp_stride: usize,
+) {
     let edge_stride = w / 4;
     for &vertical in &[true, false] {
         let edges = if vertical { edge_v } else { edge_h };
-        deblock_luma(y, w, h, qp, vertical, bit_depth.bits(), edges, edge_stride);
+        deblock_luma(
+            y,
+            w,
+            h,
+            qp,
+            vertical,
+            bit_depth.bits(),
+            edges,
+            edge_stride,
+            qp_map,
+            qp_stride,
+        );
         if !chroma.is_monochrome() {
             deblock_chroma(
                 cb,
@@ -100,6 +172,8 @@ pub(crate) fn deblock(
                 chroma,
                 edges,
                 edge_stride,
+                qp_map,
+                qp_stride,
             );
             deblock_chroma(
                 cr,
@@ -111,9 +185,29 @@ pub(crate) fn deblock(
                 chroma,
                 edges,
                 edge_stride,
+                qp_map,
+                qp_stride,
             );
         }
     }
+}
+
+#[inline]
+fn edge_qp(
+    fallback: u8,
+    qp_map: Option<&[u8]>,
+    stride: usize,
+    luma_x: usize,
+    luma_y: usize,
+    vertical: bool,
+) -> i32 {
+    let Some(map) = qp_map else {
+        return i32::from(fallback);
+    };
+    let qx = luma_x / 4;
+    let qy = luma_y / 4;
+    let (px, py) = if vertical { (qx - 1, qy) } else { (qx, qy - 1) };
+    (i32::from(map[py * stride + px]) + i32::from(map[qy * stride + qx]) + 1) >> 1
 }
 
 /// Luma-only deblocking, for monochrome (4:0:0) pictures that have no chroma.
@@ -128,13 +222,10 @@ fn deblock_luma(
     bit_depth: u8,
     edges: &[bool],
     edge_stride: usize,
+    qp_map: Option<&[u8]>,
+    qp_stride: usize,
 ) {
-    let qp_l = qp as i32;
     let bdshift = (bit_depth - 8) as i32;
-    // beta and tc scale with bit depth (HEVC §8.7.2.4.3): beta' = beta * (1<<(bd-8)),
-    // tc' = tc * (1<<(bd-8)).
-    let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
-    let tc = TC_TABLE[clip3(0, 53, qp_l + 2) as usize] << bdshift;
     let max_val = (1i32 << bit_depth) - 1;
 
     // Edges lie on the 8-sample grid; the boundary is at coordinate `e` for
@@ -146,6 +237,9 @@ fn deblock_luma(
             let mut yk = 0;
             while yk + 4 <= h {
                 if edges[(yk / 4) * edge_stride + x / 4] {
+                    let qp_l = edge_qp(qp, qp_map, qp_stride, x, yk, true);
+                    let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_l + 2) as usize] << bdshift;
                     filter_luma_segment(y, w, x, yk, true, beta, tc, max_val);
                 }
                 yk += 4;
@@ -158,6 +252,9 @@ fn deblock_luma(
             let mut xk = 0;
             while xk + 4 <= w {
                 if edges[(yy / 4) * edge_stride + xk / 4] {
+                    let qp_l = edge_qp(qp, qp_map, qp_stride, xk, yy, false);
+                    let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_l + 2) as usize] << bdshift;
                     filter_luma_segment(y, w, xk, yy, false, beta, tc, max_val);
                 }
                 xk += 4;
@@ -326,13 +423,11 @@ fn deblock_chroma(
     chroma: crate::fmt::ChromaFormat,
     edges: &[bool],
     edge_stride: usize,
+    qp_map: Option<&[u8]>,
+    qp_stride: usize,
 ) {
-    let qpi = qp as i32;
-    let qp_c = chroma_qp(qpi, chroma);
     let bdshift = (bit_depth - 8) as i32;
-    let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
     let max_val = (1i32 << bit_depth) - 1;
-    if tc == 0 { /* still proceed; delta clamps to 0 */ }
 
     if vertical {
         // chroma vertical edges at chroma column x = 8,16,... (every 16 luma)
@@ -343,6 +438,9 @@ fn deblock_chroma(
                 let lx = x * chroma.sub_w();
                 let ly = (yk + 1) * chroma.sub_h();
                 if edges[(ly / 4) * edge_stride + lx / 4] {
+                    let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, true);
+                    let qp_c = chroma_qp(qpi, chroma);
+                    let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
                     filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
                 }
                 yk += 4;
@@ -357,6 +455,9 @@ fn deblock_chroma(
                 let lx = (xk + 1) * chroma.sub_w();
                 let ly = yy * chroma.sub_h();
                 if edges[(ly / 4) * edge_stride + lx / 4] {
+                    let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, false);
+                    let qp_c = chroma_qp(qpi, chroma);
+                    let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
                     filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
                 }
                 xk += 4;

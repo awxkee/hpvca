@@ -44,6 +44,7 @@ fn main() {
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv444)
             .with_parallelism(ParallelismStrategy::GridWpp)
+            .with_sao(false)
             .with_lossless(false),
     )
     .unwrap();
