@@ -27,10 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod aq;
 mod dequant;
 mod satd;
 mod transform;
 
+pub(crate) use aq::ctu_activity_avx2;
 pub(crate) use dequant::dequantize_avx2;
 pub(crate) use satd::satd_avx2;
 pub(crate) use transform::{fwd_transform_avx2, inv_transform_avx2};

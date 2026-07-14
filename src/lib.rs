@@ -26,8 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(clippy::excessive_precision)]
 #![deny(unreachable_pub)]
 use std::mem::size_of;
+mod aq;
 mod cabac;
 mod color;
 mod cost;
@@ -39,6 +41,7 @@ mod hevc;
 mod hevc_transform;
 mod intra;
 mod isobmff;
+mod math;
 mod metadata;
 mod pool;
 mod sao;
@@ -97,7 +100,7 @@ impl Default for VarianceBoost {
     fn default() -> Self {
         Self {
             octile: 6,
-            strength: 2.0,
+            strength: 1.0,
             boost_only: false,
         }
     }

@@ -33,7 +33,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/IMG_0150.PNG").unwrap().to_rgb8();
+    let img = image::open("./assets/aak.jpg").unwrap().to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
@@ -45,7 +45,6 @@ fn main() {
             .with_chroma(ChromaFormat::Yuv444)
             .with_parallelism(ParallelismStrategy::GridWpp)
             .with_sao(false)
-            .with_variance_boost(6, 2.0, false)
             .with_lossless(false),
     )
     .unwrap();

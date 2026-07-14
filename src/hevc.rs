@@ -28,6 +28,7 @@
  */
 
 use crate::{
+    aq::{activity_aq_enabled, activity_qp_offsets},
     cabac::{
         CabacEncoder, CabacEstimator, CabacWriter, ContextSet, IntraModeContexts,
         advance_residual_contexts, encode_cbf_chroma, encode_cbf_luma, encode_residual,
@@ -576,6 +577,7 @@ pub(crate) fn build_pps_tiled(
 }
 
 /// Encode a still image as a single HEVC IDR picture.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn encode_intra(
     yuv: &Yuv,
     width: u32,
@@ -1027,158 +1029,6 @@ struct RegionOutput {
     unfiltered_y: Vec<u16>,
 }
 
-#[derive(Clone, Copy)]
-struct CtuActivity {
-    mean_log_variance: f32,
-    low_contrast_log_variance: f32,
-}
-
-#[inline]
-fn variance_boost_qp(low_contrast_log_variance: f32, qp: u8, config: crate::VarianceBoost) -> f32 {
-    // The gentle curve treats 8-bit variance 256 as the transition out of
-    // low-contrast detail. Start above QP 32: at finer quantizers this tool is
-    // visually redundant and can perturb an already good bit allocation.
-    const LOW_VARIANCE_LOG_LIMIT: f32 = 5.549_076; // ln(1 + 256)
-    let low_contrast = ((LOW_VARIANCE_LOG_LIMIT - low_contrast_log_variance)
-        / LOW_VARIANCE_LOG_LIMIT)
-        .clamp(0.0, 1.0);
-    let strength = ((f32::from(qp) - 32.0) / 7.0).clamp(0.0, 1.0);
-    low_contrast * strength * config.strength * 0.575
-}
-
-/// Log-variance statistics of the 8x8 luma cells inside one CTU. The mean is
-/// the ordinary masking signal. The weighted sixth octile detects CTUs that
-/// contain a substantial amount of delicate, low-contrast detail even when a
-/// few hard edges would otherwise classify the whole CTU as highly active.
-fn ctu_activity(yuv: &Yuv, ctu_row: usize, ctu_col: usize, octile: u8) -> CtuActivity {
-    let width = yuv.width as usize;
-    let height = yuv.height as usize;
-    let row0 = ctu_row * 64;
-    let col0 = ctu_col * 64;
-    if row0 >= height || col0 >= width {
-        return CtuActivity {
-            mean_log_variance: 0.0,
-            low_contrast_log_variance: 0.0,
-        };
-    }
-    let shift = yuv.bit_depth.bits().saturating_sub(8);
-    let mut log_sum = 0.0f32;
-    let mut log_variances = [0.0f32; 64];
-    let mut variance_slots = log_variances.iter_mut();
-    let row_end = (row0 + 64).min(height);
-    let col_end = (col0 + 64).min(width);
-    let ctu_rows = &yuv.y[row0 * width..row_end * width];
-    for row_band in ctu_rows.chunks_exact(width * 8) {
-        let mut sums = [0.0f32; 8];
-        let mut sums_sq = [0.0f32; 8];
-        let mut counts = [0.0f32; 8];
-        for row in row_band.chunks_exact(width) {
-            let blocks = row[col0..col_end].as_chunks::<8>().0.iter();
-            for (((block, sum), sum_sq), count) in blocks
-                .zip(sums.iter_mut())
-                .zip(sums_sq.iter_mut())
-                .zip(counts.iter_mut())
-            {
-                for &sample in block {
-                    let sample = f32::from(sample >> shift);
-                    *sum += sample;
-                    *sum_sq += sample * sample;
-                    *count += 1.0;
-                }
-            }
-        }
-        for ((sum, sum_sq), count) in sums
-            .into_iter()
-            .zip(sums_sq)
-            .zip(counts)
-            .take((col_end - col0).div_ceil(8))
-        {
-            let mean = sum / count;
-            let variance = (sum_sq / count - mean * mean).max(0.0);
-            let log_variance = variance.ln_1p();
-            log_sum += log_variance;
-            *variance_slots
-                .next()
-                .expect("one variance slot per 8x8 CTU block") = log_variance;
-        }
-    }
-    let blocks = 64 - variance_slots.len();
-    if blocks == 0 {
-        CtuActivity {
-            mean_log_variance: 0.0,
-            low_contrast_log_variance: 0.0,
-        }
-    } else {
-        let values = &mut log_variances[..blocks];
-        values.sort_unstable_by(f32::total_cmp);
-        let ranked = |n: usize| values[(blocks * n).div_ceil(8).saturating_sub(1)];
-        // Smooth adjacent octile boundaries so a single 8x8 block cannot make
-        // the CTU jump by a complete QP step.
-        let center = usize::from(octile);
-        let low_contrast = (ranked(center.saturating_sub(1).max(1))
-            + 2.0 * ranked(center)
-            + ranked((center + 1).min(8)))
-            * 0.25;
-        CtuActivity {
-            mean_log_variance: log_sum / blocks as f32,
-            low_contrast_log_variance: low_contrast,
-        }
-    }
-}
-
-/// Build one signed QP offset per CTU. Activity masking lets textured CTUs use
-/// a slightly higher QP while spending the saved bits on flat/low-contrast CTUs,
-/// where quantization errors are much more visible. The strength ramps in above
-/// QP 24 and is bounded to ±3 so adjacent-QG discontinuities stay small.
-fn activity_qp_offsets(
-    yuv: &Yuv,
-    ctus_x: usize,
-    ctus_y: usize,
-    qp: u8,
-    lossless: bool,
-    variance_boost: crate::VarianceBoost,
-) -> Vec<i8> {
-    if !activity_aq_enabled(qp, lossless) {
-        return Vec::new();
-    }
-    let mut activity = Vec::with_capacity(ctus_x * ctus_y);
-    for row in 0..ctus_y {
-        for col in 0..ctus_x {
-            activity.push(ctu_activity(yuv, row, col, variance_boost.octile));
-        }
-    }
-    let mean = activity
-        .iter()
-        .map(|value| value.mean_log_variance)
-        .sum::<f32>()
-        / activity.len().max(1) as f32;
-    let strength = ((f32::from(qp) - 24.0) / 14.0).clamp(0.25, 1.0) * 1.25;
-    let mut offsets: Vec<i8> = activity
-        .iter()
-        .map(|value| {
-            let masking = if variance_boost.boost_only {
-                0.0
-            } else {
-                (value.mean_log_variance - mean) * strength
-            };
-            let boost = variance_boost_qp(value.low_contrast_log_variance, qp, variance_boost);
-            (masking - boost).round().clamp(-3.0, 3.0) as i8
-        })
-        .collect();
-
-    // Rounding can bias a small image by one QP. Remove that common-mode shift
-    // so AQ redistributes the bit budget instead of silently changing quality.
-    if !variance_boost.boost_only {
-        let rounded_mean = (offsets.iter().map(|&v| i32::from(v)).sum::<i32>() as f32
-            / offsets.len().max(1) as f32)
-            .round() as i8;
-        for offset in &mut offsets {
-            *offset = (*offset - rounded_mean).clamp(-3, 3);
-        }
-    }
-    offsets
-}
-
 #[inline]
 fn fill_cu_qp(map: &mut [u8], stride: usize, row: usize, col: usize, size: usize, qp: u8) {
     if map.is_empty() {
@@ -1612,7 +1462,7 @@ fn assemble_substreams(hdr: &mut BitWriter, substreams: &[Vec<u8>]) -> Vec<u8> {
     data
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn build_idr_slice(
     yuv: &Yuv,
     width: u32,
@@ -2542,11 +2392,6 @@ impl AqCtuState {
             self.predictor
         }
     }
-}
-
-#[inline]
-fn activity_aq_enabled(qp: u8, lossless: bool) -> bool {
-    !lossless && qp >= 24
 }
 
 /// Encode HEVC `cu_qp_delta_abs` and `cu_qp_delta_sign_flag`. The absolute
@@ -7478,47 +7323,6 @@ fn extract_block_dyn_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn activity_aq_moves_bits_from_flat_to_textured_ctus() {
-        let (w, h) = (128usize, 64usize);
-        let mut y = vec![128u16; w * h];
-        for row in 0..h {
-            for col in 64..w {
-                y[row * w + col] = if (row + col) & 1 == 0 { 16 } else { 240 };
-            }
-        }
-        let yuv = Yuv {
-            y,
-            cb: Vec::new(),
-            cr: Vec::new(),
-            width: w as u32,
-            height: h as u32,
-            display_w: w as u32,
-            display_h: h as u32,
-            chroma: crate::fmt::ChromaFormat::Monochrome,
-            bit_depth: crate::fmt::BitDepth::Eight,
-        };
-        let offsets = activity_qp_offsets(&yuv, 2, 1, 38, false, crate::VarianceBoost::default());
-        assert!(
-            offsets[0] < 0,
-            "flat CTU should spend more bits: {offsets:?}"
-        );
-        assert!(
-            offsets[1] > 0,
-            "textured CTU should spend fewer bits: {offsets:?}"
-        );
-        assert!(offsets.iter().all(|&offset| (-3..=3).contains(&offset)));
-    }
-
-    #[test]
-    fn variance_boost_is_bounded_and_only_targets_coarse_low_contrast_blocks() {
-        let config = crate::VarianceBoost::default();
-        assert_eq!(variance_boost_qp(0.0, 32, config), 0.0);
-        assert_eq!(variance_boost_qp(6.0, 39, config), 0.0);
-        let boost = variance_boost_qp(2.0, 39, config);
-        assert!(boost > 0.5 && boost <= 1.15, "unexpected boost {boost}");
-    }
 
     #[test]
     fn cu_qp_delta_uses_truncated_unary_and_sign_bypass() {
