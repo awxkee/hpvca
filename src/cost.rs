@@ -147,7 +147,7 @@ mod tests {
         let orig = [12u16; 16];
         let pred = [4u16; 16];
         // Only the DC Hadamard coefficient is nonzero: 16 * 8 / 2.
-        assert_eq!(unsafe { satd_scalar(&orig, &pred, 4) }, 64);
+        assert_eq!(satd_scalar(&orig, &pred, 4), 64);
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         for n in [4, 8, 16, 32] {
             assert_eq!(
                 unsafe { resolved(&orig[..n * n], &pred[..n * n], n) },
-                unsafe { satd_scalar(&orig[..n * n], &pred[..n * n], n) },
+                satd_scalar(&orig[..n * n], &pred[..n * n], n),
             );
         }
     }

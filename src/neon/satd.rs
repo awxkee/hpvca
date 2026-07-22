@@ -33,20 +33,19 @@ use core::arch::aarch64::*;
 pub(crate) unsafe fn satd_neon(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     assert!(matches!(n, 4 | 8 | 16 | 32));
     assert!(orig.len() >= n * n && pred.len() >= n * n);
+    let orig = &orig[..n * n];
+    let pred = &pred[..n * n];
     debug_assert!(orig[..n * n].iter().all(|&sample| sample <= 4095));
     debug_assert!(pred[..n * n].iter().all(|&sample| sample <= 4095));
 
     if n == 4 {
-        return unsafe { satd_4x4(orig.as_ptr(), pred.as_ptr(), 4) };
+        return satd_4x4(orig, pred);
     }
 
     let mut total = 0u32;
-    for by in (0..n).step_by(4) {
+    for (orig_band, pred_band) in orig.chunks_exact(n * 4).zip(pred.chunks_exact(n * 4)) {
         for bx in (0..n).step_by(8) {
-            let offset = by * n + bx;
-            // SAFETY: the slice checks above and 4-pixel tiling guarantee that
-            // every eight-sample row load is in bounds. NEON is mandatory on AArch64.
-            total += unsafe { satd_4x8(orig.as_ptr().add(offset), pred.as_ptr().add(offset), n) };
+            total += satd_4x8(orig_band, pred_band, n, bx);
         }
     }
     total
@@ -130,11 +129,14 @@ fn transpose4(rows: [int32x4_t; 4]) -> [int32x4_t; 4] {
 }
 
 #[target_feature(enable = "neon")]
-unsafe fn satd_4x4(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
+fn satd_4x4(orig: &[u16], pred: &[u16]) -> u32 {
     let mut rows = [vdupq_n_s32(0); 4];
-    for (row, dst) in rows.iter_mut().enumerate() {
-        let o16 = unsafe { vld1_u16(orig.add(row * stride)) };
-        let p16 = unsafe { vld1_u16(pred.add(row * stride)) };
+    let (orig_rows, orig_remainder) = orig.as_chunks::<4>();
+    let (pred_rows, pred_remainder) = pred.as_chunks::<4>();
+    debug_assert!(orig_remainder.is_empty() && pred_remainder.is_empty());
+    for ((orig_row, pred_row), dst) in orig_rows.iter().zip(pred_rows).zip(&mut rows) {
+        let o16 = unsafe { vld1_u16(orig_row.as_ptr()) };
+        let p16 = unsafe { vld1_u16(pred_row.as_ptr()) };
         let difference = vreinterpretq_s32_u32(vsubl_u16(o16, p16));
         *dst = hadamard4(difference);
     }
@@ -153,11 +155,17 @@ unsafe fn satd_4x4(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
 }
 
 #[target_feature(enable = "neon")]
-unsafe fn satd_4x8(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
+fn satd_4x8(orig: &[u16], pred: &[u16], stride: usize, column: usize) -> u32 {
     let mut rows = [vdupq_n_s16(0); 4];
-    for (row, dst) in rows.iter_mut().enumerate() {
-        let o16 = unsafe { vld1q_u16(orig.add(row * stride)) };
-        let p16 = unsafe { vld1q_u16(pred.add(row * stride)) };
+    for ((orig_row, pred_row), dst) in orig
+        .chunks_exact(stride)
+        .zip(pred.chunks_exact(stride))
+        .zip(&mut rows)
+    {
+        let orig_chunk = &orig_row[column..].as_chunks::<8>().0[0];
+        let pred_chunk = &pred_row[column..].as_chunks::<8>().0[0];
+        let o16 = unsafe { vld1q_u16(orig_chunk.as_ptr()) };
+        let p16 = unsafe { vld1q_u16(pred_chunk.as_ptr()) };
         let difference = vreinterpretq_s16_u16(vsubq_u16(o16, p16));
         *dst = hadamard4x2_s16(difference);
     }

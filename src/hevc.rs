@@ -2720,8 +2720,7 @@ impl CompressionContext {
 
     #[inline]
     fn satd(&self, orig: &[u16], pred: &[u16], n: usize) -> u32 {
-        // SAFETY: every SATD implementation has the same slice-based contract;
-        // the selected implementation validates the block shape and lengths.
+        // SAFETY: the resolver selects only implementations supported by the CPU.
         unsafe { (self.satd)(orig, pred, n) }
     }
 }
@@ -4611,7 +4610,7 @@ fn choose_nxn_proxy(
     // independent predictors, while gradient-orientation spread identifies edges
     // that one 8×8 direction cannot represent well.
     let depth_scale = 1u64 << bit_depth.saturating_sub(8);
-    // SAFETY: the two slices were checked above and 8 is a supported block size.
+    // SAFETY: the resolver selects only implementations supported by the CPU.
     let parent_satd = unsafe { satd(&orig[..64], &parent_pred[..64], 8) } as f32;
     let satd_floor = 48.0 * depth_scale as f32 + lambda.sqrt() * 8.0;
     if parent_satd <= satd_floor {
@@ -5427,7 +5426,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                         &mut scratch.pred,
                         &mut scratch.angular,
                     );
-                    // SAFETY: both buffers contain a complete supported square block.
+                    // SAFETY: the resolver selects only implementations supported by the CPU.
                     cost += unsafe { satd(&orig[..block_len], &scratch.pred[..block_len], side) }
                         as f32;
                 }
