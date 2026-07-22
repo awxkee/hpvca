@@ -33,6 +33,10 @@ use crate::{
 };
 use std::sync::OnceLock;
 
+const ACTIVITY_QP_FLOOR: u8 = 8;
+
+const ACTIVITY_STRENGTH: f32 = 1.25;
+
 pub(crate) type CtuActivityFn = unsafe fn(&Yuv, usize, usize, u8) -> CtuActivity;
 
 static CTU_ACTIVITY: OnceLock<CtuActivityFn> = OnceLock::new();
@@ -305,7 +309,6 @@ pub(crate) fn ctu_activity_scalar(
         }
     }
     let coarse_len = 32 * 32 - coarse_slots.len();
-    drop(coarse_slots);
     let full_energy = luma_laplacian_energy(ctu_rows, width, col0, col_end, shift);
     let coarse_energy = f32_laplacian_energy(&coarse[..coarse_len], coarse_width);
     finish_ctu_activity(
@@ -345,7 +348,7 @@ pub(crate) fn resolve_ctu_activity() -> CtuActivityFn {
 
 #[inline]
 pub(crate) fn activity_aq_enabled(qp: u8, lossless: bool) -> bool {
-    !lossless && qp >= 24
+    !lossless && qp >= ACTIVITY_QP_FLOOR
 }
 
 pub(crate) fn activity_qp_offsets(
@@ -373,7 +376,7 @@ pub(crate) fn activity_qp_offsets(
         .map(|value| value.mean_log_variance)
         .sum::<f32>()
         / activity.len().max(1) as f32;
-    let strength = ((f32::from(qp) - 24.0) / 14.0).clamp(0.25, 1.0) * 1.25;
+    let strength = ACTIVITY_STRENGTH;
     let mut offsets: Vec<i8> = activity
         .iter()
         .map(|value| {
@@ -382,6 +385,8 @@ pub(crate) fn activity_qp_offsets(
             } else {
                 (value.mean_log_variance - mean) * strength
             };
+            // Clamp to ±3: `code_one_ctu` indexes a 7-entry lambda-scale table
+            // by `offset + 3`, so offsets outside this range are undefined.
             masking.fast_round().clamp(-3.0, 3.0) as i8
         })
         .collect();

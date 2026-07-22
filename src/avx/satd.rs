@@ -33,18 +33,17 @@ use core::arch::x86_64::*;
 pub(crate) unsafe fn satd_avx2(orig: &[u16], pred: &[u16], n: usize) -> u32 {
     assert!(matches!(n, 4 | 8 | 16 | 32));
     assert!(orig.len() >= n * n && pred.len() >= n * n);
+    let orig = &orig[..n * n];
+    let pred = &pred[..n * n];
 
     if n == 4 {
-        return unsafe { satd_4x4(orig.as_ptr(), pred.as_ptr(), 4) };
+        return satd_4x4(orig, pred);
     }
 
     let mut total = 0u32;
-    for by in (0..n).step_by(4) {
+    for (orig_band, pred_band) in orig.chunks_exact(n * 4).zip(pred.chunks_exact(n * 4)) {
         for bx in (0..n).step_by(8) {
-            let offset = by * n + bx;
-            // SAFETY: the slice checks above and 4-pixel tiling guarantee that
-            // every 128-bit row load is in bounds. The resolver checks AVX2.
-            total += unsafe { satd_4x8(orig.as_ptr().add(offset), pred.as_ptr().add(offset), n) };
+            total += satd_4x8(orig_band, pred_band, n, bx);
         }
     }
     total
@@ -53,15 +52,15 @@ pub(crate) unsafe fn satd_avx2(orig: &[u16], pred: &[u16], n: usize) -> u32 {
 #[inline]
 #[target_feature(enable = "avx2")]
 fn hadamard4x2(row: __m256i) -> __m256i {
-    let opposite = _mm256_shuffle_epi32(row, 0b01_00_11_10);
+    let opposite = _mm256_shuffle_epi32::<0b01_00_11_10>(row);
     let pair_add = _mm256_add_epi32(row, opposite);
     let pair_sub = _mm256_sub_epi32(row, opposite);
     let butterfly = _mm256_unpacklo_epi64(pair_add, pair_sub);
-    let adjacent = _mm256_shuffle_epi32(butterfly, 0b10_11_00_01);
+    let adjacent = _mm256_shuffle_epi32::<0b10_11_00_01>(butterfly);
     let sum = _mm256_add_epi32(butterfly, adjacent);
     let difference = _mm256_sub_epi32(butterfly, adjacent);
-    let difference = _mm256_shuffle_epi32(difference, 0b10_10_00_00);
-    _mm256_blend_epi32(sum, difference, 0b1010_1010)
+    let difference = _mm256_shuffle_epi32::<0b10_10_00_00>(difference);
+    _mm256_blend_epi32::<0b1010_1010>(sum, difference)
 }
 
 #[inline]
@@ -112,11 +111,14 @@ fn transpose4(rows: [__m128i; 4]) -> [__m128i; 4] {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn satd_4x4(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
+fn satd_4x4(orig: &[u16], pred: &[u16]) -> u32 {
     let mut rows = [_mm_setzero_si128(); 4];
-    for (row, dst) in rows.iter_mut().enumerate() {
-        let o16 = unsafe { _mm_loadl_epi64(orig.add(row * stride).cast()) };
-        let p16 = unsafe { _mm_loadl_epi64(pred.add(row * stride).cast()) };
+    let (orig_rows, orig_remainder) = orig.as_chunks::<4>();
+    let (pred_rows, pred_remainder) = pred.as_chunks::<4>();
+    debug_assert!(orig_remainder.is_empty() && pred_remainder.is_empty());
+    for ((orig_row, pred_row), dst) in orig_rows.iter().zip(pred_rows).zip(&mut rows) {
+        let o16 = unsafe { _mm_loadl_epi64(orig_row.as_ptr().cast()) };
+        let p16 = unsafe { _mm_loadl_epi64(pred_row.as_ptr().cast()) };
         let difference = _mm_sub_epi32(_mm_cvtepu16_epi32(o16), _mm_cvtepu16_epi32(p16));
         *dst = hadamard4(difference);
     }
@@ -134,11 +136,17 @@ unsafe fn satd_4x4(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn satd_4x8(orig: *const u16, pred: *const u16, stride: usize) -> u32 {
+fn satd_4x8(orig: &[u16], pred: &[u16], stride: usize, column: usize) -> u32 {
     let mut rows = [_mm256_setzero_si256(); 4];
-    for (row, dst) in rows.iter_mut().enumerate() {
-        let o16 = unsafe { _mm_loadu_si128(orig.add(row * stride).cast()) };
-        let p16 = unsafe { _mm_loadu_si128(pred.add(row * stride).cast()) };
+    for ((orig_row, pred_row), dst) in orig
+        .chunks_exact(stride)
+        .zip(pred.chunks_exact(stride))
+        .zip(&mut rows)
+    {
+        let orig_chunk = &orig_row[column..].as_chunks::<8>().0[0];
+        let pred_chunk = &pred_row[column..].as_chunks::<8>().0[0];
+        let o16 = unsafe { _mm_loadu_si128(orig_chunk.as_ptr().cast()) };
+        let p16 = unsafe { _mm_loadu_si128(pred_chunk.as_ptr().cast()) };
         let difference = _mm256_sub_epi32(_mm256_cvtepu16_epi32(o16), _mm256_cvtepu16_epi32(p16));
         *dst = hadamard4x2(difference);
     }
