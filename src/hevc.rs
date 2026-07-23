@@ -587,6 +587,7 @@ pub(crate) fn encode_intra(
     color: Option<crate::color::Cicp>,
     sao: bool,
     variance_boost: crate::VarianceBoost,
+    effort: crate::Speed,
 ) -> Result<NaluStream, EncodeError> {
     encode_intra_opts(
         yuv,
@@ -600,6 +601,7 @@ pub(crate) fn encode_intra(
         1,
         sao,
         variance_boost,
+        effort,
     )
 }
 
@@ -616,6 +618,7 @@ pub(crate) fn encode_intra_opts(
     threads: usize,
     sao: bool,
     variance_boost: crate::VarianceBoost,
+    effort: crate::Speed,
 ) -> Result<NaluStream, EncodeError> {
     // Transquant-bypass samples are not modified by in-loop filters. Disable
     // the slice-level tool as well so no redundant SAO syntax is emitted.
@@ -673,6 +676,7 @@ pub(crate) fn encode_intra_opts(
         },
         sao,
         variance_boost,
+        effort,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -741,6 +745,7 @@ fn encode_wpp_parallel(
     sao_params: Option<&[crate::sao::SaoParam]>,
     aq_offsets: &[i8],
     sao_enabled: bool,
+    rdoq_in_loop: bool,
 ) -> Vec<Vec<u8>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -788,6 +793,7 @@ fn encode_wpp_parallel(
     let worker = || {
         // Each worker owns one reusable work area; whichever row it codes.
         let mut scratch = Box::new(CompressionContext::new());
+        scratch.rdoq_in_loop = rdoq_in_loop;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
             if r >= ctus_y {
@@ -1185,6 +1191,7 @@ fn encode_region_pass(
             sao_params,
             aq_offsets,
             sao_enabled,
+            scratch.rdoq_in_loop,
         )
     } else {
         let mut substreams: Vec<Vec<u8>> = Vec::with_capacity(ctus_y);
@@ -1320,8 +1327,10 @@ fn encode_region_substreams(
     pool: &crate::pool::ThreadPool,
     sao_enabled: bool,
     variance_boost: crate::VarianceBoost,
+    effort: crate::Speed,
 ) -> RegionOutput {
     let mut scratch = Box::new(CompressionContext::new());
+    scratch.rdoq_in_loop = effort.rdoq_in_loop();
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact CTU-offset table.
     let ctus_x = (((width + 63) & !63) / 64) as usize;
@@ -1484,6 +1493,7 @@ fn build_idr_slice(
     plan: ParallelPlan<'_>,
     sao: bool,
     variance_boost: crate::VarianceBoost,
+    effort: crate::Speed,
 ) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
     let ParallelPlan {
         wpp,
@@ -1549,6 +1559,7 @@ fn build_idr_slice(
             pool,
             sao,
             variance_boost,
+            effort,
         );
         final_y = output.y;
         final_cb = output.cb;
@@ -1604,6 +1615,7 @@ fn build_idr_slice(
                             pool,
                             sao,
                             variance_boost,
+                            effort,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -2685,6 +2697,9 @@ struct CompressionContext {
     chroma_tbs: [ChromaTb; 2],
     tu_tree: TuTreeScratch,
     rdoq: crate::hevc_transform::RdoqScratch,
+    /// When set (Effort::Slow), the reconstructed intra shortlist is RDOQ'd
+    /// inside the RD loop rather than only the committed winner.
+    rdoq_in_loop: bool,
 }
 
 impl CompressionContext {
@@ -2715,6 +2730,7 @@ impl CompressionContext {
             chroma_tbs: [ChromaTb::new(), ChromaTb::new()],
             tu_tree: TuTreeScratch::new(),
             rdoq: crate::hevc_transform::RdoqScratch::new(),
+            rdoq_in_loop: false,
         }
     }
 
@@ -5171,14 +5187,35 @@ fn encode_cu_nxn<W: CabacWriter>(
                 &mut scratch.transform_tmp,
                 true,
             );
-            crate::hevc_transform::quantize_with_sign_hiding_into(
-                &scratch.coeff,
-                PU,
-                qp,
-                bit_depth.bits(),
-                scan,
-                &mut scratch.levels,
-            );
+            if scratch.rdoq_in_loop {
+                // Effort::Slow: RDOQ each 4×4 PU candidate. NxN's inferred split
+                // codes cbf_luma at depth 1, so use the depth-aware entry point.
+                let tb = crate::hevc_transform::RdoqTb {
+                    coeff: &scratch.coeff,
+                    n: PU,
+                    qp,
+                    bit_depth: bit_depth.bits(),
+                    scan,
+                    scan_idx,
+                    lambda,
+                };
+                crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+                    &tb,
+                    1,
+                    &trial_ctx,
+                    &mut scratch.levels,
+                    &mut scratch.rdoq,
+                );
+            } else {
+                crate::hevc_transform::quantize_with_sign_hiding_into(
+                    &scratch.coeff,
+                    PU,
+                    qp,
+                    bit_depth.bits(),
+                    scan,
+                    &mut scratch.levels,
+                );
+            }
             let mut nonzero = false;
             for (dst, &(scan_row, scan_col)) in scratch.scanned[..PU_LEN].iter_mut().zip(scan) {
                 let level = scratch.levels[scan_row * PU + scan_col];
@@ -6192,14 +6229,34 @@ fn encode_cu<W: CabacWriter>(
                 &mut scratch.transform_tmp,
                 false,
             );
-            crate::hevc_transform::quantize_with_sign_hiding_into(
-                &scratch.coeff,
-                lu,
-                qp,
-                bit_depth.bits(),
-                scan,
-                &mut scratch.levels,
-            );
+            if scratch.rdoq_in_loop {
+                // Effort::Slow: RDOQ every reconstructed candidate so the mode
+                // decision is made on the true coded rate (top-K RDOQ in loop).
+                let tb = crate::hevc_transform::RdoqTb {
+                    coeff: &scratch.coeff,
+                    n: lu,
+                    qp,
+                    bit_depth: bit_depth.bits(),
+                    scan,
+                    scan_idx,
+                    lambda,
+                };
+                crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
+                    &tb,
+                    &trial_ctx,
+                    &mut scratch.levels,
+                    &mut scratch.rdoq,
+                );
+            } else {
+                crate::hevc_transform::quantize_with_sign_hiding_into(
+                    &scratch.coeff,
+                    lu,
+                    qp,
+                    bit_depth.bits(),
+                    scan,
+                    &mut scratch.levels,
+                );
+            }
         }
         let mut nonzero = false;
         for (dst, &(row, col)) in scratch.scanned[..num_luma].iter_mut().zip(scan) {
@@ -7586,6 +7643,7 @@ mod tests {
             &pool,
             true,
             crate::VarianceBoost::default(),
+            crate::Speed::Fast,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -7641,6 +7699,7 @@ mod tests {
             &pool,
             true,
             crate::VarianceBoost::default(),
+            crate::Speed::Fast,
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);

@@ -85,6 +85,21 @@ pub enum ParallelismStrategy {
     GridWpp,
 }
 
+/// Encoder effort tier, trading encode speed for compression efficiency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Speed {
+    #[default]
+    Fast,
+    Slow,
+}
+
+impl Speed {
+    /// Whether the reconstructed intra shortlist is RDOQ'd inside the RD loop.
+    pub(crate) fn rdoq_in_loop(self) -> bool {
+        matches!(self, Speed::Slow)
+    }
+}
+
 /// Variance-boost controls for low-contrast detail preservation.
 #[derive(Clone, Copy, Debug)]
 pub struct VarianceBoost {
@@ -165,6 +180,8 @@ pub struct EncodeConfig {
     pub sao: bool,
     /// Low-contrast variance-boost settings.
     pub variance_boost: VarianceBoost,
+    /// Effort tier (speed vs compression efficiency). Defaults to [`Speed::Fast`].
+    pub speed: Speed,
 }
 
 impl Default for EncodeConfig {
@@ -179,6 +196,7 @@ impl Default for EncodeConfig {
             parallelism: ParallelismStrategy::GridWpp,
             sao: true,
             variance_boost: VarianceBoost::default(),
+            speed: Speed::default(),
         }
     }
 }
@@ -227,6 +245,11 @@ impl EncodeConfig {
 
     pub fn with_chroma(mut self, chroma: ChromaFormat) -> Self {
         self.chroma = chroma;
+        self
+    }
+
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
         self
     }
 
@@ -740,6 +763,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -752,6 +776,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -839,6 +864,7 @@ fn encode_gray_alpha_wide(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -851,6 +877,7 @@ fn encode_gray_alpha_wide(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -890,6 +917,7 @@ pub fn encode_yuv_with_alpha(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -910,6 +938,7 @@ pub fn encode_yuv_with_alpha(
         cfg.color.cicp,
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -939,6 +968,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         resolve_threads(cfg.threads),
         cfg.sao,
         cfg.variance_boost,
+        cfg.speed,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -1045,6 +1075,7 @@ fn encode_cell(
     threads: usize,
     sao: bool,
     variance_boost: VarianceBoost,
+    effort: Speed,
 ) -> Result<hevc::NaluStream, EncodeError> {
     if cell_wpp {
         // A WPP picture cannot run more CTU rows concurrently than it has.
@@ -1063,9 +1094,20 @@ fn encode_cell(
             wpp_threads,
             sao,
             variance_boost,
+            effort,
         )
     } else {
-        hevc::encode_intra(yuv, w, h, quality, lossless, cicp, sao, variance_boost)
+        hevc::encode_intra(
+            yuv,
+            w,
+            h,
+            quality,
+            lossless,
+            cicp,
+            sao,
+            variance_boost,
+            effort,
+        )
     }
 }
 
@@ -1113,6 +1155,7 @@ fn encode_rgb_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1172,6 +1215,7 @@ fn encode_gray_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1260,6 +1304,7 @@ fn encode_yuv_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1283,6 +1328,7 @@ fn encode_yuv_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1378,6 +1424,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1448,6 +1495,7 @@ fn encode_rgba_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1470,6 +1518,7 @@ fn encode_rgba_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1550,6 +1599,7 @@ fn encode_gray_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1571,6 +1621,7 @@ fn encode_gray_alpha_tiled(
             cell_threads,
             cfg.sao,
             cfg.variance_boost,
+            cfg.speed,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
