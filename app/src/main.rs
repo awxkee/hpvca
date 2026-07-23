@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy};
+use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy, Speed};
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
@@ -45,7 +45,9 @@ fn main() {
             .with_chroma(ChromaFormat::Yuv444)
             .with_parallelism(ParallelismStrategy::GridWpp)
             .with_sao(false)
-            .with_lossless(false),
+            .with_lossless(false)
+            .with_quality(90)
+            .with_speed(Speed::Slow),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
