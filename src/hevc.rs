@@ -2944,20 +2944,20 @@ pub(crate) struct CompressionContext {
     inv_transform: crate::hevc_transform::InvTransformFn,
     dequantize: crate::hevc_transform::DequantizeFn,
     last_tu_layout: TuLayout,
-    orig: [u16; 1024],
-    chroma_orig_cb: [u16; 1024],
-    chroma_orig_cr: [u16; 1024],
-    pred: [u16; 1024],
-    best_pred: [u16; 1024],
-    reconstructed: [u16; 1024],
-    residual: [i32; 1024],
-    best_residual: [i32; 1024],
-    coeff: [i32; 1024],
-    best_coeff: [i32; 1024],
-    dequant: [i32; 1024],
-    inverse: [i32; 1024],
-    transform_tmp: [i32; 1024],
-    levels: [i16; 1024],
+    orig: Box<[u16]>,
+    chroma_orig_cb: Box<[u16]>,
+    chroma_orig_cr: Box<[u16]>,
+    pred: Box<[u16]>,
+    best_pred: Box<[u16]>,
+    reconstructed: Box<[u16]>,
+    residual: Box<[i32]>,
+    best_residual: Box<[i32]>,
+    coeff: Box<[i32]>,
+    best_coeff: Box<[i32]>,
+    dequant: Box<[i32]>,
+    inverse: Box<[i32]>,
+    transform_tmp: Box<[i32]>,
+    levels: Box<[i16]>,
     scanned: [i16; 1024],
     angular: intra::AngularScratch,
     chroma_tbs: [ChromaTb; 2],
@@ -2972,23 +2972,23 @@ pub(crate) struct CompressionContext {
 /// Per-TU coefficient storage for the 64×64-CU (four-32×32-TU) CTU path: four
 /// 32×32 luma TBs plus four 16×16 chroma TB pairs, in Z order.
 struct Cu64Scratch {
-    y_zz: [[i16; 1024]; 4],
-    cb_zz: [[i16; 256]; 4],
-    cr_zz: [[i16; 256]; 4],
-    y_nz: [bool; 4],
-    cb_nz: [bool; 4],
-    cr_nz: [bool; 4],
+    y_zz: Box<[[i16; 1024]]>,
+    cb_zz: Box<[[i16; 256]]>,
+    cr_zz: Box<[[i16; 256]]>,
+    y_nz: Box<[bool]>,
+    cb_nz: Box<[bool]>,
+    cr_nz: Box<[bool]>,
 }
 
 impl Cu64Scratch {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            y_zz: [[0; 1024]; 4],
-            cb_zz: [[0; 256]; 4],
-            cr_zz: [[0; 256]; 4],
-            y_nz: [false; 4],
-            cb_nz: [false; 4],
-            cr_nz: [false; 4],
+            y_zz: vec![[0; 1024]; 4].into_boxed_slice(),
+            cb_zz: vec![[0; 256]; 4].into_boxed_slice(),
+            cr_zz: vec![[0; 256]; 4].into_boxed_slice(),
+            y_nz: vec![false; 4].into_boxed_slice(),
+            cb_nz: vec![false; 4].into_boxed_slice(),
+            cr_nz: vec![false; 4].into_boxed_slice(),
         }
     }
 }
@@ -3002,20 +3002,20 @@ impl CompressionContext {
             inv_transform: crate::hevc_transform::resolve_inv_transform(),
             dequantize: crate::hevc_transform::resolve_dequantize(),
             last_tu_layout: TuLayout::Unsplit,
-            orig: [0; 1024],
-            chroma_orig_cb: [0; 1024],
-            chroma_orig_cr: [0; 1024],
-            pred: [0; 1024],
-            best_pred: [0; 1024],
-            reconstructed: [0; 1024],
-            residual: [0; 1024],
-            best_residual: [0; 1024],
-            coeff: [0; 1024],
-            best_coeff: [0; 1024],
-            dequant: [0; 1024],
-            inverse: [0; 1024],
-            transform_tmp: [0; 1024],
-            levels: [0; 1024],
+            orig: vec![0; 1024].into_boxed_slice(),
+            chroma_orig_cb: vec![0; 1024].into_boxed_slice(),
+            chroma_orig_cr: vec![0; 1024].into_boxed_slice(),
+            pred: vec![0; 1024].into_boxed_slice(),
+            best_pred: vec![0; 1024].into_boxed_slice(),
+            reconstructed: vec![0; 1024].into_boxed_slice(),
+            residual: vec![0; 1024].into_boxed_slice(),
+            best_residual: vec![0; 1024].into_boxed_slice(),
+            coeff: vec![0; 1024].into_boxed_slice(),
+            best_coeff: vec![0; 1024].into_boxed_slice(),
+            dequant: vec![0; 1024].into_boxed_slice(),
+            inverse: vec![0; 1024].into_boxed_slice(),
+            transform_tmp: vec![0; 1024].into_boxed_slice(),
+            levels: vec![0; 1024].into_boxed_slice(),
             scanned: [0; 1024],
             angular: intra::AngularScratch::new(),
             chroma_tbs: [ChromaTb::new(), ChromaTb::new()],
@@ -6095,22 +6095,21 @@ fn encode_cu_nxn<W: CabacWriter>(
                 neutral,
             },
         );
-        let predict =
-            |mode: u8, dst: &mut [u16; 1024], angular: &mut intra::AngularScratch| match mode {
-                0 => intra::predict_planar_into(&above, &left, PU, dst),
-                1 => intra::predict_dc_into(&above, &left, PU, true, dst),
-                _ => intra::predict_angular_into(
-                    corner,
-                    &above,
-                    &left,
-                    PU,
-                    mode,
-                    true,
-                    max_val as i32,
-                    dst,
-                    angular,
-                ),
-            };
+        let predict = |mode: u8, dst: &mut [u16], angular: &mut intra::AngularScratch| match mode {
+            0 => intra::predict_planar_into(&above, &left, PU, dst),
+            1 => intra::predict_dc_into(&above, &left, PU, true, dst),
+            _ => intra::predict_angular_into(
+                corner,
+                &above,
+                &left,
+                PU,
+                mode,
+                true,
+                max_val as i32,
+                dst,
+                angular,
+            ),
+        };
 
         let mut rmd = [IntraModeCandidate {
             mode: 0,
@@ -7066,7 +7065,7 @@ fn encode_cu<W: CabacWriter>(
     let lambda_mode = lambda.sqrt();
     // The smoothed references depend only on the block, not the mode.
     let (cf, fa, fl) = intra::filter_luma_refs(yc0, &ya, &yl, lu, bit_depth.bits() as u32);
-    let predict_luma = |mode: u8, pred: &mut [u16; 1024], angular: &mut intra::AngularScratch| {
+    let predict_luma = |mode: u8, pred: &mut [u16], angular: &mut intra::AngularScratch| {
         let (corner, above, left) = if intra::should_filter_refs(mode, lu) {
             (cf, &fa[..], &fl[..])
         } else {

@@ -243,10 +243,16 @@ pub(crate) fn run_fwd_transform(
     res: &[i32],
     n: usize,
     bit_depth: u8,
-    out: &mut [i32; MAX_TB],
-    tmp: &mut [i32; MAX_TB],
+    out: &mut [i32],
+    tmp: &mut [i32],
     intra_luma: bool,
 ) {
+    let out = out
+        .try_into()
+        .expect("transform output buffer has MAX_TB elements");
+    let tmp = tmp
+        .try_into()
+        .expect("transform temporary buffer has MAX_TB elements");
     // SAFETY: resolvers only return implementations with this slice-based
     // contract; each implementation validates the transform size and buffers.
     unsafe { f(res, n, bit_depth, out, tmp, intra_luma) }
@@ -258,10 +264,16 @@ pub(crate) fn run_inv_transform(
     coeff: &[i32],
     n: usize,
     bit_depth: u8,
-    out: &mut [i32; MAX_TB],
-    tmp: &mut [i32; MAX_TB],
+    out: &mut [i32],
+    tmp: &mut [i32],
     intra_luma: bool,
 ) {
+    let out = out
+        .try_into()
+        .expect("transform output buffer has MAX_TB elements");
+    let tmp = tmp
+        .try_into()
+        .expect("transform temporary buffer has MAX_TB elements");
     // SAFETY: resolvers only return implementations with this slice-based
     // contract; each implementation validates the transform size and buffers.
     unsafe { f(coeff, n, bit_depth, out, tmp, intra_luma) }
@@ -274,8 +286,11 @@ pub(crate) fn run_dequantize(
     n: usize,
     qp: u8,
     bit_depth: u8,
-    out: &mut [i32; MAX_TB],
+    out: &mut [i32],
 ) {
+    let out = out
+        .try_into()
+        .expect("dequantization output buffer has MAX_TB elements");
     // SAFETY: resolvers only return implementations with this slice-based
     // contract; callers provide one complete supported transform block.
     unsafe { f(level, n, qp, bit_depth, out) }
@@ -986,9 +1001,10 @@ fn rdoq_with_sign_hiding_into(
 pub(crate) fn rdoq_luma_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
     ctx: &ContextSet,
-    levels: &mut [i16; MAX_TB],
+    levels: &mut [i16],
     scratch: &mut RdoqScratch,
 ) {
+    let levels = levels.try_into().expect("RDOQ buffer has MAX_TB elements");
     rdoq_with_sign_hiding_into(tb, true, 0, ctx, levels, scratch);
 }
 
@@ -999,9 +1015,10 @@ pub(crate) fn rdoq_luma_with_sign_hiding_into(
 pub(crate) fn rdoq_chroma_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
     ctx: &ContextSet,
-    levels: &mut [i16; MAX_TB],
+    levels: &mut [i16],
     scratch: &mut RdoqScratch,
 ) {
+    let levels = levels.try_into().expect("RDOQ buffer has MAX_TB elements");
     rdoq_with_sign_hiding_into(tb, false, 0, ctx, levels, scratch);
 }
 
@@ -1010,9 +1027,10 @@ pub(crate) fn rdoq_luma_at_depth_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
     trafo_depth: usize,
     ctx: &ContextSet,
-    levels: &mut [i16; MAX_TB],
+    levels: &mut [i16],
     scratch: &mut RdoqScratch,
 ) {
+    let levels = levels.try_into().expect("RDOQ buffer has MAX_TB elements");
     rdoq_with_sign_hiding_into(tb, true, trafo_depth, ctx, levels, scratch);
 }
 
@@ -1021,9 +1039,10 @@ pub(crate) fn rdoq_chroma_at_depth_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
     trafo_depth: usize,
     ctx: &ContextSet,
-    levels: &mut [i16; MAX_TB],
+    levels: &mut [i16],
     scratch: &mut RdoqScratch,
 ) {
+    let levels = levels.try_into().expect("RDOQ buffer has MAX_TB elements");
     rdoq_with_sign_hiding_into(tb, false, trafo_depth, ctx, levels, scratch);
 }
 
@@ -1040,9 +1059,12 @@ pub(crate) fn quantize_with_sign_hiding_into(
     qp: u8,
     bit_depth: u8,
     scan: &[(usize, usize)],
-    out: &mut [i16; MAX_TB],
+    out: &mut [i16],
 ) {
     debug_assert_eq!(scan.len(), n * n);
+    let out = out
+        .try_into()
+        .expect("quantization output buffer has MAX_TB elements");
     quantize_impl_into(coeff, n, qp, bit_depth, Some(scan), out);
 }
 
