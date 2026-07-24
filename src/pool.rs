@@ -109,6 +109,7 @@ impl ThreadPool {
         let scope = Scope {
             shared: &self.shared,
             pending: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
             _marker: PhantomData,
         };
         let out = f(&scope);
@@ -122,7 +123,19 @@ impl Drop for ThreadPool {
         // Signal retirement and wake every parked worker, then join. Any tasks
         // still queued at drop are drained by the workers before they see an empty
         // queue + shutdown; in practice `scoped` has already awaited all of them.
-        self.shared.shutdown.store(true, Ordering::Release);
+        //
+        // The flag MUST be set while holding the queue mutex. A worker parks with
+        // `ready.wait(q)`, which releases that mutex atomically; between its
+        // `shutdown` check and that release it still holds the lock. Storing the
+        // flag without the lock lets `notify_all` land in exactly that gap, where
+        // there is no waiter yet to receive it — the worker then parks forever and
+        // `join` below never returns. Taking the lock orders us either fully
+        // before the check (worker sees the flag and exits) or fully after the
+        // park (worker receives the notification).
+        {
+            let _guard = self.shared.queue.lock().unwrap();
+            self.shared.shutdown.store(true, Ordering::Release);
+        }
         self.shared.ready.notify_all();
         for h in self.handles.drain(..) {
             let _ = h.join();
@@ -155,7 +168,25 @@ fn worker_loop(shared: &Shared) {
 pub(crate) struct Scope<'scope> {
     shared: &'scope Shared,
     pending: AtomicUsize,
+    /// Set when a task unwound. The panic is re-raised on the scope owner in
+    /// [`Scope::wait`] so a worker-thread failure surfaces as a normal panic
+    /// instead of vanishing with the worker.
+    panicked: AtomicBool,
     _marker: PhantomData<&'scope ()>,
+}
+
+struct PendingGuard<'a> {
+    pending: &'a AtomicUsize,
+    panicked: &'a AtomicBool,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.panicked.store(true, Ordering::SeqCst);
+        }
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<'scope> Scope<'scope> {
@@ -166,11 +197,14 @@ impl<'scope> Scope<'scope> {
         F: FnOnce() + Send + 'scope,
     {
         self.pending.fetch_add(1, Ordering::SeqCst);
-        // `pending` lives on the caller's stack for at least `'scope`.
+        // `pending`/`panicked` live on the caller's stack for at least `'scope`.
         let pending: &'scope AtomicUsize = unsafe { &*(&self.pending as *const AtomicUsize) };
+        let panicked: &'scope AtomicBool = unsafe { &*(&self.panicked as *const AtomicBool) };
         let job: Box<dyn FnOnce() + Send + 'scope> = Box::new(move || {
+            // The guard decrements on unwind too, so a panicking task can never
+            // strand `wait()`.
+            let _guard = PendingGuard { pending, panicked };
             task();
-            pending.fetch_sub(1, Ordering::SeqCst);
         });
         // SAFETY: erase the `'scope` lifetime for the type-erased queue. `wait`
         // blocks until `pending` reaches zero, i.e. until this task has run to
@@ -180,14 +214,106 @@ impl<'scope> Scope<'scope> {
         self.shared.push(job);
     }
 
-    /// Block until every spawned task has finished, running queued tasks on the
-    /// calling thread meanwhile so it contributes instead of idling.
     fn wait(&self) {
+        // Consecutive idle spins (no task to steal, work still outstanding)
+        // before declaring the scope stuck. Each idle spin yields or sleeps, so
+        // this is minutes of no progress, never a false trip on slow encodes.
+        const STALL_LIMIT: u64 = 20_000_000;
+        let mut idle_spins: u64 = 0;
         while self.pending.load(Ordering::SeqCst) != 0 {
             match self.shared.try_pop() {
-                Some(task) => task(),
-                None => std::thread::yield_now(),
+                Some(task) => {
+                    idle_spins = 0;
+                    task();
+                }
+                None => {
+                    idle_spins += 1;
+                    assert!(
+                        idle_spins < STALL_LIMIT,
+                        "hpvca thread pool stalled: {} task(s) still pending with an empty \
+                         queue after {} idle spins — a task neither finished nor unwound",
+                        self.pending.load(Ordering::SeqCst),
+                        idle_spins,
+                    );
+                    // Spin briefly (the common case is a task finishing within
+                    // microseconds), then back off to sleeping so a long task
+                    // does not pin this core at 100%.
+                    if idle_spins < 1024 {
+                        std::hint::spin_loop();
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
             }
         }
+        assert!(
+            !self.panicked.load(Ordering::SeqCst),
+            "hpvca thread pool: a worker task panicked (see the panic printed by the \
+             worker thread above)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn panicking_task_does_not_hang_the_scope() {
+        let pool = ThreadPool::new(2);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.scoped(|scope| {
+                for i in 0..2 {
+                    scope.spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        panic!("worker task {i} fails on purpose");
+                    });
+                }
+                // Let the workers dequeue both tasks before the caller waits.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            });
+        }));
+        assert!(
+            result.is_err(),
+            "a task that panicked on a worker must surface as a panic, not a hang"
+        );
+    }
+
+    #[test]
+    fn rapid_pool_create_drop_does_not_lose_shutdown_wakeup() {
+        for _ in 0..3000 {
+            let pool = ThreadPool::new(4);
+            drop(pool);
+        }
+    }
+
+    #[test]
+    fn all_tasks_run_to_completion() {
+        let pool = ThreadPool::new(3);
+        let counter = AtomicUsize::new(0);
+        pool.scoped(|scope| {
+            for _ in 0..64 {
+                scope.spawn(|| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 64);
+    }
+
+    #[test]
+    fn zero_worker_pool_still_drains() {
+        let pool = ThreadPool::new(0);
+        let counter = AtomicUsize::new(0);
+        pool.scoped(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 16);
     }
 }
