@@ -50,8 +50,10 @@ fn clip_sample(v: i32, max_val: i32) -> u16 {
     v.max(0).min(max_val) as u16
 }
 
-/// Chroma QP mapping (HEVC Table 8-22) for 4:2:0.
-fn chroma_qp(qpi: i32, chroma: crate::fmt::ChromaFormat) -> i32 {
+/// Chroma QP mapping (HEVC Table 8-22) for 4:2:0, including the PPS Cb/Cr
+/// offset that §8.7.2.5.5 adds to the edge-average luma QP before the mapping.
+fn chroma_qp(qpi: i32, chroma: crate::fmt::ChromaFormat, cqo: i8) -> i32 {
+    let qpi = clip3(0, 57, qpi + i32::from(cqo));
     if !matches!(chroma, crate::fmt::ChromaFormat::Yuv420) {
         return qpi.min(51);
     }
@@ -83,11 +85,12 @@ pub(crate) fn deblock(
     qp: u8,
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
+    cqo: i8,
     edge_v: &[bool],
     edge_h: &[bool],
 ) {
     deblock_impl(
-        y, w, h, cb, cr, cw, ch, qp, bit_depth, chroma, edge_v, edge_h, None, 0,
+        y, w, h, cb, cr, cw, ch, qp, bit_depth, chroma, cqo, edge_v, edge_h, None, 0,
     );
 }
 
@@ -106,6 +109,7 @@ pub(crate) fn deblock_with_qp_map(
     qp: u8,
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
+    cqo: i8,
     edge_v: &[bool],
     edge_h: &[bool],
     qp_map: &[u8],
@@ -122,6 +126,7 @@ pub(crate) fn deblock_with_qp_map(
         qp,
         bit_depth,
         chroma,
+        cqo,
         edge_v,
         edge_h,
         Some(qp_map),
@@ -141,6 +146,7 @@ fn deblock_impl(
     qp: u8,
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
+    cqo: i8,
     edge_v: &[bool],
     edge_h: &[bool],
     qp_map: Option<&[u8]>,
@@ -170,6 +176,7 @@ fn deblock_impl(
                 vertical,
                 bit_depth.bits(),
                 chroma,
+                cqo,
                 edges,
                 edge_stride,
                 qp_map,
@@ -183,6 +190,7 @@ fn deblock_impl(
                 vertical,
                 bit_depth.bits(),
                 chroma,
+                cqo,
                 edges,
                 edge_stride,
                 qp_map,
@@ -421,6 +429,7 @@ fn deblock_chroma(
     vertical: bool,
     bit_depth: u8,
     chroma: crate::fmt::ChromaFormat,
+    cqo: i8,
     edges: &[bool],
     edge_stride: usize,
     qp_map: Option<&[u8]>,
@@ -439,7 +448,7 @@ fn deblock_chroma(
                 let ly = (yk + 1) * chroma.sub_h();
                 if edges[(ly / 4) * edge_stride + lx / 4] {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, true);
-                    let qp_c = chroma_qp(qpi, chroma);
+                    let qp_c = chroma_qp(qpi, chroma, cqo);
                     let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
                     filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
                 }
@@ -456,7 +465,7 @@ fn deblock_chroma(
                 let ly = yy * chroma.sub_h();
                 if edges[(ly / 4) * edge_stride + lx / 4] {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, false);
-                    let qp_c = chroma_qp(qpi, chroma);
+                    let qp_c = chroma_qp(qpi, chroma, cqo);
                     let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
                     filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
                 }
@@ -531,6 +540,7 @@ mod tests {
             40,
             crate::fmt::BitDepth::Eight,
             crate::fmt::ChromaFormat::Monochrome,
+            0,
             &edge_v,
             &edge_h,
         );
@@ -540,8 +550,10 @@ mod tests {
 
     #[test]
     fn chroma_qp_mapping_matches_format_rules() {
-        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv420), 33);
-        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv422), 35);
-        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv444), 35);
+        // A −3 Cb/Cr offset shifts qPi before the mapping:
+        // 35 − 3 = 32 → Table 8-22 gives 31 for 4:2:0, identity elsewhere.
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv420, -3), 31);
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv422, -3), 32);
+        assert_eq!(chroma_qp(35, crate::fmt::ChromaFormat::Yuv444, -3), 32);
     }
 }

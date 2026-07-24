@@ -43,6 +43,8 @@ static CTU_ACTIVITY: OnceLock<CtuActivityFn> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 pub(crate) struct CtuActivity {
+    /// Still produced by the SIMD kernels; masking now uses per-QG variances.
+    #[allow(dead_code)]
     pub(crate) mean_log_variance: f32,
     pub(crate) low_contrast_log_variance: f32,
     pub(crate) mean_luma: f32,
@@ -351,6 +353,61 @@ pub(crate) fn activity_aq_enabled(qp: u8, lossless: bool) -> bool {
     !lossless && qp >= ACTIVITY_QP_FLOOR
 }
 
+/// Mean `ln(1+variance)` of the 8×8 blocks inside each 32×32 quadrant
+/// (Z order) of one CTU, from the unpadded source. Quadrants fully outside the
+/// picture report `NaN` and are excluded from picture-level normalization.
+fn ctu_quadrant_log_variances(yuv: &Yuv, ctu_row: usize, ctu_col: usize) -> [f32; 4] {
+    let width = yuv.width as usize;
+    let height = yuv.height as usize;
+    let shift = yuv.bit_depth.bits().saturating_sub(8);
+    let mut out = [f32::NAN; 4];
+    for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let row0 = ctu_row * 64 + dy * 32;
+        let col0 = ctu_col * 64 + dx * 32;
+        if row0 >= height || col0 >= width {
+            continue;
+        }
+        let row_end = (row0 + 32).min(height);
+        let col_end = (col0 + 32).min(width);
+        let mut log_sum = 0.0f32;
+        let mut blocks = 0.0f32;
+        let mut block_row = row0;
+        while block_row < row_end {
+            let mut block_col = col0;
+            let band_end = (block_row + 8).min(row_end);
+            while block_col < col_end {
+                let cols = (block_col + 8).min(col_end) - block_col;
+                let mut sum = 0.0f32;
+                let mut sum_sq = 0.0f32;
+                let mut count = 0.0f32;
+                for r in block_row..band_end {
+                    for &sample in &yuv.y[r * width + block_col..r * width + block_col + cols] {
+                        let sample = f32::from(sample >> shift);
+                        sum += sample;
+                        sum_sq = fmla(sample, sample, sum_sq);
+                        count += 1.0;
+                    }
+                }
+                let mean = sum / count;
+                let variance = (sum_sq / count - mean * mean).max(0.0);
+                log_sum += log1p(variance);
+                blocks += 1.0;
+                block_col += 8;
+            }
+            block_row += 8;
+        }
+        out[quadrant] = log_sum / blocks.max(1.0);
+    }
+    out
+}
+
+/// Per-quantization-group (32×32) QP offsets, indexed `ctu_index * 4 +
+/// quadrant` in Z order. Activity masking operates at QG granularity; the
+/// variance/dark protections and structure correction stay per-CTU and apply
+/// to all four of its groups.
 pub(crate) fn activity_qp_offsets(
     yuv: &Yuv,
     ctus_x: usize,
@@ -360,34 +417,55 @@ pub(crate) fn activity_qp_offsets(
     variance_boost: VarianceBoost,
     ctu_activity: CtuActivityFn,
 ) -> Vec<i8> {
+    activity_qp_offsets_clamped(yuv, ctus_x, ctus_y, qp, lossless, variance_boost, ctu_activity, 3)
+}
+
+/// [`activity_qp_offsets`] with a caller-chosen clamp. Direct coding requires
+/// ±3 (the lambda-scale table), but a gridded encode computes the picture map
+/// with a wide clamp so each cell can lift its mean into its slice QP and
+/// re-center the residuals — otherwise cell-level dynamic range is lost to
+/// the clamp before the cells ever see the map.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activity_qp_offsets_clamped(
+    yuv: &Yuv,
+    ctus_x: usize,
+    ctus_y: usize,
+    qp: u8,
+    lossless: bool,
+    variance_boost: VarianceBoost,
+    ctu_activity: CtuActivityFn,
+    max_offset: i8,
+) -> Vec<i8> {
     if !activity_aq_enabled(qp, lossless) {
         return Vec::new();
     }
-    let mut activity = Vec::with_capacity(ctus_x * ctus_y);
+    let clamp_hi = f32::from(max_offset);
+    let ctus = ctus_x * ctus_y;
+    let mut activity = Vec::with_capacity(ctus);
+    let mut qg_log_variance = Vec::with_capacity(ctus * 4);
     for row in 0..ctus_y {
         for col in 0..ctus_x {
             // SAFETY: dispatch targets share the slice-based scalar contract and
             // handle partial CTUs at the coded-picture edges.
             activity.push(unsafe { ctu_activity(yuv, row, col, variance_boost.octile) });
+            qg_log_variance.extend_from_slice(&ctu_quadrant_log_variances(yuv, row, col));
         }
     }
-    let mean = activity
-        .iter()
-        .map(|value| value.mean_log_variance)
-        .sum::<f32>()
-        / activity.len().max(1) as f32;
+    let valid = qg_log_variance.iter().filter(|v| !v.is_nan());
+    let valid_count = valid.clone().count().max(1) as f32;
+    let mean = valid.sum::<f32>() / valid_count;
     let strength = ACTIVITY_STRENGTH;
-    let mut offsets: Vec<i8> = activity
+    let mut offsets: Vec<i8> = qg_log_variance
         .iter()
-        .map(|value| {
-            let masking = if variance_boost.boost_only {
+        .map(|&log_variance| {
+            let masking = if variance_boost.boost_only || log_variance.is_nan() {
                 0.0
             } else {
-                (value.mean_log_variance - mean) * strength
+                (log_variance - mean) * strength
             };
-            // Clamp to ±3: `code_one_ctu` indexes a 7-entry lambda-scale table
-            // by `offset + 3`, so offsets outside this range are undefined.
-            masking.fast_round().clamp(-3.0, 3.0) as i8
+            // Coding requires ±3 (`code_one_ctu`'s 7-entry lambda-scale table);
+            // gridded analysis widens this and re-clamps after cell rebasing.
+            masking.fast_round().clamp(-clamp_hi, clamp_hi) as i8
         })
         .collect();
 
@@ -396,10 +474,10 @@ pub(crate) fn activity_qp_offsets(
             / offsets.len().max(1) as f32)
             .fast_round() as i8;
         for offset in &mut offsets {
-            *offset = (*offset - rounded_mean).clamp(-3, 3);
+            *offset = (*offset - rounded_mean).clamp(-max_offset, max_offset);
         }
     }
-    for (offset, value) in offsets.iter_mut().zip(&activity) {
+    for (group, value) in offsets.chunks_exact_mut(4).zip(&activity) {
         let flat_boost = variance_boost_qp(value.low_contrast_log_variance, qp, variance_boost);
         let dark_boost = dark_structure_boost_qp(
             value.mean_luma,
@@ -408,8 +486,11 @@ pub(crate) fn activity_qp_offsets(
             variance_boost,
         );
         let protection = flat_boost.max(dark_boost).fast_round() as i8;
-        *offset = (*offset - protection).clamp(-3, 3);
+        for offset in group {
+            *offset = (*offset - protection).clamp(-max_offset, max_offset);
+        }
     }
+
     offsets
 }
 
@@ -456,13 +537,15 @@ mod tests {
             VarianceBoost::default(),
             ctu_activity_scalar,
         );
+        // Offsets are per 32×32 quantization group: four per CTU in Z order.
+        assert_eq!(offsets.len(), 8);
         assert!(
-            offsets[0] < 0,
-            "flat CTU should spend more bits: {offsets:?}"
+            offsets[..4].iter().all(|&offset| offset < 0),
+            "flat CTU groups should spend more bits: {offsets:?}"
         );
         assert!(
-            offsets[1] > 0,
-            "textured CTU should spend fewer bits: {offsets:?}"
+            offsets[4..].iter().all(|&offset| offset > 0),
+            "textured CTU groups should spend fewer bits: {offsets:?}"
         );
         assert!(offsets.iter().all(|&offset| (-3..=3).contains(&offset)));
     }

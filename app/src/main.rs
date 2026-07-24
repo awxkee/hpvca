@@ -33,7 +33,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
 
     let instant = Instant::now();
@@ -45,9 +45,9 @@ fn main() {
             .with_chroma(ChromaFormat::Yuv444)
             .with_parallelism(ParallelismStrategy::GridWpp)
             .with_sao(false)
-            .with_lossless(false)
-            .with_quality(90)
-            .with_speed(Speed::Slow),
+            .with_quality(70)
+            .with_speed(Speed::Slow)
+            .with_lossless(false),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

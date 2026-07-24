@@ -417,11 +417,41 @@ pub(crate) fn predict_chroma_tb_into(
     }
 }
 
-/// above samples then top-right (length n+1), `left[0..=n]` = left samples
-/// then bottom-left (length n+1). Returns filtered (above', left') in the same
-/// layout that `predict_planar` consumes (length n+1 each). Endpoints that have
-/// no outer neighbor (top-right, bottom-left) are filtered using the sample
-/// beyond them, which for our restricted reference we approximate by clamping.
+pub(crate) fn filter_luma_refs(
+    corner: u16,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    bits: u32,
+) -> (u16, [u16; 65], [u16; 65]) {
+    if n == 32 {
+        // biIntFlag (§8.4.4.2.3): both edges are near-linear end to end.
+        let threshold = 1i32 << (bits - 5);
+        let above_linear =
+            (corner as i32 + above[63] as i32 - 2 * above[31] as i32).abs() < threshold;
+        let left_linear = (corner as i32 + left[63] as i32 - 2 * left[31] as i32).abs() < threshold;
+        if above_linear && left_linear {
+            // Bilinear interpolation between the corner and each far endpoint;
+            // the corner and the endpoints themselves stay unfiltered.
+            let mut fa = [0u16; 65];
+            let mut fl = [0u16; 65];
+            for x in 0..63 {
+                let w = (63 - x) as i32;
+                fa[x] = ((w * corner as i32 + (x as i32 + 1) * above[63] as i32 + 32) >> 6) as u16;
+                fl[x] = ((w * corner as i32 + (x as i32 + 1) * left[63] as i32 + 32) >> 6) as u16;
+            }
+            fa[63] = above[63];
+            fl[63] = left[63];
+            fa[64] = above[64];
+            fl[64] = left[64];
+            return (corner, fa, fl);
+        }
+    }
+    let (fa, fl) = filter_references(corner, above, left, n);
+    let fc = ((above[0] as i32 + 2 * corner as i32 + left[0] as i32 + 2) >> 2) as u16;
+    (fc, fa, fl)
+}
+
 pub(crate) fn filter_references(
     corner: u16,
     above: &[u16],

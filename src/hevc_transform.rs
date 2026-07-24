@@ -662,6 +662,25 @@ pub(crate) struct RdoqTb<'a> {
     pub lambda: f32,
 }
 
+/// Diagnostic: `HPVCA_RDOQ=0` falls back to the plain quantizer so the
+/// contribution of RDOQ itself can be measured.
+/// Experiment: multiplier on the RDOQ trellis lambda (`HPVCA_RDOQ_LAMBDA`).
+/// Below 1 the trellis keeps more coefficients, above 1 it zeroes more.
+fn rdoq_lambda_scale() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("HPVCA_RDOQ_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
+fn rdoq_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("HPVCA_RDOQ").map(|v| v == "0").unwrap_or(false))
+}
+
 /// Rate-distortion optimized quantization for a committed luma or chroma mode.
 fn rdoq_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
@@ -671,6 +690,10 @@ fn rdoq_with_sign_hiding_into(
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
+    if rdoq_disabled() {
+        quantize_impl_into(tb.coeff, tb.n, tb.qp, tb.bit_depth, Some(tb.scan), levels);
+        return;
+    }
     let RdoqTb {
         coeff,
         n,
@@ -680,6 +703,7 @@ fn rdoq_with_sign_hiding_into(
         scan_idx,
         lambda,
     } = *tb;
+    let lambda = lambda * rdoq_lambda_scale();
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
