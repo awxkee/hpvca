@@ -417,7 +417,16 @@ pub(crate) fn activity_qp_offsets(
     variance_boost: VarianceBoost,
     ctu_activity: CtuActivityFn,
 ) -> Vec<i8> {
-    activity_qp_offsets_clamped(yuv, ctus_x, ctus_y, qp, lossless, variance_boost, ctu_activity, 3)
+    activity_qp_offsets_clamped(
+        yuv,
+        ctus_x,
+        ctus_y,
+        qp,
+        lossless,
+        variance_boost,
+        ctu_activity,
+        3,
+    )
 }
 
 /// [`activity_qp_offsets`] with a caller-chosen clamp. Direct coding requires
@@ -477,7 +486,7 @@ pub(crate) fn activity_qp_offsets_clamped(
             *offset = (*offset - rounded_mean).clamp(-max_offset, max_offset);
         }
     }
-    for (group, value) in offsets.chunks_exact_mut(4).zip(&activity) {
+    for (group, value) in offsets.as_chunks_mut::<4>().0.iter_mut().zip(&activity) {
         let flat_boost = variance_boost_qp(value.low_contrast_log_variance, qp, variance_boost);
         let dark_boost = dark_structure_boost_qp(
             value.mean_luma,

@@ -227,6 +227,7 @@ pub(crate) fn rgb_to_yuv(
 /// [`rgb_to_yuv`] into donated plane buffers, reusing their retained capacity.
 /// The buffers come back to the caller inside the returned [`Yuv`], so a
 /// leased workspace can reclaim them after encoding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rgb_to_yuv_into(
     rgb: &[u16],
     width: u32,

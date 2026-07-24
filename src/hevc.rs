@@ -39,6 +39,7 @@ use crate::{
     intra,
     yuv::Yuv,
 };
+use crate::math::FastRound;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Nalu {
@@ -1051,7 +1052,7 @@ fn code_one_ctu(
     // the mean of its four groups' offsets so the comparison is made at the
     // operating point the CU would actually be coded at.
     if aq_enabled {
-        let mean = (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).round();
+        let mean = (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
         let delta = (mean as i16).clamp(-3, 3);
         tree.qp = (i16::from(qp) + delta).clamp(0, 51) as u8;
         tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
@@ -1671,6 +1672,7 @@ fn biased_qp(quality: u8, qp_bias: i8) -> u8 {
     (i16::from(quality_to_qp(quality)) + i16::from(qp_bias)).clamp(0, 51) as u8
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_idr_slice(
     yuv: &Yuv,
     width: u32,
@@ -2520,37 +2522,15 @@ fn is_block_decoded(
 /// Base factor of the intra lambda `λ = base · 2^((qp−12)/3)` (HM's 0.57).
 /// `HPVCA_LAMBDA` overrides for experiments.
 fn lambda_base_factor() -> f32 {
-    static FACTOR: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *FACTOR.get_or_init(|| {
-        std::env::var("HPVCA_LAMBDA")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(LAMBDA_BASE_DEFAULT)
-    })
+    LAMBDA_BASE_DEFAULT
 }
+
 const LAMBDA_BASE_DEFAULT: f32 = 0.57;
 
-/// Fixed `HPVCA_CQO` override for the shared Cb/Cr QP offset, if set.
 fn chroma_qp_offset_env() -> Option<i8> {
-    static OFFSET: std::sync::OnceLock<Option<i8>> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        std::env::var("HPVCA_CQO")
-            .ok()
-            .and_then(|value| value.parse::<i8>().ok())
-            .map(|value| value.clamp(-12, 12))
-    })
+    None
 }
 
-/// Content-adaptive shared Cb/Cr QP offset (`pps_cb/cr_qp_offset`), applied
-/// consistently to chroma quantization, the chroma RD lambda and the deblock
-/// tc derivation (§8.7.2.5.5). Negative values spend more rate on chroma —
-/// which RGB-domain metrics reward heavily on normal content (a fixed −3 was
-/// −3.8% BD-rate; −4..−5 deeper still) but which *hurts* content whose luma
-/// energy is very low (dark synthetic gradients: every luma bit matters there
-/// and the chroma gain cannot pay for it — buddhabrot lost 6.6% at −4). The
-/// offset therefore scales with the picture's mean 8×8 log-luma-variance,
-/// reaching full depth for ordinary photographs and easing toward 0 in the
-/// low-energy regime. `HPVCA_CQO` forces a fixed offset for experiments.
 pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
     if lossless {
         return 0;
@@ -2577,13 +2557,7 @@ pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
     let mean_log_variance = sum / count.max(1.0);
     let scale = ((mean_log_variance - LOG_VARIANCE_LOW) / (LOG_VARIANCE_HIGH - LOG_VARIANCE_LOW))
         .clamp(0.0, 1.0);
-    if std::env::var_os("HPVCA_CQO_DEBUG").is_some() {
-        eprintln!(
-            "adaptive cqo: mean_log_var={mean_log_variance:.3} scale={scale:.3} -> {}",
-            -((DEPTH * scale).round() as i8)
-        );
-    }
-    -((DEPTH * scale).round() as i8)
+    -((DEPTH * scale).fast_round() as i8)
 }
 
 /// Chroma QP derivation from luma QP (HEVC §8.6.1), including the PPS Cb/Cr
@@ -3650,33 +3624,15 @@ const CU64_ENABLED_DEFAULT: bool = false;
 /// below to be a candidate, `HPVCA_CU64_MARGIN` the rate margin (in bits) the
 /// 64-CU must beat the four-32 alternative by.
 fn cu64_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("HPVCA_CU64")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(CU64_ENABLED_DEFAULT)
-    })
+    CU64_ENABLED_DEFAULT
 }
 
 fn cu64_gate() -> f32 {
-    static G: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        std::env::var("HPVCA_CU64_GATE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(CU_RDO_BAND_LOW)
-    })
+    CU_RDO_BAND_LOW
 }
 
 fn cu64_margin() -> f32 {
-    static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("HPVCA_CU64_MARGIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8.0)
-    })
+    0.0
 }
 
 const CU64_SAVED_SYNTAX_BITS: f32 = 22.0;

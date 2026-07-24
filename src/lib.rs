@@ -59,6 +59,7 @@ pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
+use crate::math::FastRound;
 
 const MIN_DIM: u32 = 1;
 const MAX_DIM: u32 = 16_384;
@@ -1116,12 +1117,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Full-picture per-QG AQ offset map for a gridded encode, or `None` when AQ
-/// is inactive. AQ masking is *relative* to the picture mean: computing it per
-/// 512×512 cell would make every cell normalize against itself and stop rate
-/// from shifting between flat and textured cells, so gridded paths analyze the
-/// full image once and pass each cell its window via [`cell_aq_slice`].
-#[allow(clippy::too_many_arguments)]
 fn grid_global_aq_map(
     src: &[u16],
     width: u32,
@@ -1216,7 +1211,7 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
         }
     }
     let bias = if count > 0 {
-        ((sum as f32 / count as f32).round() as i32).clamp(-12, 12) as i8
+        ((sum as f32 / count as f32).fast_round() as i32).clamp(-12, 12) as i8
     } else {
         0
     };
