@@ -30,6 +30,7 @@
 #![deny(unreachable_pub)]
 use std::mem::size_of;
 mod aq;
+mod coder_scratch;
 mod cabac;
 mod color;
 mod cost;
@@ -58,6 +59,7 @@ pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
+use crate::math::FastRound;
 
 const MIN_DIM: u32 = 1;
 const MAX_DIM: u32 = 16_384;
@@ -72,6 +74,7 @@ pub enum ParallelismStrategy {
     Single,
     /// One HEVC image coded with Wavefront Parallel Processing
     /// (`entropy_coding_sync`): CTU rows are independent CABAC substreams.
+    #[default]
     Wpp,
     /// One HEVC image combining HEVC tiles + WPP for maximum core saturation.
     TilesWpp,
@@ -81,7 +84,6 @@ pub enum ParallelismStrategy {
     /// A HEIF grid of independent HEVC images, each internally WPP'd — every cell is
     /// a plain WPP image, so it stays broadly compatible while each cell also
     /// carries its own wavefront substreams.
-    #[default]
     GridWpp,
 }
 
@@ -325,8 +327,13 @@ pub fn encode_rgb(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u8(rgb, width, height, 3)?;
-    let wide: Vec<u16> = rgb.iter().map(|&b| b as u16).collect();
-    encode_rgb_wide(&wide, width, height, BitDepth::Eight, cfg)
+    let mut ws = coder_scratch::lease();
+    let mut wide = std::mem::take(&mut ws.stage2);
+    wide.clear();
+    wide.extend(rgb.iter().map(|&b| b as u16));
+    let result = encode_rgb_wide(&wide, width, height, BitDepth::Eight, cfg);
+    ws.stage2 = wide;
+    result
 }
 
 /// Encode a packed 8-bit RGBA image to HEIC. Alpha is **discarded**.
@@ -652,7 +659,7 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
     cfg.validate()?;
     // A grid packages the picture as multiple items; the single-image strategies
     // (Wpp / TilesWpp / Single) code it as one item instead.
-    if needs_tiling(yuv.display_w, yuv.display_h) && cfg.parallelism.uses_grid() {
+    if use_grid(yuv.display_w, yuv.display_h, cfg.parallelism) {
         return encode_yuv_tiled(yuv, cfg);
     }
     encode_yuv_raw(yuv, cfg)
@@ -661,6 +668,29 @@ pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
 /// Returns true if the image is large enough to need grid tiling.
 fn needs_tiling(width: u32, height: u32) -> bool {
     width > TILE_SIZE || height > TILE_SIZE
+}
+
+/// Whether the picture is too large for a single HEVC picture and therefore
+/// *must* be split into a HEIF grid regardless of the requested strategy.
+/// Level 6.2 caps MaxLumaPs at 35 651 584 samples, and §A.4.1 caps each side
+/// at `sqrt(MaxLumaPs * 8)`.
+fn exceeds_single_picture(width: u32, height: u32) -> bool {
+    const MAX_LUMA_PS: u64 = 35_651_584;
+    const MAX_SIDE: u32 = 16_888; // floor(sqrt(MAX_LUMA_PS * 8))
+    (width as u64) * (height as u64) > MAX_LUMA_PS || width > MAX_SIDE || height > MAX_SIDE
+}
+
+/// Whether to package this picture as a HEIF grid of independent cells.
+///
+/// Grid cells are independent HEVC images: intra prediction restarts and the
+/// in-loop filters stop at every cell edge, which measured a 4.5–4.9% BD-rate
+/// penalty on smooth content (~0.1% on detailed content). A single WPP picture
+/// parallelises over CTU rows just as well, so the grid is now used only when
+/// the caller explicitly asks for a grid strategy, or when the picture cannot
+/// be represented as one HEVC picture at all.
+fn use_grid(width: u32, height: u32, parallelism: ParallelismStrategy) -> bool {
+    exceeds_single_picture(width, height)
+        || (parallelism.uses_grid() && needs_tiling(width, height))
 }
 
 /// Core RGB path: dispatches to tiled grid for large images, single `hvc1`
@@ -683,24 +713,44 @@ fn encode_rgb_wide(
     let cfg = &local_cfg;
     // A grid packages the picture as multiple HEVC items; the single-image
     // strategies code it as one item instead (handled below).
-    if needs_tiling(width, height) && cfg.parallelism.uses_grid() {
+    if use_grid(width, height, cfg.parallelism) {
         return encode_rgb_tiled(rgb, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
+    // Conversion planes come from a leased workspace and are reclaimed from
+    // the Yuv after encoding, so repeat encodes reuse their capacity.
+    let mut ws = coder_scratch::lease();
+    let (conv_y, conv_cb, conv_cr) = (
+        std::mem::take(&mut ws.conv_y),
+        std::mem::take(&mut ws.conv_cb),
+        std::mem::take(&mut ws.conv_cr),
+    );
     let mut yuv = if enc_w != width || enc_h != height {
-        let padded = pad_buf::<3>(rgb, width, height, enc_w, enc_h);
-        if cfg.lossless {
+        let mut padded = std::mem::take(&mut ws.stage);
+        pad_buf_into::<3>(&mut padded, rgb, width, height, enc_w, enc_h);
+        let yuv = if cfg.lossless {
             ycgco::rgb_to_gbr(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
         } else {
-            yuv::rgb_to_yuv(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
-        }
+            yuv::rgb_to_yuv_into(
+                &padded, enc_w, enc_h, cfg.chroma, bit_depth, conv_y, conv_cb, conv_cr,
+            )
+        };
+        ws.stage = padded;
+        yuv
     } else if cfg.lossless {
         ycgco::rgb_to_gbr(rgb, width, height, cfg.chroma, bit_depth)
     } else {
-        yuv::rgb_to_yuv(rgb, width, height, cfg.chroma, bit_depth)
+        yuv::rgb_to_yuv_into(
+            rgb, width, height, cfg.chroma, bit_depth, conv_y, conv_cb, conv_cr,
+        )
     };
     yuv = yuv.with_display(width, height);
-    encode_yuv_raw(&yuv, cfg)
+    let result = encode_yuv_raw(&yuv, cfg);
+    // Reclaim the planes (also recycles lossless-path allocations).
+    ws.conv_y = yuv.y;
+    ws.conv_cb = yuv.cb;
+    ws.conv_cr = yuv.cr;
+    result
 }
 
 fn force_identity_matrix(color: &mut ColorMetadata) {
@@ -722,7 +772,7 @@ fn encode_rgba_with_alpha_wide(
     bit_depth: BitDepth,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if needs_tiling(width, height) {
+    if use_grid(width, height, cfg.parallelism) {
         return encode_rgba_alpha_tiled(rgba, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, cfg.chroma);
@@ -803,7 +853,7 @@ fn encode_gray_wide(
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(width, height)?;
     validate_buf_u16(gray, width, height, 1)?;
-    if needs_tiling(width, height) {
+    if use_grid(width, height, cfg.parallelism) {
         return encode_gray_tiled(gray, width, height, bit_depth, cfg);
     }
     // Grayscale is always Monochrome regardless of cfg.chroma.
@@ -828,7 +878,7 @@ fn encode_gray_alpha_wide(
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(width, height)?;
     validate_buf_u16(ya, width, height, 2)?;
-    if needs_tiling(width, height) {
+    if use_grid(width, height, cfg.parallelism) {
         return encode_gray_alpha_tiled(ya, width, height, bit_depth, cfg);
     }
     let (enc_w, enc_h) = encoded_dims(width, height, ChromaFormat::Monochrome);
@@ -903,7 +953,7 @@ pub fn encode_yuv_with_alpha(
     if alpha.len() != yuv.y.len() {
         return Err(EncodeError::InvalidInput);
     }
-    if needs_tiling(yuv.display_w, yuv.display_h) {
+    if use_grid(yuv.display_w, yuv.display_h, cfg.parallelism) {
         return encode_yuv_alpha_tiled(yuv, alpha, cfg);
     }
 
@@ -969,6 +1019,9 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        None,
+        0,
+        None,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -1064,6 +1117,111 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+fn grid_global_aq_map(
+    src: &[u16],
+    width: u32,
+    height: u32,
+    channels: usize,
+    bit_depth: BitDepth,
+    quality: u8,
+    lossless: bool,
+    variance_boost: VarianceBoost,
+) -> (Option<Vec<i8>>, i8) {
+    let qp = hevc::quality_to_qp(quality);
+    if lossless {
+        return (None, 0);
+    }
+    let luma_yuv = if channels == 2 {
+        // Interleaved gray+alpha: analysis wants the luma channel only.
+        let y: Vec<u16> = src.iter().step_by(2).copied().collect();
+        build_mono_yuv(y, width, height, width, height, bit_depth)
+    } else {
+        yuv::rgb_to_yuv(src, width, height, ChromaFormat::Monochrome, bit_depth)
+    };
+    let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, false);
+    let map = aq::activity_aq_enabled(qp, false)
+        .then(|| grid_aq_offsets(&luma_yuv, qp, variance_boost));
+    (map, cqo)
+}
+
+/// [`grid_global_aq_map`] for a source that is already a [`Yuv`].
+fn grid_global_aq_map_from_yuv(
+    yuv: &Yuv,
+    quality: u8,
+    lossless: bool,
+    variance_boost: VarianceBoost,
+) -> (Option<Vec<i8>>, i8) {
+    let qp = hevc::quality_to_qp(quality);
+    if lossless {
+        return (None, 0);
+    }
+    let cqo = hevc::adaptive_chroma_qp_offset(yuv, false);
+    let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(yuv, qp, variance_boost));
+    (map, cqo)
+}
+
+fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8, variance_boost: VarianceBoost) -> Vec<i8> {
+    let ctus_x = (luma_yuv.width as usize).div_ceil(64);
+    let ctus_y = (luma_yuv.height as usize).div_ceil(64);
+    aq::activity_qp_offsets_clamped(
+        luma_yuv,
+        ctus_x,
+        ctus_y,
+        qp,
+        false,
+        variance_boost,
+        aq::resolve_ctu_activity(),
+        12,
+    )
+}
+
+/// One grid cell's window of the full-picture per-QG map, re-indexed to the
+/// cell's local CTU coordinates, plus the cell's slice-QP bias.
+///
+/// Per-QG offsets are clamped to ±3 (the lambda-scale table), so a cell whose
+/// mean activity sits far from the picture mean would saturate the clamp and
+/// lose dynamic range. The rounded mean of the cell's real-content offsets is
+/// lifted into the cell's slice QP instead (each grid cell is an independent
+/// HEVC image with its own PPS), and the residual per-QG offsets re-center
+/// around it. Groups past the true picture extent (edge cells encode
+/// replication padding) follow the bias with a neutral residual.
+fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Vec<i8>, i8) {
+    let global_ctus_x = (width as usize).div_ceil(64);
+    let global_ctus_y = (height as usize).div_ceil(64);
+    let cell_ctus = (TILE_SIZE / 64) as usize;
+    let mut local = vec![0i8; cell_ctus * cell_ctus * 4];
+    let mut sum = 0i32;
+    let mut count = 0i32;
+    for r in 0..cell_ctus {
+        for c in 0..cell_ctus {
+            let global_row = row as usize * cell_ctus + r;
+            let global_col = col as usize * cell_ctus + c;
+            let in_picture = global_row < global_ctus_y && global_col < global_ctus_x;
+            for q in 0..4 {
+                let offset = map
+                    .get((global_row * global_ctus_x + global_col) * 4 + q)
+                    .copied()
+                    .unwrap_or(0);
+                local[(r * cell_ctus + c) * 4 + q] = offset;
+                if in_picture {
+                    sum += i32::from(offset);
+                    count += 1;
+                }
+            }
+        }
+    }
+    let bias = if count > 0 {
+        ((sum as f32 / count as f32).fast_round() as i32).clamp(-12, 12) as i8
+    } else {
+        0
+    };
+    for offset in &mut local {
+        *offset = (i32::from(*offset) - i32::from(bias)).clamp(-3, 3) as i8;
+    }
+    (local, bias)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_cell(
     yuv: &Yuv,
     w: u32,
@@ -1076,39 +1234,35 @@ fn encode_cell(
     sao: bool,
     variance_boost: VarianceBoost,
     effort: Speed,
+    aq_override: Option<&[i8]>,
+    qp_bias: i8,
+    chroma_qp_offset: Option<i8>,
 ) -> Result<hevc::NaluStream, EncodeError> {
-    if cell_wpp {
+    let (wpp, wpp_threads) = if cell_wpp {
         // A WPP picture cannot run more CTU rows concurrently than it has.
         // Capping here avoids creating idle nested workers on high-core-count
         // systems encoding the fixed 512-pixel grid cells.
-        let wpp_threads = threads.min(h.div_ceil(64) as usize).max(1);
-        hevc::encode_intra_opts(
-            yuv,
-            w,
-            h,
-            quality,
-            lossless,
-            cicp,
-            true,
-            false,
-            wpp_threads,
-            sao,
-            variance_boost,
-            effort,
-        )
+        (true, threads.min(h.div_ceil(64) as usize).max(1))
     } else {
-        hevc::encode_intra(
-            yuv,
-            w,
-            h,
-            quality,
-            lossless,
-            cicp,
-            sao,
-            variance_boost,
-            effort,
-        )
-    }
+        (false, 1)
+    };
+    hevc::encode_intra_opts(
+        yuv,
+        w,
+        h,
+        quality,
+        lossless,
+        cicp,
+        wpp,
+        false,
+        wpp_threads,
+        sao,
+        variance_boost,
+        effort,
+        aq_override,
+        qp_bias,
+        chroma_qp_offset,
+    )
 }
 
 /// Encode a large RGB image as a HEIF grid of [`TILE_SIZE`]×[`TILE_SIZE`] tiles.
@@ -1135,16 +1289,37 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map(rgb, width, height, 3, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let tile = extract_rgb_tile(rgb, width, height, col, row, TILE_SIZE, 3);
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
+        // The cell's staging tile and conversion planes come from a leased
+        // workspace, so a worker crunching many cells stops allocating after
+        // its first one.
+        let mut ws = coder_scratch::lease();
+        let mut tile = std::mem::take(&mut ws.stage);
+        extract_rgb_tile_into(&mut tile, rgb, width, height, col, row, TILE_SIZE, 3);
         let yuv = if cfg.lossless {
             ycgco::rgb_to_gbr(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
         } else {
-            yuv::rgb_to_yuv(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
+            yuv::rgb_to_yuv_into(
+                &tile,
+                enc_tw,
+                enc_th,
+                cfg.chroma,
+                bit_depth,
+                std::mem::take(&mut ws.conv_y),
+                std::mem::take(&mut ws.conv_cb),
+                std::mem::take(&mut ws.conv_cr),
+            )
         };
-        encode_cell(
+        ws.stage = tile;
+        let result = encode_cell(
             &yuv,
             enc_tw,
             enc_th,
@@ -1156,7 +1331,14 @@ fn encode_rgb_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
-        )
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
+        );
+        ws.conv_y = yuv.y;
+        ws.conv_cb = yuv.cb;
+        ws.conv_cr = yuv.cr;
+        result
     })?;
     isobmff::wrap_hevc_grid(
         &tile_streams,
@@ -1191,9 +1373,15 @@ fn encode_gray_tiled(
     let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map(gray, width, height, 1, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
         let luma = extract_plane_tile(
             gray,
             width as usize,
@@ -1216,6 +1404,9 @@ fn encode_gray_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1256,9 +1447,15 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
         let x0 = (col * TILE_SIZE) as usize;
         let y0 = (row * TILE_SIZE) as usize;
 
@@ -1305,6 +1502,9 @@ fn encode_yuv_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1329,6 +1529,9 @@ fn encode_yuv_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            None,
+            0,
+            Some(0),
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1376,9 +1579,15 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
         let x0 = (col * TILE_SIZE) as usize;
         let y0 = (row * TILE_SIZE) as usize;
 
@@ -1425,6 +1634,9 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1461,9 +1673,15 @@ fn encode_rgba_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map(rgba, width, height, 4, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
         // Extract a TILE_SIZE×TILE_SIZE RGBA tile (4 ch) with edge replication.
         let tile = extract_rgb_tile(rgba, width, height, col, row, TILE_SIZE, 4);
 
@@ -1496,6 +1714,9 @@ fn encode_rgba_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1519,6 +1740,9 @@ fn encode_rgba_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            None,
+            0,
+            Some(0),
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1565,9 +1789,15 @@ fn encode_gray_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
+    let (aq_map, grid_cqo) = grid_global_aq_map(ya, width, height, 2, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
+        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
+            Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
+            None => (None, 0),
+        };
         // Extract a TILE_SIZE×TILE_SIZE YA tile (2 ch) with edge replication.
         let tile = extract_rgb_tile(ya, width, height, col, row, TILE_SIZE, 2);
 
@@ -1600,6 +1830,9 @@ fn encode_gray_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            cell_aq_offsets,
+            cell_qp_bias,
+            Some(grid_cqo),
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1622,6 +1855,9 @@ fn encode_gray_alpha_tiled(
             cfg.sao,
             cfg.variance_boost,
             cfg.speed,
+            None,
+            0,
+            Some(0),
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
@@ -1662,11 +1898,29 @@ fn extract_rgb_tile(
     tile_size: u32,
     channels: usize,
 ) -> Vec<u16> {
+    let mut tile = Vec::new();
+    extract_rgb_tile_into(&mut tile, src, src_w, src_h, col, row, tile_size, channels);
+    tile
+}
+
+/// [`extract_rgb_tile`] into a reusable buffer; every element is overwritten.
+#[allow(clippy::too_many_arguments)]
+fn extract_rgb_tile_into(
+    tile: &mut Vec<u16>,
+    src: &[u16],
+    src_w: u32,
+    src_h: u32,
+    col: u32,
+    row: u32,
+    tile_size: u32,
+    channels: usize,
+) {
     let (sw, sh) = (src_w as usize, src_h as usize);
     let ts = tile_size as usize;
     let x0 = (col * tile_size) as usize;
     let y0 = (row * tile_size) as usize;
-    let mut tile = vec![0u16; ts * ts * channels];
+    tile.clear();
+    tile.resize(ts * ts * channels, 0u16);
     for ty in 0..ts {
         let sy = (y0 + ty).min(sh - 1);
         let src_row = &src[sy * sw * channels..(sy * sw + sw) * channels];
@@ -1677,7 +1931,6 @@ fn extract_rgb_tile(
                 .copy_from_slice(&src_row[sx * channels..(sx + 1) * channels]);
         }
     }
-    tile
 }
 
 /// Extract a single-channel plane tile, replication-padding at edges.
@@ -1758,10 +2011,18 @@ fn encoded_dims(width: u32, height: u32, chroma: ChromaFormat) -> (u32, u32) {
 /// Replicate-pad a planar buffer from `(w, h)` to `(nw, nh)`.
 /// `channels` is the number of interleaved u16 samples per pixel.
 fn pad_buf<const N: usize>(src: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u16> {
+    let mut out = Vec::new();
+    pad_buf_into::<N>(&mut out, src, w, h, nw, nh);
+    out
+}
+
+/// [`pad_buf`] into a reusable buffer; every element is overwritten.
+fn pad_buf_into<const N: usize>(out: &mut Vec<u16>, src: &[u16], w: u32, h: u32, nw: u32, nh: u32) {
     let (w, h, nw, nh) = (w as usize, h as usize, nw as usize, nh as usize);
     let src_stride = w * N;
     let dst_stride = nw * N;
-    let mut out = vec![0u16; nw * nh * N];
+    out.clear();
+    out.resize(nw * nh * N, 0u16);
 
     for (dst_row_idx, dst_row) in out.chunks_exact_mut(dst_stride).enumerate() {
         let sr = dst_row_idx.min(h - 1);
@@ -1775,7 +2036,6 @@ fn pad_buf<const N: usize>(src: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec
             }
         }
     }
-    out
 }
 
 #[cfg(test)]

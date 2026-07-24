@@ -305,8 +305,11 @@ pub(crate) fn apply_luma(
     height: usize,
     bit_depth: u8,
     params: &[SaoParam],
+    source_scratch: &mut Vec<u16>,
 ) {
-    let source = plane.to_vec();
+    source_scratch.clear();
+    source_scratch.extend_from_slice(plane);
+    let source: &[u16] = source_scratch;
     let cols = width.div_ceil(64);
     let max_value = ((1u32 << bit_depth) - 1) as i32;
     for (index, &param) in params.iter().enumerate() {
@@ -399,7 +402,7 @@ mod tests {
         assert_eq!(p[0].type_idx, 1);
         assert!(p[0].offsets.contains(&4));
         let mut filtered = rec;
-        apply_luma(&mut filtered, 64, 64, 64, 8, &p);
+        apply_luma(&mut filtered, 64, 64, 64, 8, &p, &mut Vec::new());
         assert_eq!(filtered, original);
     }
 }

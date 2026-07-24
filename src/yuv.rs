@@ -212,6 +212,32 @@ pub(crate) fn rgb_to_yuv(
     chroma: ChromaFormat,
     bit_depth: BitDepth,
 ) -> Yuv {
+    rgb_to_yuv_into(
+        rgb,
+        width,
+        height,
+        chroma,
+        bit_depth,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// [`rgb_to_yuv`] into donated plane buffers, reusing their retained capacity.
+/// The buffers come back to the caller inside the returned [`Yuv`], so a
+/// leased workspace can reclaim them after encoding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rgb_to_yuv_into(
+    rgb: &[u16],
+    width: u32,
+    height: u32,
+    chroma: ChromaFormat,
+    bit_depth: BitDepth,
+    mut y_plane: Vec<u16>,
+    mut cb_plane: Vec<u16>,
+    mut cr_plane: Vec<u16>,
+) -> Yuv {
     let w = width as usize;
     let h = height as usize;
     let maxv = bit_depth.max_val() as i32;
@@ -219,36 +245,31 @@ pub(crate) fn rgb_to_yuv(
 
     if chroma.is_monochrome() {
         let channels = rgb.len() / (w * h);
-        let y_plane: Vec<u16> = if channels == 1 {
-            rgb.to_vec()
+        y_plane.clear();
+        if channels == 1 {
+            y_plane.extend_from_slice(rgb);
         } else if channels == 4 {
-            rgb.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|px| {
-                    let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-                    rgb_to_y(r, g, b).clamp(0, maxv) as u16
-                })
-                .collect()
+            y_plane.extend(rgb.as_chunks::<4>().0.iter().map(|px| {
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                rgb_to_y(r, g, b).clamp(0, maxv) as u16
+            }));
         } else if channels == 3 {
-            rgb.as_chunks::<3>()
-                .0
-                .iter()
-                .map(|px| {
-                    let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-                    rgb_to_y(r, g, b).clamp(0, maxv) as u16
-                })
-                .collect()
+            y_plane.extend(rgb.as_chunks::<3>().0.iter().map(|px| {
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                rgb_to_y(r, g, b).clamp(0, maxv) as u16
+            }));
         } else {
             unimplemented!(
                 "Amount of channels {} in 'rgb_to_yuv' is not supported",
                 channels
             )
-        };
+        }
+        cb_plane.clear();
+        cr_plane.clear();
         return Yuv {
             y: y_plane,
-            cb: Vec::new(),
-            cr: Vec::new(),
+            cb: cb_plane,
+            cr: cr_plane,
             width,
             height,
             display_w: width,
@@ -263,9 +284,12 @@ pub(crate) fn rgb_to_yuv(
     let cw = w.div_ceil(sw);
     let ch = h.div_ceil(sh);
 
-    let mut y_plane = vec![0u16; w * h];
-    let mut cb_plane = vec![0u16; cw * ch];
-    let mut cr_plane = vec![0u16; cw * ch];
+    y_plane.clear();
+    y_plane.resize(w * h, 0u16);
+    cb_plane.clear();
+    cb_plane.resize(cw * ch, 0u16);
+    cr_plane.clear();
+    cr_plane.resize(cw * ch, 0u16);
 
     let process_row = |src: &[u16],
                        y_dst: &mut [u16],

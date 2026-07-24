@@ -662,6 +662,14 @@ pub(crate) struct RdoqTb<'a> {
     pub lambda: f32,
 }
 
+fn rdoq_lambda_scale() -> f32 {
+    1.0
+}
+
+fn rdoq_disabled() -> bool {
+    false
+}
+
 /// Rate-distortion optimized quantization for a committed luma or chroma mode.
 fn rdoq_with_sign_hiding_into(
     tb: &RdoqTb<'_>,
@@ -671,6 +679,10 @@ fn rdoq_with_sign_hiding_into(
     levels: &mut [i16; MAX_TB],
     scratch: &mut RdoqScratch,
 ) {
+    if rdoq_disabled() {
+        quantize_impl_into(tb.coeff, tb.n, tb.qp, tb.bit_depth, Some(tb.scan), levels);
+        return;
+    }
     let RdoqTb {
         coeff,
         n,
@@ -680,6 +692,7 @@ fn rdoq_with_sign_hiding_into(
         scan_idx,
         lambda,
     } = *tb;
+    let lambda = lambda * rdoq_lambda_scale();
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 

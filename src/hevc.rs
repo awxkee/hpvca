@@ -39,6 +39,7 @@ use crate::{
     intra,
     yuv::Yuv,
 };
+use crate::math::FastRound;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Nalu {
@@ -423,7 +424,10 @@ pub(crate) fn build_sps(
     // the normative regular [1 2 1] reference filter, so the decoder must do
     // the same. Enabling this flag without the strong-smoothing eligibility test
     // would make encoder and decoder predictions diverge.
-    bw.write_bit(false); // strong_intra_smoothing_enabled_flag
+    // Strong (bilinear) reference smoothing for 32×32 luma TBs over smooth
+    // gradients (§8.4.4.2.3). The encoder applies the matching normative
+    // filter in `intra::filter_luma_refs`.
+    bw.write_bit(true); // strong_intra_smoothing_enabled_flag
 
     // VUI parameters: color info so decoders display correctly
     bw.write_bit(true); // vui_parameters_present_flag
@@ -491,7 +495,7 @@ fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
 
 #[cfg(test)]
 pub(crate) fn build_pps(qp: u8, lossless: bool, wpp: bool) -> Nalu {
-    build_pps_tiled(qp, lossless, wpp, 1, 1)
+    build_pps_tiled(qp, lossless, wpp, 1, 1, 0)
 }
 
 /// PPS with an optional uniform tile grid. `tile_cols`/`tile_rows` == 1 means no
@@ -502,6 +506,7 @@ pub(crate) fn build_pps_tiled(
     wpp: bool,
     tile_cols: usize,
     tile_rows: usize,
+    cqo: i8,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
@@ -527,12 +532,14 @@ pub(crate) fn build_pps_tiled(
     let aq = activity_aq_enabled(qp, lossless);
     bw.write_bit(aq); // cu_qp_delta_enabled_flag
     if aq {
-        bw.write_ue(0); // diff_cu_qp_delta_depth: QG size = CTB size (64x64)
+        // Quantization groups are 32×32: adaptive quantization steers each CTU
+        // quadrant independently (one cu_qp_delta per group, §8.6.1 prediction).
+        bw.write_ue(1); // diff_cu_qp_delta_depth
     }
 
     // pps_cb_qp_offset and pps_cr_qp_offset: ALWAYS present (HEVC spec §7.3.2.3)
-    bw.write_se(0); // pps_cb_qp_offset = 0
-    bw.write_se(0); // pps_cr_qp_offset = 0
+    bw.write_se(i32::from(cqo)); // pps_cb_qp_offset
+    bw.write_se(i32::from(cqo)); // pps_cr_qp_offset
 
     bw.write_bit(false); // pps_slice_chroma_qp_offsets_present_flag
     bw.write_bit(false); // weighted_pred_flag
@@ -602,6 +609,9 @@ pub(crate) fn encode_intra(
         sao,
         variance_boost,
         effort,
+        None,
+        0,
+        None,
     )
 }
 
@@ -619,6 +629,18 @@ pub(crate) fn encode_intra_opts(
     sao: bool,
     variance_boost: crate::VarianceBoost,
     effort: crate::Speed,
+    // Per-QG AQ offsets in THIS picture's CTU coordinates, pre-computed from
+    // the full image a grid cell belongs to. `None` = analyze locally. AQ is
+    // relative (activity vs picture mean), so a grid cell normalizing against
+    // itself mis-allocates rate across cells; the caller passes a slice of the
+    // full-picture map instead.
+    aq_override: Option<&[i8]>,
+    // Slice-QP bias for a grid cell whose mean activity offset was rebased out
+    // of the ±3 per-QG clamp (see `cell_aq_slice`).
+    qp_bias: i8,
+    // Shared Cb/Cr QP offset: grid cells receive the full picture's value so
+    // every cell treats chroma identically; `None` derives it from `yuv`.
+    chroma_qp_offset: Option<i8>,
 ) -> Result<NaluStream, EncodeError> {
     // Transquant-bypass samples are not modified by in-loop filters. Disable
     // the slice-level tool as well so no redundant SAO syntax is emitted.
@@ -655,13 +677,14 @@ pub(crate) fn encode_intra_opts(
         lossless,
         color.as_ref(),
     );
-    let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
-    let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows);
+    let qp_val: u8 = quality_to_qp(quality);
+    let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
+    let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo);
     // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
     // background workers plus the calling thread give `threads`-way concurrency; the
     // pool (and its threads) is dropped when this function returns.
     let pool = crate::pool::ThreadPool::new(threads.saturating_sub(1));
-    let (idr, _ry, _rcb, _rcr) = build_idr_slice(
+    let idr = build_idr_slice(
         yuv,
         width,
         height,
@@ -677,6 +700,9 @@ pub(crate) fn encode_intra_opts(
         sao,
         variance_boost,
         effort,
+        aq_override,
+        qp_bias,
+        cqo,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -764,6 +790,7 @@ fn encode_wpp_parallel(
     } = rec;
     let SliceCoding {
         qp,
+        cqo,
         lambda,
         lossless,
     } = coding;
@@ -791,8 +818,10 @@ fn encode_wpp_parallel(
     let qp_map = SyncSlice::new(qp_map);
 
     let worker = || {
-        // Each worker owns one reusable work area; whichever row it codes.
-        let mut scratch = Box::new(CompressionContext::new());
+        // Each worker leases one recycled work area; whichever row it codes.
+        // Only the per-CU working set is needed — planes/maps arrive shared.
+        let mut lease = crate::coder_scratch::lease();
+        let scratch = &mut lease.cc;
         scratch.rdoq_in_loop = rdoq_in_loop;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
@@ -857,17 +886,18 @@ fn encode_wpp_parallel(
                         cu_stride,
                         mode_stride,
                     },
-                    &mut scratch,
+                    &mut *scratch,
                     strides,
                     SliceCoding {
                         qp,
+                        cqo,
                         lambda,
                         lossless,
                     },
                     r,
                     col,
                     aq_predictor,
-                    aq_offsets.get(r * ctus_x + col).copied().unwrap_or(0),
+                    aq_offsets,
                     sao_params,
                     sao_enabled,
                 );
@@ -919,7 +949,7 @@ fn code_one_ctu(
     ctu_row: usize,
     ctu_col: usize,
     aq_predictor: u8,
-    aq_offset: i8,
+    aq_offsets: &[i8],
     sao_params: Option<&[crate::sao::SaoParam]>,
     sao_enabled: bool,
 ) -> u8 {
@@ -942,38 +972,20 @@ fn code_one_ctu(
     } = rec;
     let SliceCoding {
         qp,
+        cqo,
         lambda,
         lossless,
     } = coding;
     let lu_row0 = ctu_row * 64;
     let lu_col0 = ctu_col * 64;
     let aq_enabled = activity_aq_enabled(qp, lossless);
-    let target_qp = if aq_enabled {
-        (i16::from(qp) + i16::from(aq_offset)).clamp(0, 51) as u8
-    } else {
-        qp
-    };
-    let local_lambda = if aq_enabled {
-        // QP offsets are bounded to ±3, so use exact 2^(delta/3) constants
-        // instead of evaluating powf for every CTU in both SAO passes.
-        const SCALE: [f32; 7] = [
-            0.5,
-            0.629_960_54,
-            0.793_700_5,
-            1.0,
-            1.259_921_1,
-            1.587_401,
-            2.0,
-        ];
-        let delta = i16::from(target_qp) - i16::from(qp);
-        lambda * SCALE[(delta + 3) as usize]
-    } else {
-        lambda
-    };
+    // Quantization groups are 32×32 (diff_cu_qp_delta_depth = 1): each CTU
+    // quadrant gets its own AQ target, lambda and cu_qp_delta below. The tree
+    // starts at the slice operating point; the quadrant loop overrides it.
     let aq = AqCtuState {
         enabled: aq_enabled,
         predictor: aq_predictor,
-        target: target_qp,
+        target: qp,
         coded: false,
     };
 
@@ -993,19 +1005,15 @@ fn code_one_ctu(
         );
     }
 
-    // The 64×64 root cannot be a leaf until the encoder has a 64-CU / four-32-TU
-    // transform-tree path, so signal the root split and code four 32×32 quadtrees.
-    let root_ctx = (ctu_col > 0) as usize + (ctu_row > 0) as usize;
-    cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
-
     let mut tree = CuTreeState {
         yuv,
+        cqo,
         rec_y,
         rec_cb,
         rec_cr,
         strides,
-        qp: target_qp,
-        lambda: local_lambda,
+        qp,
+        lambda,
         mode_map,
         cu_depth,
         edge_v,
@@ -1017,19 +1025,152 @@ fn code_one_ctu(
         aq,
         scratch,
     };
-    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+    // With depth-0 leaves possible, the root split_cu_flag context must derive
+    // from real neighbour CU depths (a hardcoded neighbour-exists shortcut would
+    // desync the moment any neighbouring CTU is coded as a single 64×64 CU).
+    let root_ctx = split_cu_context(tree.cu_depth, lu_row0, lu_col0, 0, tree.cu_stride);
+    const AQ_LAMBDA_SCALE: [f32; 7] = [
+        0.5,
+        0.629_960_54,
+        0.793_700_5,
+        1.0,
+        1.259_921_1,
+        1.587_401,
+        2.0,
+    ];
+    let ctu_index = ctu_row * (strides.w / 64) + ctu_col;
+    let qg_offsets: [i8; 4] = std::array::from_fn(|quadrant| {
+        aq_offsets
+            .get(ctu_index * 4 + quadrant)
+            .copied()
+            .unwrap_or(0)
+    });
+    // A 64×64 CU spans all four quantization groups but resets IsCuQpDeltaCoded
+    // only once (§7.3.8.4: the reset fires at every quadtree node whose size is
+    // at least the QG size, so the 64 node is the group), i.e. it carries a
+    // single cu_qp_delta. Give it — and both arms of the decision trial below —
+    // the mean of its four groups' offsets so the comparison is made at the
+    // operating point the CU would actually be coded at.
+    if aq_enabled {
+        let mean = (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
+        let delta = (mean as i16).clamp(-3, 3);
+        tree.qp = (i16::from(qp) + delta).clamp(0, 51) as u8;
+        tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
+        tree.aq.target = tree.qp;
+    }
+    if let Some((luma_mode, mpm)) = ctu_cu64_choice(&mut tree, lu_row0, lu_col0) {
+        // Real rate trial: one 64×64 CU vs the four unsplit 32×32 CUs the flat
+        // gate guarantees. Both trials write scratch reconstruction the commit
+        // below overwrites; AQ state is restored after each trial.
+        let saved_aq = tree.aq;
+        let mut est = CabacEstimator::default();
+        let mut trial_ctx = ctx.clone();
+        let mut trial_ictx = ictx.clone();
+        code_ctu_as_cu64(
+            &mut est,
+            &mut trial_ctx,
+            &mut trial_ictx,
+            &mut tree,
+            lu_row0,
+            lu_col0,
+            luma_mode,
+            mpm,
+            false,
+        );
+        tree.aq = saved_aq;
+        let sse_64 = cu_region_sse(&tree, lu_row0, lu_col0, 64);
+        let cost_64 = sse_64 + tree.lambda * est.bits();
+        // Four unsplit 32s: each pays its split_cu_flag(0) bin on top of the
+        // leaf. The AQ state is shared across the four trials so the CTU's
+        // single cu_qp_delta is charged once, exactly as a real coding would.
+        let mut trial_aq = saved_aq;
+        let mut cost_32 = 0.0f32;
+        for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+            cost_32 += tree.lambda
+                + cost_leaf_with_aq(
+                    &mut tree,
+                    lu_row0 + dy * 32,
+                    lu_col0 + dx * 32,
+                    32,
+                    ctx,
+                    ictx,
+                    &mut trial_aq,
+                );
+        }
+        // The four leaf trials each reconstructed their own quadrant, so the
+        // region now holds the complete four-32 reconstruction.
+        let sse_32 = cu_region_sse(&tree, lu_row0, lu_col0, 64);
+        tree.aq = saved_aq;
+        // Accept only decisive pure wins: clearly cheaper in rate (a full
+        // margin beyond estimator noise) AND no distortion increase. Near-tie
+        // acceptances measured net-negative: the estimator cannot see the
+        // downstream context/MPM divergence a depth-0 CU causes, and
+        // perceptual metrics punish shared-mode smoothing of gradients more
+        // than SSE registers.
+        if cost_64 + tree.lambda * cu64_margin() <= cost_32 && sse_64 <= sse_32 {
+            cab.encode_bin(0, &mut ctx.split_cu_flag[root_ctx]);
+            code_ctu_as_cu64(
+                cab, ctx, ictx, &mut tree, lu_row0, lu_col0, luma_mode, mpm, true,
+            );
+            return tree.aq.resolved_qp();
+        }
+    }
+    cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
+    // One 32×32 quantization group per quadrant. Each derives its predicted QP
+    // per §8.6.1: qPY_A/qPY_B come from the already-coded CU left of / above
+    // the group's top-left sample when that CU lies in the SAME CTB (the
+    // per-4×4 qp_map holds every coded CU's QpY exactly as a decoder derives
+    // it), otherwise from qPY_PREV — the last CU of the previous group in
+    // decoding order, threaded across CTUs and reset per WPP row / region.
+    let mut prev_qp = aq_predictor;
+    for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
         let row = lu_row0 + dy * 32;
         let col = lu_col0 + dx * 32;
+        if tree.aq.enabled {
+            let target = (i16::from(qp) + i16::from(qg_offsets[quadrant])).clamp(0, 51) as u8;
+            let delta = (i16::from(target) - i16::from(qp)).clamp(-3, 3);
+            let qp_at = |r: usize, c: usize| tree.qp_map[(r / 4) * tree.mode_stride + c / 4];
+            let a = if dx == 1 {
+                qp_at(row, col - 1)
+            } else {
+                prev_qp
+            };
+            let b = if dy == 1 {
+                qp_at(row - 1, col)
+            } else {
+                prev_qp
+            };
+            let predictor = ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+            tree.qp = target;
+            tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
+            tree.aq = AqCtuState {
+                enabled: true,
+                predictor,
+                target,
+                coded: false,
+            };
+        }
         let plan = rdo_cu32_plan(&mut tree, row, col, ctx, ictx);
         commit_cu32_plan(cab, ctx, ictx, &mut tree, row, col, 1, plan);
+        prev_qp = tree.aq.resolved_qp();
     }
-    tree.aq.resolved_qp()
+    prev_qp
 }
 
+/// Coded substreams of one region. The reconstruction stays inside the
+/// leased [`crate::coder_scratch::CoderScratch`] the region was coded with
+/// (the deblocked/SAO recon is read from there when needed); test builds also
+/// carry owned copies for assertions.
 struct RegionOutput {
     substreams: Vec<Vec<u8>>,
+    #[cfg(test)]
     y: Vec<u16>,
+    #[cfg(test)]
     cb: Vec<u16>,
+    #[cfg(test)]
     cr: Vec<u16>,
     #[cfg(test)]
     unfiltered_y: Vec<u16>,
@@ -1062,8 +1203,10 @@ fn encode_region_pass(
     sao_params: Option<&[crate::sao::SaoParam]>,
     aq_offsets: &[i8],
     sao_enabled: bool,
-    scratch: &mut CompressionContext,
+    cqo: i8,
+    ws: &mut crate::coder_scratch::CoderScratch,
 ) -> RegionOutput {
+    use crate::coder_scratch::fill_resize;
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
     let w = ((width + 63) & !63) as usize;
@@ -1074,31 +1217,42 @@ fn encode_region_pass(
     let src_yh = yuv.height as usize;
     let src_cw = (yuv.width as usize).div_ceil(sub_w);
     let src_ch = (yuv.height as usize).div_ceil(sub_h);
-    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
+    let lambda = lambda_base_factor() * 2f32.powf((qp as f32 - 12.0) / 3.0);
     let cu_stride = w / 8;
     let mode_stride = w / 4;
-    let mut cu_depth = vec![0u8; (w / 8) * (h / 8)];
-    let mut mode_map = vec![0u8; (w / 4) * (h / 4)];
-    let mut edge_v = vec![false; (w / 4) * (h / 4)];
-    let mut edge_h = vec![false; (w / 4) * (h / 4)];
-    let mut rec_y = pad_plane(&yuv.y, src_yw, src_yh, w, h);
-    let (mut rec_cb, mut rec_cr) = if yuv.chroma.is_monochrome() {
-        (Vec::new(), Vec::new())
+    let crate::coder_scratch::CoderScratch {
+        cc: scratch,
+        rec_y,
+        rec_cb,
+        rec_cr,
+        cu_depth,
+        mode_map,
+        edge_v,
+        edge_h,
+        qp_map,
+        ..
+    } = ws;
+    fill_resize(cu_depth, (w / 8) * (h / 8), 0u8);
+    fill_resize(mode_map, (w / 4) * (h / 4), 0u8);
+    fill_resize(edge_v, (w / 4) * (h / 4), false);
+    fill_resize(edge_h, (w / 4) * (h / 4), false);
+    pad_plane_into(rec_y, &yuv.y, src_yw, src_yh, w, h);
+    if yuv.chroma.is_monochrome() {
+        rec_cb.clear();
+        rec_cr.clear();
     } else {
-        (
-            pad_plane(&yuv.cb, src_cw, src_ch, cw, ch),
-            pad_plane(&yuv.cr, src_cw, src_ch, cw, ch),
-        )
-    };
+        pad_plane_into(rec_cb, &yuv.cb, src_cw, src_ch, cw, ch);
+        pad_plane_into(rec_cr, &yuv.cr, src_cw, src_ch, cw, ch);
+    }
     let ctus_x = w / 64;
     let ctus_y = h / 64;
     // QpY on the 4x4 grid, used by the normative deblocking thresholds after
     // every CTU's delta has either been coded or inferred from its predictor.
-    let mut qp_map = if aq_offsets.is_empty() {
-        Vec::new()
+    if aq_offsets.is_empty() {
+        qp_map.clear();
     } else {
-        vec![qp; mode_stride * (h / 4)]
-    };
+        fill_resize(qp_map, mode_stride * (h / 4), qp);
+    }
     let strides = PlaneStrides {
         w,
         src_yw,
@@ -1125,14 +1279,14 @@ fn encode_region_pass(
                     },
                     yuv,
                     CtuRecState {
-                        rec_y: &mut rec_y,
-                        rec_cb: &mut rec_cb,
-                        rec_cr: &mut rec_cr,
-                        mode_map: &mut mode_map,
-                        cu_depth: &mut cu_depth,
-                        edge_v: &mut edge_v,
-                        edge_h: &mut edge_h,
-                        qp_map: &mut qp_map,
+                        rec_y: &mut *rec_y,
+                        rec_cb: &mut *rec_cb,
+                        rec_cr: &mut *rec_cr,
+                        mode_map: &mut *mode_map,
+                        cu_depth: &mut *cu_depth,
+                        edge_v: &mut *edge_v,
+                        edge_h: &mut *edge_h,
+                        qp_map: &mut *qp_map,
                         cu_stride,
                         mode_stride,
                     },
@@ -1140,16 +1294,14 @@ fn encode_region_pass(
                     strides,
                     SliceCoding {
                         qp,
+                        cqo,
                         lambda,
                         lossless,
                     },
                     ctu_row,
                     ctu_col,
                     aq_predictor,
-                    aq_offsets
-                        .get(ctu_row * ctus_x + ctu_col)
-                        .copied()
-                        .unwrap_or(0),
+                    aq_offsets,
                     sao_params,
                     sao_enabled,
                 );
@@ -1166,20 +1318,21 @@ fn encode_region_pass(
         encode_wpp_parallel(
             yuv,
             CtuRecState {
-                rec_y: &mut rec_y,
-                rec_cb: &mut rec_cb,
-                rec_cr: &mut rec_cr,
-                mode_map: &mut mode_map,
-                cu_depth: &mut cu_depth,
-                edge_v: &mut edge_v,
-                edge_h: &mut edge_h,
-                qp_map: &mut qp_map,
+                rec_y: &mut *rec_y,
+                rec_cb: &mut *rec_cb,
+                rec_cr: &mut *rec_cr,
+                mode_map: &mut *mode_map,
+                cu_depth: &mut *cu_depth,
+                edge_v: &mut *edge_v,
+                edge_h: &mut *edge_h,
+                qp_map: &mut *qp_map,
                 cu_stride,
                 mode_stride,
             },
             strides,
             SliceCoding {
                 qp,
+                cqo,
                 lambda,
                 lossless,
             },
@@ -1217,14 +1370,14 @@ fn encode_region_pass(
                     },
                     yuv,
                     CtuRecState {
-                        rec_y: &mut rec_y,
-                        rec_cb: &mut rec_cb,
-                        rec_cr: &mut rec_cr,
-                        mode_map: &mut mode_map,
-                        cu_depth: &mut cu_depth,
-                        edge_v: &mut edge_v,
-                        edge_h: &mut edge_h,
-                        qp_map: &mut qp_map,
+                        rec_y: &mut *rec_y,
+                        rec_cb: &mut *rec_cb,
+                        rec_cr: &mut *rec_cr,
+                        mode_map: &mut *mode_map,
+                        cu_depth: &mut *cu_depth,
+                        edge_v: &mut *edge_v,
+                        edge_h: &mut *edge_h,
+                        qp_map: &mut *qp_map,
                         cu_stride,
                         mode_stride,
                     },
@@ -1232,16 +1385,14 @@ fn encode_region_pass(
                     strides,
                     SliceCoding {
                         qp,
+                        cqo,
                         lambda,
                         lossless,
                     },
                     ctu_row,
                     ctu_col,
                     aq_predictor,
-                    aq_offsets
-                        .get(ctu_row * ctus_x + ctu_col)
-                        .copied()
-                        .unwrap_or(0),
+                    aq_offsets,
                     sao_params,
                     sao_enabled,
                 );
@@ -1272,43 +1423,48 @@ fn encode_region_pass(
     if !lossless {
         if qp_map.is_empty() {
             crate::deblock::deblock(
-                &mut rec_y,
+                &mut *rec_y,
                 w,
                 h,
-                &mut rec_cb,
-                &mut rec_cr,
+                &mut *rec_cb,
+                &mut *rec_cr,
                 cw,
                 ch,
                 qp,
                 yuv.bit_depth,
                 yuv.chroma,
-                &edge_v,
-                &edge_h,
+                cqo,
+                &*edge_v,
+                &*edge_h,
             );
         } else {
             crate::deblock::deblock_with_qp_map(
-                &mut rec_y,
+                &mut *rec_y,
                 w,
                 h,
-                &mut rec_cb,
-                &mut rec_cr,
+                &mut *rec_cb,
+                &mut *rec_cr,
                 cw,
                 ch,
                 qp,
                 yuv.bit_depth,
                 yuv.chroma,
-                &edge_v,
-                &edge_h,
-                &qp_map,
+                cqo,
+                &*edge_v,
+                &*edge_h,
+                &*qp_map,
                 mode_stride,
             );
         }
     }
     RegionOutput {
         substreams,
-        y: rec_y,
-        cb: rec_cb,
-        cr: rec_cr,
+        #[cfg(test)]
+        y: rec_y.clone(),
+        #[cfg(test)]
+        cb: rec_cb.clone(),
+        #[cfg(test)]
+        cr: rec_cr.clone(),
         #[cfg(test)]
         unfiltered_y,
     }
@@ -1328,25 +1484,34 @@ fn encode_region_substreams(
     sao_enabled: bool,
     variance_boost: crate::VarianceBoost,
     effort: crate::Speed,
+    aq_override: Option<&[i8]>,
+    cqo: i8,
 ) -> RegionOutput {
-    let mut scratch = Box::new(CompressionContext::new());
-    scratch.rdoq_in_loop = effort.rdoq_in_loop();
+    let mut ws = crate::coder_scratch::lease();
+    ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
     // AQ analysis is source-only and identical for the SAO analysis/commit
-    // passes. Compute it once here and share the compact CTU-offset table.
+    // passes. Compute it once here and share the compact per-QG offset table —
+    // unless the caller supplies one sliced from the full picture this region
+    // is a tile/grid cell of (local normalization would mis-allocate rate
+    // across cells; see `encode_intra_opts`).
     let ctus_x = (((width + 63) & !63) / 64) as usize;
     let ctus_y = (((height + 63) & !63) / 64) as usize;
-    let aq_offsets = if activity_aq_enabled(qp, lossless) {
-        activity_qp_offsets(
+    let computed_offsets;
+    let aq_offsets: &[i8] = if let Some(map) = aq_override {
+        map
+    } else if activity_aq_enabled(qp, lossless) {
+        computed_offsets = activity_qp_offsets(
             yuv,
             ctus_x,
             ctus_y,
             qp,
             false,
             variance_boost,
-            scratch.ctu_activity,
-        )
+            ws.cc.ctu_activity,
+        );
+        &computed_offsets
     } else {
-        Vec::new()
+        &[]
     };
     if lossless || !sao_enabled {
         return encode_region_pass(
@@ -1360,9 +1525,10 @@ fn encode_region_substreams(
             is_last_region,
             pool,
             None,
-            &aq_offsets,
+            aq_offsets,
             false,
-            &mut scratch,
+            cqo,
+            &mut ws,
         );
     }
 
@@ -1370,7 +1536,7 @@ fn encode_region_substreams(
     // on the fully reconstructed, deblocked picture. A deterministic analysis
     // pass resolves that ordering without feeding SAO pixels into intra
     // prediction. The real pass then writes the selected CTU parameters.
-    let analysis = encode_region_pass(
+    let _analysis = encode_region_pass(
         yuv,
         width,
         height,
@@ -1381,29 +1547,34 @@ fn encode_region_substreams(
         is_last_region,
         pool,
         None,
-        &aq_offsets,
+        aq_offsets,
         true,
-        &mut scratch,
+        cqo,
+        &mut ws,
     );
     let stride = ((width + 63) & !63) as usize;
     let coded_h = ((height + 63) & !63) as usize;
-    let original = pad_plane(
+    // The deblocked analysis reconstruction is still resident in the workspace.
+    let ws_ref = &mut *ws;
+    pad_plane_into(
+        &mut ws_ref.sao_original,
         &yuv.y,
         yuv.width as usize,
         yuv.height as usize,
         stride,
         coded_h,
     );
-    let lambda = 0.57_f32 * 2f32.powf((qp as f32 - 12.0) / 3.0);
+    let lambda = lambda_base_factor() * 2f32.powf((qp as f32 - 12.0) / 3.0);
     let params = crate::sao::analyze_luma(
-        &original,
-        &analysis.y,
+        &ws_ref.sao_original,
+        &ws_ref.rec_y,
         stride,
         width as usize,
         height as usize,
         yuv.bit_depth.bits(),
         lambda,
     );
+    #[allow(unused_mut)]
     let mut output = encode_region_pass(
         yuv,
         width,
@@ -1415,18 +1586,25 @@ fn encode_region_substreams(
         is_last_region,
         pool,
         Some(&params),
-        &aq_offsets,
+        aq_offsets,
         true,
-        &mut scratch,
+        cqo,
+        &mut ws,
     );
+    let ws_ref = &mut *ws;
     crate::sao::apply_luma(
-        &mut output.y,
+        &mut ws_ref.rec_y,
         stride,
         width as usize,
         height as usize,
         yuv.bit_depth.bits(),
         &params,
+        &mut ws_ref.sao_apply,
     );
+    #[cfg(test)]
+    {
+        output.y = ws.rec_y.clone();
+    }
     output
 }
 
@@ -1484,6 +1662,17 @@ fn assemble_substreams(hdr: &mut BitWriter, substreams: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51.
+pub(crate) fn quality_to_qp(quality: u8) -> u8 {
+    ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8
+}
+
+/// Quality→QP with a grid cell's slice-QP rebias applied.
+fn biased_qp(quality: u8, qp_bias: i8) -> u8 {
+    (i16::from(quality_to_qp(quality)) + i16::from(qp_bias)).clamp(0, 51) as u8
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_idr_slice(
     yuv: &Yuv,
     width: u32,
@@ -1494,7 +1683,10 @@ fn build_idr_slice(
     sao: bool,
     variance_boost: crate::VarianceBoost,
     effort: crate::Speed,
-) -> Result<(Nalu, Vec<u16>, Vec<u16>, Vec<u16>), EncodeError> {
+    aq_override: Option<&[i8]>,
+    qp_bias: i8,
+    cqo: i8,
+) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
         threads,
@@ -1502,8 +1694,7 @@ fn build_idr_slice(
         tile_rows,
         pool,
     } = plan;
-    // Map quality (1-100) to HEVC QP (0-51): quality=100→QP~10, quality=1→QP=51
-    let qp_val: u8 = ((100 - quality.clamp(1, 100) as u32) * 41 / 99 + 10).min(51) as u8;
+    let qp_val: u8 = biased_qp(quality, qp_bias);
     let _ = quality; // used above
 
     // ── Slice header ────────────────────────────────────────────────────────
@@ -1523,8 +1714,10 @@ fn build_idr_slice(
     if !yuv.chroma.is_monochrome() {
         hdr.write_bit(false); // slice_sao_chroma_flag = 0 (luma SAO search only)
     }
-    // QP is carried fully in the PPS init_qp_minus26, so slice_qp_delta = 0.
-    hdr.write_se(0); // slice_qp_delta
+    // The shared PPS carries the unbiased base QP (grid cells share one hvcC
+    // parameter-set config, so a per-cell PPS init_qp would never reach the
+    // decoder); a rebased grid cell shifts its QP here instead.
+    hdr.write_se(i32::from(qp_bias)); // slice_qp_delta
     // slice_loop_filter_across_slices_enabled_flag — REQUIRED here by HEVC §7.3.6.1:
     // it is present whenever pps_loop_filter_across_slices_enabled_flag (set in our
     // PPS) is 1 and (slice_sao_luma_flag || slice_sao_chroma_flag || deblocking not
@@ -1543,9 +1736,6 @@ fn build_idr_slice(
     // an independent region coded in parallel on the pool and its substreams are
     // concatenated in tile-scan order.
     let num_tiles = tile_cols * tile_rows;
-    let mut final_y = Vec::new();
-    let mut final_cb = Vec::new();
-    let mut final_cr = Vec::new();
     let slice_data = if num_tiles <= 1 {
         let output = encode_region_substreams(
             yuv,
@@ -1560,10 +1750,9 @@ fn build_idr_slice(
             sao,
             variance_boost,
             effort,
+            aq_override,
+            cqo,
         );
-        final_y = output.y;
-        final_cb = output.cb;
-        final_cr = output.cr;
         let substreams = output.substreams;
         if wpp {
             assemble_substreams(&mut hdr, &substreams)
@@ -1590,6 +1779,48 @@ fn build_idr_slice(
                 bounds.push((x0, y0, tw, th));
             }
         }
+        // AQ is normalized against the WHOLE picture: compute (or take) the
+        // full map here and hand each tile its window, so rate still shifts
+        // between flat and textured tiles instead of each tile spending as if
+        // it were an average picture.
+        let computed_map;
+        let full_map: Option<&[i8]> = if let Some(map) = aq_override {
+            Some(map)
+        } else if activity_aq_enabled(qp_val, lossless) {
+            computed_map = activity_qp_offsets(
+                yuv,
+                ctus_x,
+                ctus_y,
+                qp_val,
+                lossless,
+                variance_boost,
+                crate::aq::resolve_ctu_activity(),
+            );
+            Some(&computed_map)
+        } else {
+            None
+        };
+        let tile_maps: Vec<Vec<i8>> = bounds
+            .iter()
+            .map(|&(x0, y0, tw, th)| {
+                let Some(map) = full_map else {
+                    return Vec::new();
+                };
+                let (ltx, lty) = (tw / 64, th / 64);
+                let mut local = vec![0i8; ltx * lty * 4];
+                for r in 0..lty {
+                    for c in 0..ltx {
+                        for q in 0..4 {
+                            local[(r * ltx + c) * 4 + q] = map
+                                .get(((y0 / 64 + r) * ctus_x + x0 / 64 + c) * 4 + q)
+                                .copied()
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
         // Tiles run concurrently AND each WPP-parallelizes its rows internally (nested
         // on the shared pool). Give every tile the full thread count and let the pool's
         // single work queue balance the combined tile×row tasks across the cores.
@@ -1601,6 +1832,7 @@ fn build_idr_slice(
             pool.scoped(|s| {
                 for (idx, &(x0, y0, tw, th)) in bounds.iter().enumerate() {
                     let is_last = idx == num_tiles - 1;
+                    let tile_map = &tile_maps[idx];
                     s.spawn(move || {
                         let tile_yuv = extract_tile_yuv(yuv, x0, y0, tw, th);
                         let output = encode_region_substreams(
@@ -1616,6 +1848,8 @@ fn build_idr_slice(
                             sao,
                             variance_boost,
                             effort,
+                            full_map.map(|_| tile_map.as_slice()),
+                            cqo,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -1625,35 +1859,9 @@ fn build_idr_slice(
                 }
             });
         }
-        final_y.resize(w * h, 0);
-        let sub_w = yuv.chroma.sub_w();
-        let sub_h = yuv.chroma.sub_h();
-        let cw = w / sub_w;
-        let ch = h / sub_h;
-        if !yuv.chroma.is_monochrome() {
-            final_cb.resize(cw * ch, 0);
-            final_cr.resize(cw * ch, 0);
-        }
         let mut all = Vec::new();
-        for (idx, output) in tile_outputs.into_iter().enumerate() {
+        for output in tile_outputs.into_iter() {
             let output = output.expect("tile worker did not produce output");
-            let (x0, y0, tw, th) = bounds[idx];
-            for r in 0..th {
-                final_y[(y0 + r) * w + x0..(y0 + r) * w + x0 + tw]
-                    .copy_from_slice(&output.y[r * tw..r * tw + tw]);
-            }
-            if !yuv.chroma.is_monochrome() {
-                let cx0 = x0 / sub_w;
-                let cy0 = y0 / sub_h;
-                let tcw = tw / sub_w;
-                let tch = th / sub_h;
-                for r in 0..tch {
-                    final_cb[(cy0 + r) * cw + cx0..(cy0 + r) * cw + cx0 + tcw]
-                        .copy_from_slice(&output.cb[r * tcw..r * tcw + tcw]);
-                    final_cr[(cy0 + r) * cw + cx0..(cy0 + r) * cw + cx0 + tcw]
-                        .copy_from_slice(&output.cr[r * tcw..r * tcw + tcw]);
-                }
-            }
             all.extend(output.substreams);
         }
         assemble_substreams(&mut hdr, &all)
@@ -1663,20 +1871,32 @@ fn build_idr_slice(
     let mut nalu_data = hdr.finish();
     nalu_data.extend_from_slice(&slice_data);
 
-    Ok((
-        Nalu {
-            _nal_type: 20,
-            data: nalu_data,
-        },
-        final_y,
-        final_cb,
-        final_cr,
-    ))
+    Ok(Nalu {
+        _nal_type: 20,
+        data: nalu_data,
+    })
 }
 
 /// Pad a plane to (dst_w × dst_h) by edge-replication.
+#[allow(dead_code)]
 fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u16> {
-    let mut out = vec![128u16; dst_w * dst_h];
+    let mut out = Vec::new();
+    pad_plane_into(&mut out, src, src_w, src_h, dst_w, dst_h);
+    out
+}
+
+/// [`pad_plane`] into a reusable buffer: every element of the (dst_w × dst_h)
+/// output is written, so recycled workspace contents can never leak through.
+fn pad_plane_into(
+    out: &mut Vec<u16>,
+    src: &[u16],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) {
+    out.clear();
+    out.resize(dst_w * dst_h, 128u16);
     for r in 0..dst_h {
         let sr = r.min(src_h - 1);
         let src_row = &src[sr * src_w..sr * src_w + src_w];
@@ -1687,8 +1907,6 @@ fn pad_plane(src: &[u16], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize
         let edge = src_row[src_w - 1];
         dst_row[src_w..].fill(edge);
     }
-
-    out
 }
 
 /// Copy a `tw × th` window starting at (x0, y0) out of a plane, replicating the
@@ -2301,11 +2519,52 @@ fn is_block_decoded(
     order(nr, nc) < order(cur_r, cur_c)
 }
 
-/// Chroma QP derivation from luma QP (HEVC §8.6.1). The mapping table from qPi to
-/// QpC applies only to 4:2:0 (ChromaArrayType 1); for 4:2:2 (and 4:4:4) QpC = qPi
-/// clamped to 51.
-fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat) -> u8 {
-    let qpi = (qp as i32).clamp(0, 57);
+/// Base factor of the intra lambda `λ = base · 2^((qp−12)/3)` (HM's 0.57).
+/// `HPVCA_LAMBDA` overrides for experiments.
+fn lambda_base_factor() -> f32 {
+    LAMBDA_BASE_DEFAULT
+}
+
+const LAMBDA_BASE_DEFAULT: f32 = 0.57;
+
+fn chroma_qp_offset_env() -> Option<i8> {
+    None
+}
+
+pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
+    if lossless {
+        return 0;
+    }
+    if let Some(fixed) = chroma_qp_offset_env() {
+        return fixed;
+    }
+    const DEPTH: f32 = 4.0;
+    const LOG_VARIANCE_LOW: f32 = 1.2;
+    const LOG_VARIANCE_HIGH: f32 = 2.6;
+    let ctus_x = (yuv.width as usize).div_ceil(64);
+    let ctus_y = (yuv.height as usize).div_ceil(64);
+    let activity = crate::aq::resolve_ctu_activity();
+    let mut sum = 0.0f32;
+    let mut count = 0.0f32;
+    for row in 0..ctus_y {
+        for col in 0..ctus_x {
+            // SAFETY: dispatch targets share the slice-based scalar contract.
+            let ctu = unsafe { activity(yuv, row, col, 6) };
+            sum += ctu.mean_log_variance;
+            count += 1.0;
+        }
+    }
+    let mean_log_variance = sum / count.max(1.0);
+    let scale = ((mean_log_variance - LOG_VARIANCE_LOW) / (LOG_VARIANCE_HIGH - LOG_VARIANCE_LOW))
+        .clamp(0.0, 1.0);
+    -((DEPTH * scale).fast_round() as i8)
+}
+
+/// Chroma QP derivation from luma QP (HEVC §8.6.1), including the PPS Cb/Cr
+/// offset. The mapping table from qPi to QpC applies only to 4:2:0
+/// (ChromaArrayType 1); for 4:2:2 (and 4:4:4) QpC = qPi clamped to 51.
+fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat, cqo: i8) -> u8 {
+    let qpi = (qp as i32 + i32::from(cqo)).clamp(0, 57);
     match chroma {
         crate::fmt::ChromaFormat::Yuv420 => {
             static QP_C: [u8; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
@@ -2328,10 +2587,7 @@ fn chroma_qp_for(qp: u8, chroma: crate::fmt::ChromaFormat) -> u8 {
 /// `2^((QpC-QpY)/3)` is algebraically identical and avoids touching distortion.
 /// Only 4:2:0 has a non-linear QpC mapping in this encoder.
 #[inline]
-fn chroma_lambda_scale(qp_y: u8, chroma: crate::fmt::ChromaFormat) -> f32 {
-    if !matches!(chroma, crate::fmt::ChromaFormat::Yuv420) {
-        return 1.0;
-    }
+fn chroma_lambda_scale(qp_y: u8, chroma: crate::fmt::ChromaFormat, cqo: i8) -> f32 {
     const DELTA_SCALE: [f32; 7] = [
         1.0,
         0.793_700_5,
@@ -2341,9 +2597,15 @@ fn chroma_lambda_scale(qp_y: u8, chroma: crate::fmt::ChromaFormat) -> f32 {
         0.314_980_27,
         0.25,
     ];
-    let qp_c = chroma_qp_for(qp_y, chroma);
-    let delta = qp_y.saturating_sub(qp_c).min(6) as usize;
-    DELTA_SCALE[delta]
+    let qp_c = chroma_qp_for(qp_y, chroma, cqo);
+    let delta = qp_y as i32 - qp_c as i32;
+    if (0..=6).contains(&delta) {
+        DELTA_SCALE[delta as usize]
+    } else {
+        // Negative delta (chroma QP above luma via the PPS offset) or beyond the
+        // table: exact 2^(−delta/3), matching the table's law.
+        2f32.powf(-(delta as f32) / 3.0)
+    }
 }
 
 struct CuGeometry {
@@ -2385,6 +2647,7 @@ struct CuRecPlanes<'a> {
 
 struct CuParams {
     qp: u8,
+    cqo: i8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
     /// Luma CU/prediction side: 8, 16, or 32. The root TU may either match
@@ -2468,6 +2731,8 @@ fn encode_cu_qp_delta_if_needed<W: CabacWriter>(
 #[derive(Clone, Copy)]
 struct SliceCoding {
     qp: u8,
+    /// Shared Cb/Cr QP offset for this picture (see `adaptive_chroma_qp_offset`).
+    cqo: i8,
     lambda: f32,
     lossless: bool,
 }
@@ -2581,6 +2846,7 @@ struct NxnGeom {
 #[derive(Clone, Copy)]
 struct NxnParams {
     qp_slice: u8,
+    cqo: i8,
     qp: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
@@ -2671,7 +2937,7 @@ enum TuLayout {
 /// zeroing and return-value memmoves from every mode/CU while remaining safe and
 /// naturally private to each parallel tile encoder.
 #[repr(align(64))]
-struct CompressionContext {
+pub(crate) struct CompressionContext {
     satd: crate::cost::SatdFn,
     ctu_activity: crate::aq::CtuActivityFn,
     fwd_transform: crate::hevc_transform::FwdTransformFn,
@@ -2697,13 +2963,38 @@ struct CompressionContext {
     chroma_tbs: [ChromaTb; 2],
     tu_tree: TuTreeScratch,
     rdoq: crate::hevc_transform::RdoqScratch,
+    cu64: Cu64Scratch,
     /// When set (Effort::Slow), the reconstructed intra shortlist is RDOQ'd
     /// inside the RD loop rather than only the committed winner.
     rdoq_in_loop: bool,
 }
 
+/// Per-TU coefficient storage for the 64×64-CU (four-32×32-TU) CTU path: four
+/// 32×32 luma TBs plus four 16×16 chroma TB pairs, in Z order.
+struct Cu64Scratch {
+    y_zz: [[i16; 1024]; 4],
+    cb_zz: [[i16; 256]; 4],
+    cr_zz: [[i16; 256]; 4],
+    y_nz: [bool; 4],
+    cb_nz: [bool; 4],
+    cr_nz: [bool; 4],
+}
+
+impl Cu64Scratch {
+    const fn new() -> Self {
+        Self {
+            y_zz: [[0; 1024]; 4],
+            cb_zz: [[0; 256]; 4],
+            cr_zz: [[0; 256]; 4],
+            y_nz: [false; 4],
+            cb_nz: [false; 4],
+            cr_nz: [false; 4],
+        }
+    }
+}
+
 impl CompressionContext {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             satd: crate::cost::resolve_satd(),
             ctu_activity: crate::aq::resolve_ctu_activity(),
@@ -2730,6 +3021,7 @@ impl CompressionContext {
             chroma_tbs: [ChromaTb::new(), ChromaTb::new()],
             tu_tree: TuTreeScratch::new(),
             rdoq: crate::hevc_transform::RdoqScratch::new(),
+            cu64: Cu64Scratch::new(),
             rdoq_in_loop: false,
         }
     }
@@ -2761,6 +3053,8 @@ struct PlaneStrides {
 /// on the SPS minimum-CU (8×8 luma) grid.
 struct CuTreeState<'a> {
     yuv: &'a Yuv,
+    /// Shared Cb/Cr QP offset for this picture.
+    cqo: i8,
     rec_y: &'a mut [u16],
     rec_cb: &'a mut [u16],
     rec_cr: &'a mut [u16],
@@ -2830,6 +3124,7 @@ fn encode_cu_leaf(
         state.strides,
         SliceCoding {
             qp: state.qp,
+            cqo: state.cqo,
             lambda: state.lambda,
             lossless: state.lossless,
         },
@@ -3140,10 +3435,26 @@ fn cost_leaf(
     base_ctx: &ContextSet,
     base_ictx: &IntraModeContexts,
 ) -> f32 {
+    let mut aq = tree.aq;
+    cost_leaf_with_aq(tree, row, col, size, base_ctx, base_ictx, &mut aq)
+}
+
+/// [`cost_leaf`] with caller-owned AQ state, so a sequence of leaf trials that
+/// models one coded unit charges the cu_qp_delta bits exactly once instead of
+/// once per trial.
+#[allow(clippy::too_many_arguments)]
+fn cost_leaf_with_aq(
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    size: usize,
+    base_ctx: &ContextSet,
+    base_ictx: &IntraModeContexts,
+    aq: &mut AqCtuState,
+) -> f32 {
     let mut est = CabacEstimator::default();
     let mut ctx = base_ctx.clone();
     let mut ictx = base_ictx.clone();
-    let mut aq = tree.aq;
     code_one_cu(
         Entropy {
             enc: &mut est,
@@ -3164,24 +3475,31 @@ fn cost_leaf(
         tree.strides,
         SliceCoding {
             qp: tree.qp,
+            cqo: tree.cqo,
             lambda: tree.lambda,
             lossless: tree.lossless,
         },
         &mut *tree.mode_map,
         tree.mode_stride,
-        &mut aq,
+        aq,
         &mut *tree.scratch,
     );
     cu_region_sse(tree, row, col, size) + tree.lambda * est.bits()
 }
 
-/// Source-proxy confidence band for the hybrid CU-quadtree search. Full RDO is
-/// paid only where the cheap `fast_cu_split_score` is *ambiguous* about the 32×32
-/// node (score near the proxy's own split point of 1.0). Below the band the node
-/// is confidently a single 32 (no trials); above it the proxy's structural plan is
-/// trusted. This confines the expensive real trials to the small uncertain
-/// minority, keeping runtime close to the pure proxy while recovering most of the
-/// achievable RD gain.
+/// Source-proxy confidence band for the hybrid CU-quadtree search. Below the
+/// band the node is confidently a single 32 (no trials). Within the band
+/// (ambiguous, near the proxy's own split point of 1.0) real trials always run.
+/// Above the band the proxy's *no-split* verdict is trusted, but its split
+/// plan is not: textured nodes run the real trials at every QP, seeded by the
+/// proxy plan's 8-trial gates.
+///
+/// These trials were once skipped below QP 23 to save time at high quality.
+/// That was wrong and cost 2.6–3.7% BD-rate there: `fast_cu_split_score`
+/// divides its predicted gain by a λ-scaled rate penalty, so as QP falls the
+/// score rises and *every* node lands above the band — exactly where the
+/// proxy's structural plan is trusted blindly. High quality is therefore the
+/// regime that needs the trials most, not least.
 ///
 /// (A cheaper SATD-domain estimator was tried in place of the real trials but did
 /// not help: with an uncoded region of `rec_y` holding the source, every block
@@ -3195,10 +3513,10 @@ const CU_RDO_BAND_HIGH: f32 = 3.0;
 const CU_RDO_SPLIT8_GATE: f32 = 0.30;
 
 /// Hybrid rate–distortion CU-quadtree decision for one 32×32 region.
-/// - proxy score < LOW  → confidently flat: commit a single 32, no trials.
-/// - proxy score ≥ HIGH → confidently textured: trust the proxy's structural plan.
-/// - otherwise (ambiguous) → measure real J of {32} vs {four 16s, each the cheaper
-///   of 16 / four-8} by actually encoding each surviving candidate, and keep it.
+/// - proxy score < LOW → confidently flat: commit a single 32, no trials.
+/// - proxy score ≥ HIGH → trust its no-split verdict, trial its split plan.
+/// - otherwise → measure real J of {32} vs {four 16s, each the cheaper of
+///   16 / four-8} by actually encoding each surviving candidate, and keep it.
 ///
 /// The winning [`Cu32Plan`] is committed once by [`commit_cu32_plan`].
 fn rdo_cu32_plan(
@@ -3212,16 +3530,31 @@ fn rdo_cu32_plan(
     if score < CU_RDO_BAND_LOW {
         return Cu32Plan::default();
     }
-    if score >= CU_RDO_BAND_HIGH {
-        return fast_cu32_plan(tree, row, col);
-    }
+    // Above the band the proxy's *no-split* verdict is still trusted (rare for
+    // high scores, and those nodes are confidently coherent); its split plan is
+    // no longer trusted structurally — it only seeds the 8-trial gates below.
+    let trusted = score >= CU_RDO_BAND_HIGH;
+    let plan = if trusted {
+        let plan = fast_cu32_plan(tree, row, col);
+        if !plan.split_32 {
+            return plan;
+        }
+        Some(plan)
+    } else {
+        None
+    };
 
     // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
     let flag = tree.lambda;
 
     let cost_32 = cost_leaf(tree, row, col, 32, ctx, ictx);
 
-    let mut cost_split = 0.0f32;
+    // Flag accounting differs slightly by region (kept as separately tuned):
+    // the trusted path charges the root split_cu_flag and prices the 8-walk
+    // bare; the band path skips the root flag and folds one flag into the
+    // 8-walk. Both were validated empirically — see the E5 sweep.
+    let (root_flag, walk_flag) = if trusted { (flag, 0.0) } else { (0.0, flag) };
+    let mut cost_split = root_flag;
     let mut split_16 = [false; 4];
     for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
         .into_iter()
@@ -3229,20 +3562,31 @@ fn rdo_cu32_plan(
     {
         let r = row + dy * 16;
         let c = col + dx * 16;
+        // Every remaining trial can only add cost: once the accumulated split
+        // cost reaches the whole-32 cost the comparison is already decided.
+        cost_split += flag;
+        if cost_split >= cost_32 {
+            return Cu32Plan::default();
+        }
         let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
-        // Only trial the four-8 split where the proxy sees real sub-block texture.
-        let cost_8 = if fast_cu_split_score(tree, r, c, 16) < CU_RDO_SPLIT8_GATE {
-            f32::INFINITY
-        } else {
-            let mut sum = flag;
+        // Only trial the four-8 split where the proxy sees real sub-block
+        // texture (the proxy's own split threshold when its plan is available).
+        let try_8 = match &plan {
+            Some(plan) => plan.split_16[index],
+            None => fast_cu_split_score(tree, r, c, 16) >= CU_RDO_SPLIT8_GATE,
+        };
+        let cost_8 = if try_8 {
+            let mut sum = walk_flag;
             for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                 sum += cost_leaf(tree, r + ey * 8, c + ex * 8, 8, ctx, ictx);
             }
             sum
+        } else {
+            f32::INFINITY
         };
         // Both sub-options pay this 16-level split_cu_flag (0 or 1).
         split_16[index] = cost_8 < cost_16;
-        cost_split += flag + cost_16.min(cost_8);
+        cost_split += cost_16.min(cost_8);
     }
 
     if cost_32 <= cost_split {
@@ -3262,6 +3606,655 @@ fn rdo_cu32_plan(
 struct Cu32Plan {
     split_32: bool,
     split_16: [bool; 4],
+}
+
+/// Master switch for the 64×64-CU (four-32×32-TU) CTU path. The coder is
+/// complete and conformant (hpvcd / Apple sips / libheif all decode it, across
+/// Single/Wpp/GridWpp), but it is DISABLED: measured on flat/synthetic and
+/// natural sets, the direct win is tiny (~22 bits per ultra-flat CTU) and it
+/// is dominated by downstream context/MPM divergence that flips later CTU
+/// decisions quasi-randomly — per-image BD-rate swung −0.9%..+0.7% with mean
+/// ≈ +0.1% (worse) across every acceptance policy tried (J-only, pure-win
+/// J+SSE, decisive-margin). Re-enable and re-measure if the mode search or
+/// context modeling changes materially; see the hevc-lossy-rdo memory note.
+const CU64_ENABLED_DEFAULT: bool = false;
+
+/// Experiment knobs for the 64×64-CU path: `HPVCA_CU64=1` enables it,
+/// `HPVCA_CU64_GATE` sets the per-quadrant flatness threshold a CTU must sit
+/// below to be a candidate, `HPVCA_CU64_MARGIN` the rate margin (in bits) the
+/// 64-CU must beat the four-32 alternative by.
+fn cu64_enabled() -> bool {
+    CU64_ENABLED_DEFAULT
+}
+
+fn cu64_gate() -> f32 {
+    CU_RDO_BAND_LOW
+}
+
+fn cu64_margin() -> f32 {
+    0.0
+}
+
+const CU64_SAVED_SYNTAX_BITS: f32 = 22.0;
+const CU64_PREFILTER_SLACK: f32 = 1.0;
+
+fn ctu_cu64_choice(tree: &mut CuTreeState<'_>, row: usize, col: usize) -> Option<(u8, [u8; 3])> {
+    if !cu64_enabled()
+        || tree.lossless
+        || !matches!(tree.yuv.chroma, crate::fmt::ChromaFormat::Yuv420)
+    {
+        return None;
+    }
+    // Only confidently flat CTUs: every quadrant below the no-trial band, so
+    // the four-32 alternative is exactly four unsplit 32×32 CUs (the plan
+    // machinery would return `Cu32Plan::default()` for each without trials).
+    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+        if fast_cu_split_score(tree, row + dy * 32, col + dx * 32, 32) >= cu64_gate() {
+            return None;
+        }
+    }
+
+    let stride = tree.strides.w;
+    let coded_yh = tree.rec_y.len() / stride;
+    let neutral = tree.yuv.bit_depth.neutral();
+    let max_val = tree.yuv.bit_depth.max_val();
+
+    // MPM derivation for the CU at the CTU origin: the above neighbour is in the
+    // previous CTB row, so cand_b is always DC (same rule as `encode_cu`).
+    let mode_at = |r: usize, c: usize| tree.mode_map[(r / 4) * tree.mode_stride + c / 4];
+    let cand_a = if col > 0 && is_block_decoded(row, col - 1, row, col, 64, stride) {
+        mode_at(row, col - 1)
+    } else {
+        intra::DC
+    };
+    let mpm = mpm_list(cand_a, intra::DC);
+
+    let mut candidates = [0u8; 7];
+    let mut count = 0usize;
+    for mode in [intra::PLANAR, intra::DC, 10, 26, mpm[0], mpm[1], mpm[2]] {
+        if !candidates[..count].contains(&mode) {
+            candidates[count] = mode;
+            count += 1;
+        }
+    }
+
+    let lambda_mode = tree.lambda.sqrt();
+    let mut shared_satd = [0f32; 7];
+    let mut independent_best = 0f32;
+    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+        let r = row + dy * 32;
+        let c = col + dx * 32;
+        extract_block_n_into::<32>(
+            &tree.yuv.y,
+            tree.strides.src_yw,
+            tree.strides.src_yh,
+            r,
+            c,
+            &mut tree.scratch.orig,
+        );
+        let (corner0, above0, left0) = intra::get_reference_samples(
+            tree.rec_y,
+            intra::LumaRefGeometry {
+                stride,
+                block_row: r,
+                block_col: c,
+                height: coded_yh,
+                n: 32,
+                ctu: 64,
+                ctus_x: stride / 64,
+                min_pu: 8,
+                neutral,
+            },
+        );
+        let (fc, fa, fl) =
+            intra::filter_luma_refs(corner0, &above0, &left0, 32, max_val.count_ones());
+        let mut quadrant_best = f32::MAX;
+        for (slot, &mode) in candidates[..count].iter().enumerate() {
+            let (corner, above, left): (u16, &[u16], &[u16]) =
+                if intra::should_filter_refs(mode, 32) {
+                    (fc, &fa, &fl)
+                } else {
+                    (corner0, &above0, &left0)
+                };
+            match mode {
+                intra::PLANAR => {
+                    intra::predict_planar_into(above, left, 32, &mut tree.scratch.pred)
+                }
+                intra::DC => intra::predict_dc_into(above, left, 32, true, &mut tree.scratch.pred),
+                _ => intra::predict_angular_into(
+                    corner,
+                    above,
+                    left,
+                    32,
+                    mode,
+                    true,
+                    max_val as i32,
+                    &mut tree.scratch.pred,
+                    &mut tree.scratch.angular,
+                ),
+            }
+            let satd = tree
+                .scratch
+                .satd(&tree.scratch.orig[..1024], &tree.scratch.pred[..1024], 32)
+                as f32;
+            shared_satd[slot] += satd;
+            let with_bins = satd + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
+            quadrant_best = quadrant_best.min(with_bins);
+        }
+        independent_best += quadrant_best;
+    }
+
+    let mut best_slot = 0usize;
+    let mut best_cost = f32::MAX;
+    for (slot, &mode) in candidates[..count].iter().enumerate() {
+        let cost = shared_satd[slot] + lambda_mode * estimated_luma_mode_bins(mode, &mpm) as f32;
+        if cost < best_cost {
+            best_cost = cost;
+            best_slot = slot;
+        }
+    }
+
+    // Loose prefilter only — the caller settles 64-vs-32 with a real rate
+    // trial. A shared mode this much worse than four independent modes cannot
+    // recover the header saving, so don't pay for its trial.
+    if best_cost <= independent_best + lambda_mode * (CU64_SAVED_SYNTAX_BITS * CU64_PREFILTER_SLACK)
+    {
+        Some((candidates[best_slot], mpm))
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn code_ctu_as_cu64<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    luma_mode: u8,
+    mpm: [u8; 3],
+    commit: bool,
+) {
+    let stride = tree.strides.w;
+    let cw_stride = tree.strides.cw;
+    let coded_yh = tree.rec_y.len() / stride;
+    let coded_ch = tree.rec_cb.len() / cw_stride.max(1);
+    let bit_depth = tree.yuv.bit_depth;
+    let neutral = bit_depth.neutral();
+    let max_val = bit_depth.max_val();
+    let qp_slice = tree.qp;
+    let qp = qp_slice + bit_depth.qp_bd_offset();
+    let chroma = tree.yuv.chroma;
+    let chroma_qp = chroma_qp_for(qp_slice, chroma, tree.cqo) + bit_depth.qp_bd_offset();
+    let lambda = tree.lambda;
+    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma, tree.cqo);
+    let luma_scan_idx = dct::scan_idx_for(luma_mode, 5, true, false);
+    let luma_scan = dct::coeff_scan(5, luma_scan_idx);
+    static Z: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+
+    // ── Luma: four 32×32 TBs in Z order (predict → DCT → RDOQ → recon) ──────
+    let mut est_ctx = ctx.clone();
+    for (t, (dy, dx)) in Z.into_iter().enumerate() {
+        let r = row + dy * 32;
+        let c = col + dx * 32;
+        extract_block_n_into::<32>(
+            &tree.yuv.y,
+            tree.strides.src_yw,
+            tree.strides.src_yh,
+            r,
+            c,
+            &mut tree.scratch.orig,
+        );
+        let (corner0, above0, left0) = intra::get_reference_samples(
+            tree.rec_y,
+            intra::LumaRefGeometry {
+                stride,
+                block_row: r,
+                block_col: c,
+                height: coded_yh,
+                n: 32,
+                ctu: 64,
+                ctus_x: stride / 64,
+                min_pu: 8,
+                neutral,
+            },
+        );
+        let (corner, above, left) = if intra::should_filter_refs(luma_mode, 32) {
+            intra::filter_luma_refs(corner0, &above0, &left0, 32, bit_depth.bits() as u32)
+        } else {
+            (corner0, above0, left0)
+        };
+        match luma_mode {
+            intra::PLANAR => intra::predict_planar_into(&above, &left, 32, &mut tree.scratch.pred),
+            intra::DC => intra::predict_dc_into(&above, &left, 32, true, &mut tree.scratch.pred),
+            _ => intra::predict_angular_into(
+                corner,
+                &above,
+                &left,
+                32,
+                luma_mode,
+                true,
+                max_val as i32,
+                &mut tree.scratch.pred,
+                &mut tree.scratch.angular,
+            ),
+        }
+        let scratch = &mut *tree.scratch;
+        intra::compute_residual_i32_into(
+            &scratch.orig[..1024],
+            &scratch.pred[..1024],
+            32,
+            &mut scratch.residual,
+        );
+        crate::hevc_transform::run_fwd_transform(
+            scratch.fwd_transform,
+            &scratch.residual[..1024],
+            32,
+            bit_depth.bits(),
+            &mut scratch.coeff,
+            &mut scratch.transform_tmp,
+            false,
+        );
+        let tb = crate::hevc_transform::RdoqTb {
+            coeff: &scratch.coeff,
+            n: 32,
+            qp,
+            bit_depth: bit_depth.bits(),
+            scan: luma_scan,
+            scan_idx: luma_scan_idx,
+            lambda,
+        };
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &tb,
+            1,
+            &est_ctx,
+            &mut scratch.levels,
+            &mut scratch.rdoq,
+        );
+        let mut nonzero = false;
+        for (dst, &(sr, sc)) in scratch.cu64.y_zz[t].iter_mut().zip(luma_scan) {
+            let level = scratch.levels[sr * 32 + sc];
+            *dst = level;
+            nonzero |= level != 0;
+        }
+        scratch.cu64.y_nz[t] = nonzero;
+        let _ = est_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+        if nonzero {
+            advance_residual_contexts(
+                &mut est_ctx,
+                &scratch.cu64.y_zz[t],
+                5,
+                true,
+                luma_scan_idx,
+                true,
+            );
+        }
+        crate::hevc_transform::run_dequantize(
+            scratch.dequantize,
+            &scratch.levels,
+            32,
+            qp,
+            bit_depth.bits(),
+            &mut scratch.dequant,
+        );
+        crate::hevc_transform::run_inv_transform(
+            scratch.inv_transform,
+            &scratch.dequant,
+            32,
+            bit_depth.bits(),
+            &mut scratch.inverse,
+            &mut scratch.transform_tmp,
+            false,
+        );
+        intra::reconstruct_into(
+            &scratch.pred[..1024],
+            &scratch.inverse[..1024],
+            32,
+            max_val,
+            &mut scratch.reconstructed,
+        );
+        for (src_row, dst_row) in scratch
+            .reconstructed
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(tree.rec_y[r * stride + c..].chunks_mut(stride))
+        {
+            dst_row[..32].copy_from_slice(src_row);
+        }
+    }
+
+    // ── Chroma mode: SATD proxy over the five legal candidates ─────────────
+    let ch_row = row / 2;
+    let ch_col = col / 2;
+    let mut explicit = [intra::PLANAR, 26, 10, intra::DC];
+    for mode in &mut explicit {
+        if *mode == luma_mode {
+            *mode = 34;
+        }
+    }
+    // (pred_mode, syntax_idx); DM first for its one-bin syntax.
+    let all_candidates = [
+        (luma_mode, CHROMA_DM_SYNTAX_IDX),
+        (explicit[0], 0u8),
+        (explicit[1], 1),
+        (explicit[2], 2),
+        (explicit[3], 3),
+    ];
+    let chroma_satd_lambda = chroma_lambda.sqrt();
+    let mut best_chroma = (luma_mode, CHROMA_DM_SYNTAX_IDX);
+    let mut best_chroma_cost = f32::MAX;
+    let mut orig16 = [0u16; 256];
+    for (pred_mode, syntax_idx) in all_candidates {
+        let mut cost = chroma_satd_lambda * estimated_chroma_mode_bins(syntax_idx) as f32;
+        'tbs: for (dy, dx) in Z {
+            let cr_ = ch_row + dy * 16;
+            let cc = ch_col + dx * 16;
+            let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+                tree.rec_cb,
+                tree.rec_cr,
+                intra::ChromaRefGeometry {
+                    stride: cw_stride,
+                    block_row: cr_,
+                    block_col: cc,
+                    chroma_h: coded_ch,
+                    n: 16,
+                    sub_w: 2,
+                    sub_h: 2,
+                    luma_w: stride,
+                    luma_h: coded_yh,
+                    luma_ctus_x: stride / 64,
+                    min_luma_pu: 8,
+                    cur_luma_row: row + dy * 32,
+                    cur_luma_col: col + dx * 32,
+                    neutral,
+                },
+            );
+            for component in 0..2 {
+                let (source, corner, above, left) = if component == 0 {
+                    (&tree.yuv.cb, bc0, &ba, &bl)
+                } else {
+                    (&tree.yuv.cr, rc0, &ra, &rl)
+                };
+                extract_block_dyn_into(
+                    source,
+                    tree.strides.src_cw,
+                    tree.strides.src_ch,
+                    cr_,
+                    cc,
+                    16,
+                    &mut orig16,
+                );
+                intra::predict_chroma_tb_into(
+                    pred_mode,
+                    corner,
+                    above,
+                    left,
+                    16,
+                    max_val as i32,
+                    &mut tree.scratch.pred,
+                    &mut tree.scratch.angular,
+                );
+                cost += tree.scratch.satd(&orig16, &tree.scratch.pred[..256], 16) as f32;
+                if cost >= best_chroma_cost {
+                    break 'tbs;
+                }
+            }
+        }
+        if cost < best_chroma_cost {
+            best_chroma_cost = cost;
+            best_chroma = (pred_mode, syntax_idx);
+        }
+    }
+    let (chroma_mode, chroma_syntax_idx) = best_chroma;
+    let chroma_scan_idx = dct::scan_idx_for(chroma_mode, 4, false, false);
+    let chroma_scan = dct::coeff_scan(4, chroma_scan_idx);
+
+    // ── Chroma: four 16×16 Cb/Cr TB pairs in Z order ───────────────────────
+    for (t, (dy, dx)) in Z.into_iter().enumerate() {
+        let cr_ = ch_row + dy * 16;
+        let cc = ch_col + dx * 16;
+        let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
+            tree.rec_cb,
+            tree.rec_cr,
+            intra::ChromaRefGeometry {
+                stride: cw_stride,
+                block_row: cr_,
+                block_col: cc,
+                chroma_h: coded_ch,
+                n: 16,
+                sub_w: 2,
+                sub_h: 2,
+                luma_w: stride,
+                luma_h: coded_yh,
+                luma_ctus_x: stride / 64,
+                min_luma_pu: 8,
+                cur_luma_row: row + dy * 32,
+                cur_luma_col: col + dx * 32,
+                neutral,
+            },
+        );
+        for component in 0..2 {
+            let (corner, above, left) = if component == 0 {
+                (bc0, &ba, &bl)
+            } else {
+                (rc0, &ra, &rl)
+            };
+            {
+                let source = if component == 0 {
+                    &tree.yuv.cb
+                } else {
+                    &tree.yuv.cr
+                };
+                extract_block_dyn_into(
+                    source,
+                    tree.strides.src_cw,
+                    tree.strides.src_ch,
+                    cr_,
+                    cc,
+                    16,
+                    &mut orig16,
+                );
+            }
+            intra::predict_chroma_tb_into(
+                chroma_mode,
+                corner,
+                above,
+                left,
+                16,
+                max_val as i32,
+                &mut tree.scratch.pred,
+                &mut tree.scratch.angular,
+            );
+            let scratch = &mut *tree.scratch;
+            intra::compute_residual_i32_into(
+                &orig16,
+                &scratch.pred[..256],
+                16,
+                &mut scratch.residual,
+            );
+            crate::hevc_transform::run_fwd_transform(
+                scratch.fwd_transform,
+                &scratch.residual[..256],
+                16,
+                bit_depth.bits(),
+                &mut scratch.coeff,
+                &mut scratch.transform_tmp,
+                false,
+            );
+            let tb = crate::hevc_transform::RdoqTb {
+                coeff: &scratch.coeff,
+                n: 16,
+                qp: chroma_qp,
+                bit_depth: bit_depth.bits(),
+                scan: chroma_scan,
+                scan_idx: chroma_scan_idx,
+                lambda: chroma_lambda,
+            };
+            crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
+                &tb,
+                1,
+                &est_ctx,
+                &mut scratch.levels,
+                &mut scratch.rdoq,
+            );
+            let zigzag = if component == 0 {
+                &mut scratch.cu64.cb_zz[t]
+            } else {
+                &mut scratch.cu64.cr_zz[t]
+            };
+            let mut nonzero = false;
+            for (dst, &(sr, sc)) in zigzag.iter_mut().zip(chroma_scan) {
+                let level = scratch.levels[sr * 16 + sc];
+                *dst = level;
+                nonzero |= level != 0;
+            }
+            if component == 0 {
+                scratch.cu64.cb_nz[t] = nonzero;
+            } else {
+                scratch.cu64.cr_nz[t] = nonzero;
+            }
+            let _ = est_ctx.cbf_chroma[1].estimate_and_update(nonzero as u8);
+            if nonzero {
+                let zz: &[i16; 256] = if component == 0 {
+                    &scratch.cu64.cb_zz[t]
+                } else {
+                    &scratch.cu64.cr_zz[t]
+                };
+                advance_residual_contexts(&mut est_ctx, zz, 4, false, chroma_scan_idx, true);
+            }
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
+                &scratch.levels,
+                16,
+                chroma_qp,
+                bit_depth.bits(),
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
+                &scratch.dequant,
+                16,
+                bit_depth.bits(),
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+                false,
+            );
+            intra::reconstruct_into(
+                &scratch.pred[..256],
+                &scratch.inverse[..256],
+                16,
+                max_val,
+                &mut scratch.reconstructed,
+            );
+            let rec_plane = if component == 0 {
+                &mut *tree.rec_cb
+            } else {
+                &mut *tree.rec_cr
+            };
+            for (src_row, dst_row) in scratch
+                .reconstructed
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .take(16)
+                .zip(rec_plane[cr_ * cw_stride + cc..].chunks_mut(cw_stride))
+            {
+                dst_row[..16].copy_from_slice(src_row);
+            }
+        }
+    }
+
+    // ── Emission: CU header + transform tree (§7.3.8.8 / §7.3.8.10) ────────
+    encode_luma_mode(enc, ictx, luma_mode, &mpm);
+    if commit {
+        for br in 0..16 {
+            let base = (row / 4 + br) * tree.mode_stride + col / 4;
+            tree.mode_map[base..base + 16].fill(luma_mode);
+        }
+    }
+    encode_chroma_mode(enc, ictx, chroma_syntax_idx);
+
+    let scratch = &mut *tree.scratch;
+    let root_cb = scratch.cu64.cb_nz.iter().any(|&nz| nz);
+    let root_cr = scratch.cu64.cr_nz.iter().any(|&nz| nz);
+    // Root split_transform_flag is inferred (64 > MaxTbLog2SizeY); the root
+    // chroma cbfs are still coded at trafoDepth 0 before the child nodes.
+    encode_cbf_chroma(enc, ctx, root_cb, 0);
+    encode_cbf_chroma(enc, ctx, root_cr, 0);
+    for t in 0..4 {
+        enc.encode_bin(
+            0,
+            &mut ctx.split_transform_flag[split_transform_context(32)],
+        );
+        if root_cb {
+            encode_cbf_chroma(enc, ctx, scratch.cu64.cb_nz[t], 1);
+        }
+        if root_cr {
+            encode_cbf_chroma(enc, ctx, scratch.cu64.cr_nz[t], 1);
+        }
+        encode_cbf_luma(enc, ctx, scratch.cu64.y_nz[t], 1);
+        let need_qp = scratch.cu64.y_nz[t] || scratch.cu64.cb_nz[t] || scratch.cu64.cr_nz[t];
+        encode_cu_qp_delta_if_needed(enc, ctx, &mut tree.aq, need_qp);
+        if scratch.cu64.y_nz[t] {
+            encode_residual(
+                enc,
+                ctx,
+                &scratch.cu64.y_zz[t],
+                5,
+                true,
+                luma_scan_idx,
+                true,
+            );
+        }
+        if scratch.cu64.cb_nz[t] {
+            encode_residual(
+                enc,
+                ctx,
+                &scratch.cu64.cb_zz[t],
+                4,
+                false,
+                chroma_scan_idx,
+                true,
+            );
+        }
+        if scratch.cu64.cr_nz[t] {
+            encode_residual(
+                enc,
+                ctx,
+                &scratch.cu64.cr_zz[t],
+                4,
+                false,
+                chroma_scan_idx,
+                true,
+            );
+        }
+    }
+
+    // ── Maps and in-loop filter state (commit only) ────────────────────────
+    if commit {
+        fill_cu_qp(
+            &mut *tree.qp_map,
+            tree.mode_stride,
+            row,
+            col,
+            64,
+            tree.aq.resolved_qp(),
+        );
+        mark_deblock_edges(
+            &mut *tree.edge_v,
+            &mut *tree.edge_h,
+            tree.mode_stride,
+            row,
+            col,
+            64,
+            TuLayout::Split,
+            &scratch.tu_tree.split,
+        );
+        fill_cu_depth(&mut *tree.cu_depth, row, col, 64, 0, tree.cu_stride);
+    }
 }
 
 /// Encode a preselected 32×32 subtree with no speculative branches. Every leaf
@@ -3364,9 +4357,7 @@ fn commit_lossless_luma_leaf(
         },
     );
     let (corner, above, left) = if intra::should_filter_refs(mode, size) {
-        let (above, left) = intra::filter_references(corner0, &above0, &left0, size);
-        let corner = ((above0[0] as i32 + 2 * corner0 as i32 + left0[0] as i32 + 2) >> 2) as u16;
-        (corner, above, left)
+        intra::filter_luma_refs(corner0, &above0, &left0, size, max_val.count_ones())
     } else {
         (corner0, above0, left0)
     };
@@ -3633,8 +4624,27 @@ fn commit_lossless_chroma_leaf(
                     neutral: 1u16 << (bit_depth - 1),
                 },
             );
+            // In 4:4:4 (ChromaArrayType == 3) chroma reference samples get the
+            // same [1 2 1] smoothing as luma (HEVC §8.4.4.2.3, filterFlag derived
+            // when cIdx == 0 || ChromaArrayType == 3). Lossless coding always uses
+            // 4:4:4, so a conformant decoder smooths these references; predicting
+            // from raw references here would desync chroma reconstruction (the
+            // luma leaf already filters — see `should_filter_refs` above).
+            let filter = matches!(chroma, crate::fmt::ChromaFormat::Yuv444)
+                && side > 4
+                && intra::should_filter_refs(mode, side);
             let (corner, above, left) = if component == 0 {
-                (bc0, ba, bl)
+                if filter {
+                    let (a, l) = intra::filter_references(bc0, &ba, &bl, side);
+                    let cf = ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16;
+                    (cf, a, l)
+                } else {
+                    (bc0, ba, bl)
+                }
+            } else if filter {
+                let (a, l) = intra::filter_references(rc0, &ra, &rl, side);
+                let cf = ((ra[0] as i32 + 2 * rc0 as i32 + rl[0] as i32 + 2) >> 2) as u16;
+                (cf, a, l)
             } else {
                 (rc0, ra, rl)
             };
@@ -3891,9 +4901,7 @@ fn commit_split_luma(
             },
         );
         let (corner, above, left) = if intra::should_filter_refs(mode, child) {
-            let (fa, fl) = intra::filter_references(corner0, &above0, &left0, child);
-            let cf = ((above0[0] as i32 + 2 * corner0 as i32 + left0[0] as i32 + 2) >> 2) as u16;
-            (cf, fa, fl)
+            intra::filter_luma_refs(corner0, &above0, &left0, child, max_val.count_ones())
         } else {
             (corner0, above0, left0)
         };
@@ -4147,7 +5155,8 @@ fn commit_split_chroma(
                         neutral: 1u16 << (bit_depth - 1),
                     },
                 );
-                let filter = child_side > 4 && intra::should_filter_refs(mode, child_side);
+                let filter =
+                    is_444 && child_side > 4 && intra::should_filter_refs(mode, child_side);
                 let (corner, above, left) = if component == 0 {
                     if filter {
                         let (a, l) = intra::filter_references(bc0, &ba, &bl, child_side);
@@ -4424,7 +5433,7 @@ fn evaluate_chroma_mode(
                     neutral: 1u16 << (bit_depth - 1),
                 },
             );
-            let filter = side > 4 && intra::should_filter_refs(candidate.pred_mode, side);
+            let filter = is_444 && side > 4 && intra::should_filter_refs(candidate.pred_mode, side);
             let (baf, blf, bcf) = if filter {
                 let (above, left) = intra::filter_references(bc0, &ba, &bl, side);
                 let corner = ((ba[0] as i32 + 2 * bc0 as i32 + bl[0] as i32 + 2) >> 2) as u16;
@@ -4611,6 +5620,12 @@ fn evaluate_chroma_mode(
 }
 
 #[inline]
+/// Cheap gate deciding whether PART_NxN is worth its four-PU search.
+///
+/// Measured too conservative: evaluating NxN unconditionally is a small win at
+/// every quality (−0.04%..−0.27% bytes *and* higher ssimulacra2 on kodak13,
+/// −1.2%..−1.9% BD-rate on high-quality crops) for ~1.2x encode time. The
+/// Slow effort tier therefore skips this gate entirely; Fast keeps it.
 fn choose_nxn_proxy(
     satd: crate::cost::SatdFn,
     orig: &[u16],
@@ -4718,6 +5733,7 @@ fn choose_nxn_proxy(
 }
 
 struct NxNChroma444<'a> {
+    cqo: i8,
     src_cb: &'a [u16],
     src_cr: &'a [u16],
     rec_cb: &'a mut [u16],
@@ -4750,6 +5766,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
     const LEN: usize = SIDE * SIDE;
 
     let NxNChroma444 {
+        cqo,
         src_cb,
         src_cr,
         rec_cb,
@@ -4769,8 +5786,8 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
         residual_ctx_after_luma,
     } = job;
     let chroma = crate::fmt::ChromaFormat::Yuv444;
-    let chroma_qp = chroma_qp_for(qp_slice, chroma) + bit_depth.qp_bd_offset();
-    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+    let chroma_qp = chroma_qp_for(qp_slice, chroma, cqo) + bit_depth.qp_bd_offset();
+    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma, cqo);
     let max_val = bit_depth.max_val();
     let neutral = bit_depth.neutral();
     let mut residual_ctx = residual_ctx_after_luma.clone();
@@ -5016,6 +6033,7 @@ fn encode_cu_nxn<W: CabacWriter>(
     } = geom;
     let NxnParams {
         qp_slice,
+        cqo,
         qp,
         chroma,
         bit_depth,
@@ -5376,6 +6394,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             ictx,
             scratch,
             NxNChroma444 {
+                cqo,
                 src_cb,
                 src_cr,
                 rec_cb,
@@ -5397,8 +6416,8 @@ fn encode_cu_nxn<W: CabacWriter>(
         );
     } else if !chroma.is_monochrome() {
         debug_assert!(shared_chroma);
-        let chroma_qp = chroma_qp_for(qp_slice, chroma) + bit_depth.qp_bd_offset();
-        let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+        let chroma_qp = chroma_qp_for(qp_slice, chroma, cqo) + bit_depth.qp_bd_offset();
+        let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma, cqo);
         let candidates = chroma_mode_candidates(luma_modes[0], chroma);
         let mut ranked = [ChromaModeCandidate {
             pred_mode: 0,
@@ -5972,6 +6991,7 @@ fn encode_cu<W: CabacWriter>(
     } = rec;
     let CuParams {
         qp,
+        cqo,
         chroma,
         bit_depth,
         lu,
@@ -6045,8 +7065,7 @@ fn encode_cu<W: CabacWriter>(
     }
     let lambda_mode = lambda.sqrt();
     // The smoothed references depend only on the block, not the mode.
-    let (fa, fl) = intra::filter_references(yc0, &ya, &yl, lu);
-    let cf = ((ya[0] as i32 + 2 * yc0 as i32 + yl[0] as i32 + 2) >> 2) as u16;
+    let (cf, fa, fl) = intra::filter_luma_refs(yc0, &ya, &yl, lu, bit_depth.bits() as u32);
     let predict_luma = |mode: u8, pred: &mut [u16; 1024], angular: &mut intra::AngularScratch| {
         let (corner, above, left) = if intra::should_filter_refs(mode, lu) {
             (cf, &fa[..], &fl[..])
@@ -6347,13 +7366,14 @@ fn encode_cu<W: CabacWriter>(
     if lu == 8
         && !lossless
         && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422)
-        && choose_nxn_proxy(
-            scratch.satd,
-            &scratch.orig[..num_luma],
-            &scratch.best_pred[..num_luma],
-            lambda,
-            bit_depth.bits(),
-        )
+        && (scratch.rdoq_in_loop
+            || choose_nxn_proxy(
+                scratch.satd,
+                &scratch.orig[..num_luma],
+                &scratch.best_pred[..num_luma],
+                lambda,
+                bit_depth.bits(),
+            ))
     {
         // The NxN search reuses scratch.orig / best_pred / best_coeff, so snapshot
         // the 2Nx2N winner state and restore it if NxN loses the RD comparison.
@@ -6394,6 +7414,7 @@ fn encode_cu<W: CabacWriter>(
             },
             NxnParams {
                 qp_slice,
+                cqo,
                 qp,
                 chroma,
                 bit_depth,
@@ -6506,11 +7527,13 @@ fn encode_cu<W: CabacWriter>(
         max_val,
         &mut scratch.reconstructed,
     );
-    let d_unsplit = block_sse(
-        &scratch.orig[..num_luma],
-        &scratch.reconstructed[..num_luma],
-        lu,
-    );
+    let d_unsplit = {
+        block_sse(
+            &scratch.orig[..num_luma],
+            &scratch.reconstructed[..num_luma],
+            lu,
+        )
+    };
     let r_unsplit = {
         let mut tctx = ctx.clone();
         let mut r = tctx.split_transform_flag[split_transform_context(lu)].estimate_and_update(0);
@@ -6562,14 +7585,16 @@ fn encode_cu<W: CabacWriter>(
             },
             ctx,
         );
-        let d_split = sse_plane(
-            &scratch.orig[..num_luma],
-            rec_y,
-            lu_row,
-            lu_col,
-            yw_stride,
-            lu,
-        );
+        let d_split = {
+            sse_plane(
+                &scratch.orig[..num_luma],
+                rec_y,
+                lu_row,
+                lu_col,
+                yw_stride,
+                lu,
+            )
+        };
         let r_split = {
             let mut tctx = ctx.clone();
             let mut r =
@@ -6624,8 +7649,8 @@ fn encode_cu<W: CabacWriter>(
     // winner is committed directly; only ambiguous blocks run reconstruction +
     // fractional-CABAC RDO against one challenger. The chosen mode alone reaches
     // winner-only RDOQ and the real CABAC coder.
-    let chroma_qp = chroma_qp_for(qp_slice, chroma) + qp_bd_offset;
-    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma);
+    let chroma_qp = chroma_qp_for(qp_slice, chroma, cqo) + qp_bd_offset;
+    let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma, cqo);
     let sub_w = chroma.sub_w();
     let sub_h = chroma.sub_h();
     let luma_ctus_x = yw_stride / 64;
@@ -6773,7 +7798,7 @@ fn encode_cu<W: CabacWriter>(
                     chroma_satd_lambda * estimated_chroma_mode_bins(candidate.syntax_idx) as f32;
                 #[allow(clippy::needless_range_loop)]
                 'proxy_tbs: for t in 0..n_chroma_tb {
-                    let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
+                    let filt = is_444 && ctb > 4 && intra::should_filter_refs(mode, ctb);
                     let ((bc0, ba, bl), (rc0, ra, rl)) = &proxy_refs[t];
                     let cb_filtered = if filt {
                         Some(intra::filter_references(*bc0, ba, bl, ctb))
@@ -6907,7 +7932,7 @@ fn encode_cu<W: CabacWriter>(
 
             for t in 0..n_chroma_tb {
                 let sub_ch_row = ch_row + t * ctb;
-                let filt = ctb > 4 && intra::should_filter_refs(mode, ctb);
+                let filt = is_444 && ctb > 4 && intra::should_filter_refs(mode, ctb);
                 let ((bc0, ba, bl), (rc0, ra, rl)) = intra::get_reference_samples_chroma_pair(
                     rec_cb,
                     rec_cr,
@@ -7323,6 +8348,7 @@ fn code_one_cu<W: CabacWriter>(
     let CuPos { lu_row, lu_col, lu } = pos;
     let SliceCoding {
         qp,
+        cqo,
         lambda,
         lossless,
     } = coding;
@@ -7363,6 +8389,7 @@ fn code_one_cu<W: CabacWriter>(
     };
     let par = CuParams {
         qp,
+        cqo,
         chroma: yuv.chroma,
         bit_depth: yuv.bit_depth,
         lu,
@@ -7644,6 +8671,8 @@ mod tests {
             true,
             crate::VarianceBoost::default(),
             crate::Speed::Fast,
+            None,
+            0,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -7700,6 +8729,8 @@ mod tests {
             true,
             crate::VarianceBoost::default(),
             crate::Speed::Fast,
+            None,
+            0,
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);
@@ -7805,21 +8836,29 @@ mod tests {
 
     #[test]
     fn chroma_lambda_tracks_the_420_qp_mapping() {
+        // With the default pps chroma offset of −3, QpC sits below QpY even
+        // before the 4:2:0 table compression, so every scale is 2^(−delta/3)
+        // for the resulting delta.
+
+        // qp_y 29 → qPi 26 → QpC 26, delta 3.
         assert_eq!(
-            chroma_lambda_scale(29, crate::fmt::ChromaFormat::Yuv420),
-            1.0
+            chroma_lambda_scale(29, crate::fmt::ChromaFormat::Yuv420, -3),
+            0.5
         );
+        // qp_y 43 → qPi 40 → QpC 36 (Table 8-22), delta 7.
         assert_eq!(
-            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv420),
-            0.25
+            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv420, -3),
+            2f32.powf(-7.0 / 3.0)
         );
+        // qp_y 51 → qPi 48 → QpC 42, delta 9.
         assert_eq!(
-            chroma_lambda_scale(51, crate::fmt::ChromaFormat::Yuv420),
-            0.25
+            chroma_lambda_scale(51, crate::fmt::ChromaFormat::Yuv420, -3),
+            0.125
         );
+        // 4:4:4 has no table: qp_y 43 → QpC 40, delta 3.
         assert_eq!(
-            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv444),
-            1.0
+            chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv444, -3),
+            0.5
         );
     }
 
