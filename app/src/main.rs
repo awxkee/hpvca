@@ -43,7 +43,7 @@ fn main() {
         img.height(),
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv444)
-            .with_parallelism(ParallelismStrategy::GridWpp)
+            .with_parallelism(ParallelismStrategy::Wpp)
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Slow)
