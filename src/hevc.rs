@@ -190,6 +190,22 @@ fn uses_rext_profile(
     lossless || !is_420 || bit_depth.bits() > 10
 }
 
+/// Whether `persistent_rice_adaptation_enabled_flag` is set for this stream.
+///
+/// The tool exists only in the Range Extensions, so it may be used exactly when
+/// this encoder already advertises an RExt profile ([`uses_rext_profile`]):
+/// lossless, non-4:2:0, or more than 10 bits. Main / Main10 / Main Still
+/// Picture streams — the common 8-bit 4:2:0 case — must leave it off, since the
+/// SPS range extension is not even present there.
+#[inline]
+pub(crate) fn persistent_rice_enabled(
+    chroma: crate::fmt::ChromaFormat,
+    bit_depth: crate::fmt::BitDepth,
+    lossless: bool,
+) -> bool {
+    uses_rext_profile(chroma, bit_depth, lossless)
+}
+
 fn write_profile_tier_level(
     bw: &mut BitWriter,
     level_idc: u8,
@@ -311,7 +327,7 @@ pub(crate) fn build_vps(
     }
 }
 
-fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool) {
+fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool, persistent_rice: bool) {
     bw.write_bit(false); // transform_skip_rotation_enabled_flag
     bw.write_bit(false); // transform_skip_context_enabled_flag
     // In transquant-bypass intra TUs this is inferred for final horizontal
@@ -321,7 +337,10 @@ fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool) {
     bw.write_bit(false); // extended_precision_processing_flag
     bw.write_bit(false); // intra_smoothing_disabled_flag
     bw.write_bit(false); // high_precision_offsets_enabled_flag
-    bw.write_bit(false); // persistent_rice_adaptation_enabled_flag
+    // Persistent Rice adaptation: coeff_abs_level_remaining keeps a running
+    // per-picture Rice statistic instead of restarting each coefficient group
+    // at 0. Range-Extensions only — see `persistent_rice_enabled`.
+    bw.write_bit(persistent_rice); // persistent_rice_adaptation_enabled_flag
     bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
 }
 
@@ -444,7 +463,11 @@ pub(crate) fn build_sps(
         bw.write_bit(false); // sps_3d_extension_flag = 0
         bw.write_bit(false); // sps_scc_extension_flag = 0
         bw.write_bits(0, 4); // sps_extension_4bits = 0
-        write_sps_range_extension(&mut bw, lossless);
+        write_sps_range_extension(
+            &mut bw,
+            lossless,
+            persistent_rice_enabled(chroma, bit_depth, lossless),
+        );
     }
 
     bw.rbsp_trailing_bits();
@@ -837,7 +860,10 @@ fn encode_wpp_parallel(
             // Seed the row's context from the row above's WPP sync point.
             let (mut ctx, mut ictx) = if r == 0 {
                 (
-                    ContextSet::init_islice(qp),
+                    ContextSet::init_islice_ext(
+                        qp,
+                        persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
+                    ),
                     IntraModeContexts::init_islice(qp),
                 )
             } else {
@@ -1266,7 +1292,10 @@ fn encode_region_pass(
 
     let substreams = if !wpp {
         let mut cab = CabacEncoder::new();
-        let mut ctx = ContextSet::init_islice(qp);
+        let mut ctx = ContextSet::init_islice_ext(
+            qp,
+            persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
+        );
         let mut ictx = IntraModeContexts::init_islice(qp);
         let mut aq_predictor = qp;
         for ctu_row in 0..ctus_y {
@@ -1353,7 +1382,10 @@ fn encode_region_pass(
             let mut cab = CabacEncoder::new();
             let (mut ctx, mut ictx) = prev_sync.take().unwrap_or_else(|| {
                 (
-                    ContextSet::init_islice(qp),
+                    ContextSet::init_islice_ext(
+                        qp,
+                        persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
+                    ),
                     IntraModeContexts::init_islice(qp),
                 )
             });
@@ -8895,11 +8927,11 @@ mod tests {
     #[test]
     fn lossless_range_extension_sets_only_implicit_rdpcm() {
         let mut enabled = BitWriter::new();
-        write_sps_range_extension(&mut enabled, true);
+        write_sps_range_extension(&mut enabled, true, false);
         assert_eq!(enabled.finish().as_slice(), &[0x20, 0x00]);
 
         let mut disabled = BitWriter::new();
-        write_sps_range_extension(&mut disabled, false);
+        write_sps_range_extension(&mut disabled, false, false);
         assert_eq!(disabled.finish().as_slice(), &[0x00, 0x00]);
     }
 

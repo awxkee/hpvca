@@ -72,6 +72,15 @@ pub(crate) struct ContextSet {
     // bin uses context 0 and every subsequent prefix bin uses context 1.
     pub(crate) cu_qp_delta_abs: [CtxModel; 2],
 
+    /// Persistent Rice adaptation (RExt): `StatCoeff[k]`, k = 0..3, indexed by
+    /// (chroma ? 2 : 0) + (transform-skipped or transquant-bypass ? 1 : 0).
+    /// Initialized to 0 at the start of every slice segment and, because it
+    /// lives in the context set, carried through the WPP storage/sync process
+    /// exactly as the spec requires (§9.3.2.3).
+    pub(crate) stat_coeff: [u8; 4],
+    /// Whether `persistent_rice_adaptation_enabled_flag` is set in the SPS.
+    pub(crate) persistent_rice: bool,
+
     // cu_transquant_bypass_flag (1 ctx). initValue 154 for all init types
     // (HEVC Table 9-43). Used only when the PPS enables transquant bypass
     // (lossless coding).
@@ -79,6 +88,14 @@ pub(crate) struct ContextSet {
 }
 
 impl ContextSet {
+    /// I-slice context initialization. `persistent_rice` mirrors the SPS
+    /// `persistent_rice_adaptation_enabled_flag`.
+    pub(crate) fn init_islice_ext(qp: u8, persistent_rice: bool) -> Self {
+        let mut ctx = Self::init_islice(qp);
+        ctx.persistent_rice = persistent_rice;
+        ctx
+    }
+
     pub(crate) fn init_islice(qp: u8) -> Self {
         fn c(iv: u8, qp: u8) -> CtxModel {
             CtxModel::init(iv, qp)
@@ -152,6 +169,9 @@ impl ContextSet {
             cu_qp_delta_abs: arr([154, 154], qp),
 
             // cu_transquant_bypass_flag initValue 154 (all init types).
+            stat_coeff: [0; 4],
+            persistent_rice: false,
+
             cu_transquant_bypass_flag: c(154, qp),
         }
     }

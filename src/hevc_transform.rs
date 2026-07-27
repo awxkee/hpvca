@@ -29,8 +29,8 @@
 
 //! Spec-faithful HEVC integer transform, quantization, and dequantization.
 
-use crate::cabac::ContextSet;
 use crate::cabac::residual::sig_coeff_ctx;
+use crate::cabac::{ContextSet, MAX_PERSISTENT_RICE};
 use std::sync::OnceLock;
 
 /// 4×4 HEVC transform matrix.
@@ -681,6 +681,18 @@ fn rdoq_lambda_scale() -> f32 {
     1.0
 }
 
+const fn hf_distortion_weight() -> f32 {
+    1.0
+}
+
+const fn hf_start_fraction() -> f32 {
+    0.5
+}
+
+const fn dc_distortion_weight() -> f32 {
+    1.0
+}
+
 fn rdoq_disabled() -> bool {
     false
 }
@@ -708,6 +720,9 @@ fn rdoq_with_sign_hiding_into(
         lambda,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
+    let dc_weight = dc_distortion_weight();
+    let hf_weight = hf_distortion_weight();
+    let hf_start = (hf_start_fraction() * n as f32) as usize;
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
@@ -762,7 +777,17 @@ fn rdoq_with_sign_hiding_into(
         let mut c1 = 1i32;
         let mut c1_idx = 0u32;
         let mut c2_idx = 0u32;
-        let mut rice = 0u32;
+        // Persistent Rice adaptation seeds each coefficient group from the
+        // running statistic instead of 0. RDOQ is lossy-only (transquant-bypass
+        // blocks never reach it), so the statistic index is the "transformed"
+        // half. The statistic itself is not updated here: RDOQ prices a single
+        // candidate block, and the real update happens when the chosen levels
+        // are coded.
+        let mut rice = if ctx.persistent_rice {
+            u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+        } else {
+            0
+        };
 
         let mut group_sig_cost = 0.0;
         let mut group_coded_level_and_dist = 0.0;
@@ -777,7 +802,14 @@ fn rdoq_with_sign_hiding_into(
             let coeff_abs = (coeff[pos] as i64).abs();
             let scaled = coeff_abs * q_scale;
             let max_abs = ((scaled + round) >> q_bits).clamp(0, i16::MAX as i64) as u32;
-            let dist0 = distortion.coefficient_cost(coeff_abs, 0);
+            let dist_weight = if pos == 0 {
+                dc_weight
+            } else if row + col >= hf_start {
+                hf_weight
+            } else {
+                1.0
+            };
+            let dist0 = distortion.coefficient_cost(coeff_abs, 0) * dist_weight;
             cost_coeff0[scan_pos] = dist0;
             block_uncoded_cost += dist0;
 
@@ -810,7 +842,7 @@ fn rdoq_with_sign_hiding_into(
             if max_abs > 0 {
                 let min_abs = if max_abs > 1 { max_abs - 1 } else { 1 };
                 for abs_level in [max_abs, min_abs] {
-                    let dist = distortion.coefficient_cost(coeff_abs, abs_level);
+                    let dist = distortion.coefficient_cost(coeff_abs, abs_level) * dist_weight;
                     let rate =
                         rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx);
                     let coded_cost = dist + sig1 + lambda * rate;
@@ -827,7 +859,7 @@ fn rdoq_with_sign_hiding_into(
                 if !is_last && max_abs >= 3 {
                     best_cost = f32::MAX;
                     for abs_level in [max_abs, min_abs] {
-                        let dist = distortion.coefficient_cost(coeff_abs, abs_level);
+                        let dist = distortion.coefficient_cost(coeff_abs, abs_level) * dist_weight;
                         let rate = rdoq_level_bits(
                             abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx,
                         );
@@ -863,7 +895,11 @@ fn rdoq_with_sign_hiding_into(
                     1
                 };
                 if best_level >= base_level && best_level > (3 << rice) {
-                    rice = (rice + 1).min(4);
+                    rice = (rice + 1).min(if ctx.persistent_rice {
+                        MAX_PERSISTENT_RICE
+                    } else {
+                        4
+                    });
                 }
                 c1_idx += 1;
                 if best_level > 1 {
