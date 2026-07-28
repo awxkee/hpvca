@@ -563,7 +563,22 @@ fn encode_coeff_levels<W: CabacWriter>(
     }
 
     // coeff_abs_level_remaining for every coeff whose level isn't fully determined.
-    let mut rice: u32 = 0;
+    //
+    // Persistent Rice adaptation (RExt §9.3.3.11): instead of restarting the
+    // Rice parameter at 0 in every coefficient group, each group starts from a
+    // running per-picture statistic, the statistic is updated from the first
+    // remaining level coded in the group, and the in-group adaptation is no
+    // longer clamped to 4. `sign_data_hiding` is false exactly for
+    // transquant-bypass CUs, which is the "non-transformed" half of the
+    // statistic index.
+    let persistent = ctx.persistent_rice;
+    let stat_index = usize::from(!is_luma) * 2 + usize::from(!sign_data_hiding);
+    let mut rice: u32 = if persistent {
+        u32::from(ctx.stat_coeff[stat_index] / 4)
+    } else {
+        0
+    };
+    let mut stat_pending = persistent;
     for c in 0..n {
         if !has_max_base[c] {
             continue;
@@ -583,13 +598,36 @@ fn encode_coeff_levels<W: CabacWriter>(
         let abs_val = coeffs[sig_pos[c]].unsigned_abs() as i32;
         let remaining = (abs_val - base_level).max(0) as u32;
         encode_coeff_remaining(enc, remaining, rice);
-        // Rice update: if (base_level + remaining) > 3<<rice, rice = min(rice+1,4).
+        if stat_pending {
+            // Exactly once per coefficient group, from the *remaining* value
+            // (not the full level) and against the statistic's own current
+            // Rice parameter.
+            let stat = &mut ctx.stat_coeff[stat_index];
+            let initial = u32::from(*stat / 4);
+            if remaining >= (3 << initial) {
+                *stat = stat.saturating_add(1);
+            } else if remaining * 2 < (1 << initial) && *stat > 0 {
+                *stat -= 1;
+            }
+            stat_pending = false;
+        }
+        // Rice update: if (base_level + remaining) > 3<<rice, rice grows. The
+        // clamp to 4 applies only without persistent adaptation.
         let total = base_level + remaining as i32;
         if total > (3 << rice) {
-            rice = (rice + 1).min(4);
+            rice = if persistent {
+                (rice + 1).min(MAX_PERSISTENT_RICE)
+            } else {
+                (rice + 1).min(4)
+            };
         }
     }
 }
+
+/// Ceiling for the Rice parameter under persistent adaptation. The spec removes
+/// the fixed bound of 4; this bound is high enough never to bind for 8/10/12-bit
+/// coefficients while keeping `encode_coeff_remaining`'s shifts in range.
+pub(crate) const MAX_PERSISTENT_RICE: u32 = 10;
 
 /// Bypass-coded coeff_abs_level_remaining using truncated Rice/Exp-Golomb.
 fn encode_coeff_remaining<W: CabacWriter>(enc: &mut W, value: u32, rice_k: u32) {
