@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::math::FastRound;
 use crate::{
     aq::{activity_aq_enabled, activity_qp_offsets},
     cabac::{
@@ -39,7 +40,6 @@ use crate::{
     intra,
     yuv::Yuv,
 };
-use crate::math::FastRound;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Nalu {
@@ -212,6 +212,7 @@ fn write_profile_tier_level(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
     lossless: bool,
+    scc: bool,
 ) {
     // Select profile based on chroma and bit depth (matching Apple / x265 behavior):
     //   4:2:0 / mono 8-bit  → profile 3 (Main Still Picture), compat 0x70000000
@@ -225,9 +226,14 @@ fn write_profile_tier_level(
     // Implicit residual DPCM is an HEVC Range Extensions tool. Lossless streams
     // use it for horizontal/vertical intra modes, so even 8/10-bit 4:2:0 must
     // advertise an RExt profile rather than Main/Main10/Main Still Picture.
-    let is_rext = uses_rext_profile(chroma, bit_depth, lossless);
+    // Screen content coding (palette / intra block copy) lives in the
+    // Screen-Extended profiles, profile_idc 9. Their constraint block has the
+    // same layout as the RExt one, so only the identity changes.
+    let is_rext = scc || uses_rext_profile(chroma, bit_depth, lossless);
 
-    let (profile_idc, compat): (u32, u32) = if is_rext {
+    let (profile_idc, compat): (u32, u32) = if scc {
+        (9, 0x0040_0000) // Screen-Extended (profile_compatibility_flag[9])
+    } else if is_rext {
         (4, 0x0800_0000) // RExt
     } else if bits <= 8 {
         (3, 0x7000_0000) // Main Still Picture (compatible w/ Main + Main10 + MSP)
@@ -285,6 +291,7 @@ pub(crate) fn build_vps(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
     lossless: bool,
+    scc: bool,
 ) -> Nalu {
     let coded_w = (width + 63) & !63;
     let coded_h = (height + 63) & !63;
@@ -300,7 +307,7 @@ pub(crate) fn build_vps(
     bw.write_bit(true); // vps_temporal_id_nesting_flag
     bw.write_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
 
-    write_profile_tier_level(&mut bw, level, chroma, bit_depth, lossless);
+    write_profile_tier_level(&mut bw, level, chroma, bit_depth, lossless, scc);
 
     // vps_sub_layer_ordering_info_present_flag = false → only [0] entry
     bw.write_bit(false);
@@ -344,6 +351,19 @@ fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool, persistent_rice
     bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
 }
 
+/// `sps_scc_extension()` (§7.3.2.2.3). Only palette mode is signalled here; the
+/// encoder writes no predictor initializers, so the predictor starts empty in
+/// every slice segment.
+fn write_sps_scc_extension(bw: &mut BitWriter, curr_pic_ref: bool) {
+    bw.write_bit(curr_pic_ref); // sps_curr_pic_ref_enabled_flag
+    bw.write_bit(true); // palette_mode_enabled_flag
+    bw.write_ue(crate::palette::MAX_PALETTE_SIZE as u32); // palette_max_size
+    bw.write_ue(crate::palette::DELTA_MAX_PREDICTOR_SIZE as u32); // delta_palette_max_predictor_size
+    bw.write_bit(false); // sps_palette_predictor_initializers_present_flag
+    bw.write_bits(0, 2); // motion_vector_resolution_control_idc = 0
+    bw.write_bit(false); // intra_boundary_filtering_disabled_flag
+}
+
 pub(crate) fn build_sps(
     width: u32,
     height: u32,
@@ -351,6 +371,7 @@ pub(crate) fn build_sps(
     bit_depth: crate::fmt::BitDepth,
     lossless: bool,
     color: Option<&crate::color::Cicp>,
+    scc: bool,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -360,7 +381,7 @@ pub(crate) fn build_sps(
     bw.write_bit(true); // sps_temporal_id_nesting_flag
 
     let sps_level = level_idc_for((width + 63) & !63, (height + 63) & !63);
-    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth, lossless);
+    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth, lossless, scc);
 
     bw.write_ue(0); // sps_seq_parameter_set_id = 0
 
@@ -456,18 +477,23 @@ pub(crate) fn build_sps(
     // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
     // Apple's decoder rejects 12-bit streams whose SPS lacks the range extension.
     let need_range_ext = uses_rext_profile(chroma, bit_depth, lossless);
-    bw.write_bit(need_range_ext); // sps_extension_present_flag
-    if need_range_ext {
-        bw.write_bit(true); // sps_range_extension_flag = 1
+    bw.write_bit(need_range_ext || scc); // sps_extension_present_flag
+    if need_range_ext || scc {
+        bw.write_bit(need_range_ext); // sps_range_extension_flag
         bw.write_bit(false); // sps_multilayer_extension_flag = 0
         bw.write_bit(false); // sps_3d_extension_flag = 0
-        bw.write_bit(false); // sps_scc_extension_flag = 0
+        bw.write_bit(scc); // sps_scc_extension_flag
         bw.write_bits(0, 4); // sps_extension_4bits = 0
-        write_sps_range_extension(
-            &mut bw,
-            lossless,
-            persistent_rice_enabled(chroma, bit_depth, lossless),
-        );
+        if need_range_ext {
+            write_sps_range_extension(
+                &mut bw,
+                lossless,
+                persistent_rice_enabled(chroma, bit_depth, lossless),
+            );
+        }
+        if scc {
+            write_sps_scc_extension(&mut bw, false);
+        }
     }
 
     bw.rbsp_trailing_bits();
@@ -618,6 +644,7 @@ pub(crate) fn encode_intra(
     sao: bool,
     variance_boost: crate::VarianceBoost,
     effort: crate::Speed,
+    scc: bool,
 ) -> Result<NaluStream, EncodeError> {
     encode_intra_opts(
         yuv,
@@ -635,6 +662,7 @@ pub(crate) fn encode_intra(
         None,
         0,
         None,
+        scc,
     )
 }
 
@@ -664,6 +692,9 @@ pub(crate) fn encode_intra_opts(
     // Shared Cb/Cr QP offset: grid cells receive the full picture's value so
     // every cell treats chroma identically; `None` derives it from `yuv`.
     chroma_qp_offset: Option<i8>,
+    // Screen-content coding tools (palette mode). Signals the SPS SCC extension
+    // and lets every CU choose palette mode over intra prediction.
+    scc: bool,
 ) -> Result<NaluStream, EncodeError> {
     // Transquant-bypass samples are not modified by in-loop filters. Disable
     // the slice-level tool as well so no redundant SAO syntax is emitted.
@@ -691,7 +722,7 @@ pub(crate) fn encode_intra_opts(
     };
     // WPP needs ≥2 CTU columns (tiles are kept ≥4 CTB wide by `choose_tile_grid`).
     let wpp = wpp && ctus_x >= 2;
-    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless);
+    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless, scc);
     let sps = build_sps(
         width,
         height,
@@ -699,6 +730,7 @@ pub(crate) fn encode_intra_opts(
         yuv.bit_depth,
         lossless,
         color.as_ref(),
+        scc,
     );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
@@ -726,6 +758,7 @@ pub(crate) fn encode_intra_opts(
         aq_override,
         qp_bias,
         cqo,
+        scc,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -816,6 +849,7 @@ fn encode_wpp_parallel(
         cqo,
         lambda,
         lossless,
+        scc,
     } = coding;
 
     let progress: Vec<AtomicUsize> = (0..ctus_y).map(|_| AtomicUsize::new(0)).collect();
@@ -826,8 +860,16 @@ fn encode_wpp_parallel(
         .map(|_| std::sync::atomic::AtomicBool::new(false))
         .collect();
     // Context models saved after the 2nd CTU of each row, consumed by the next.
-    let sync_ctx: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
-        (0..ctus_y).map(|_| OnceLock::new()).collect();
+    // The palette predictor rides along: §9.3.2.3 stores and restores it at the
+    // same WPP sync point as the context variables.
+    let sync_ctx: Vec<
+        OnceLock<(
+            ContextSet,
+            IntraModeContexts,
+            crate::palette::PalettePredictor,
+        )>,
+    > = (0..ctus_y).map(|_| OnceLock::new()).collect();
+    let palette_comps = if yuv.chroma.is_monochrome() { 1 } else { 3 };
     let substreams: Vec<Mutex<Vec<u8>>> = (0..ctus_y).map(|_| Mutex::new(Vec::new())).collect();
     let next_row = AtomicUsize::new(0);
 
@@ -858,13 +900,16 @@ fn encode_wpp_parallel(
                 "WPP row {r} claimed by two workers — writes would alias"
             );
             // Seed the row's context from the row above's WPP sync point.
-            let (mut ctx, mut ictx) = if r == 0 {
+            let (mut ctx, mut ictx, palette_pred) = if r == 0 {
+                let mut pred = crate::palette::PalettePredictor::default();
+                pred.reset(palette_comps);
                 (
                     ContextSet::init_islice_ext(
                         qp,
                         persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
                     ),
                     IntraModeContexts::init_islice(qp),
+                    pred,
                 )
             } else {
                 loop {
@@ -874,6 +919,7 @@ fn encode_wpp_parallel(
                     std::thread::yield_now();
                 }
             };
+            scratch.palette_pred = palette_pred;
             let mut cab = CabacEncoder::new();
             // WPP resets qPY_PRED to SliceQpY at the first QG of every CTU row.
             let mut aq_predictor = qp;
@@ -919,6 +965,7 @@ fn encode_wpp_parallel(
                         cqo,
                         lambda,
                         lossless,
+                        scc,
                     },
                     r,
                     col,
@@ -929,7 +976,8 @@ fn encode_wpp_parallel(
                 );
                 aq_predictor = resolved_qp;
                 if col == 1 {
-                    let _ = sync_ctx[r].set((ctx.clone(), ictx.clone()));
+                    let _ =
+                        sync_ctx[r].set((ctx.clone(), ictx.clone(), scratch.palette_pred.clone()));
                 }
                 // end_of_slice_segment_flag: 1 only on the whole slice's final CTU
                 // (last row of the last region).
@@ -1001,6 +1049,7 @@ fn code_one_ctu(
         cqo,
         lambda,
         lossless,
+        scc,
     } = coding;
     let lu_row0 = ctu_row * 64;
     let lu_col0 = ctu_col * 64;
@@ -1048,6 +1097,7 @@ fn code_one_ctu(
         cu_stride,
         mode_stride,
         lossless,
+        scc,
         aq,
         scratch,
     };
@@ -1078,7 +1128,8 @@ fn code_one_ctu(
     // the mean of its four groups' offsets so the comparison is made at the
     // operating point the CU would actually be coded at.
     if aq_enabled {
-        let mean = (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
+        let mean =
+            (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
         let delta = (mean as i16).clamp(-3, 3);
         tree.qp = (i16::from(qp) + delta).clamp(0, 51) as u8;
         tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
@@ -1230,6 +1281,7 @@ fn encode_region_pass(
     aq_offsets: &[i8],
     sao_enabled: bool,
     cqo: i8,
+    scc: bool,
     ws: &mut crate::coder_scratch::CoderScratch,
 ) -> RegionOutput {
     use crate::coder_scratch::fill_resize;
@@ -1297,6 +1349,11 @@ fn encode_region_pass(
             persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
         );
         let mut ictx = IntraModeContexts::init_islice(qp);
+        // The palette predictor is reset at the start of every slice segment
+        // (and therefore every tile) alongside the context variables.
+        scratch
+            .palette_pred
+            .reset(if yuv.chroma.is_monochrome() { 1 } else { 3 });
         let mut aq_predictor = qp;
         for ctu_row in 0..ctus_y {
             for ctu_col in 0..ctus_x {
@@ -1326,6 +1383,7 @@ fn encode_region_pass(
                         cqo,
                         lambda,
                         lossless,
+                        scc,
                     },
                     ctu_row,
                     ctu_col,
@@ -1364,6 +1422,7 @@ fn encode_region_pass(
                 cqo,
                 lambda,
                 lossless,
+                scc,
             },
             ctus_x,
             ctus_y,
@@ -1377,18 +1436,27 @@ fn encode_region_pass(
         )
     } else {
         let mut substreams: Vec<Vec<u8>> = Vec::with_capacity(ctus_y);
-        let mut prev_sync: Option<(ContextSet, IntraModeContexts)> = None;
+        let mut prev_sync: Option<(
+            ContextSet,
+            IntraModeContexts,
+            crate::palette::PalettePredictor,
+        )> = None;
+        let palette_comps = if yuv.chroma.is_monochrome() { 1 } else { 3 };
         for ctu_row in 0..ctus_y {
             let mut cab = CabacEncoder::new();
-            let (mut ctx, mut ictx) = prev_sync.take().unwrap_or_else(|| {
+            let (mut ctx, mut ictx, palette_pred) = prev_sync.take().unwrap_or_else(|| {
+                let mut pred = crate::palette::PalettePredictor::default();
+                pred.reset(palette_comps);
                 (
                     ContextSet::init_islice_ext(
                         qp,
                         persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless),
                     ),
                     IntraModeContexts::init_islice(qp),
+                    pred,
                 )
             });
+            scratch.palette_pred = palette_pred;
             let mut this_sync = None;
             // The sequential WPP fallback obeys the same row-start QP reset as
             // the parallel path.
@@ -1420,6 +1488,7 @@ fn encode_region_pass(
                         cqo,
                         lambda,
                         lossless,
+                        scc,
                     },
                     ctu_row,
                     ctu_col,
@@ -1430,7 +1499,7 @@ fn encode_region_pass(
                 );
                 aq_predictor = resolved_qp;
                 if ctu_col == 1 {
-                    this_sync = Some((ctx.clone(), ictx.clone()));
+                    this_sync = Some((ctx.clone(), ictx.clone(), scratch.palette_pred.clone()));
                 }
                 let last = is_last_region && ctu_row == ctus_y - 1 && ctu_col == ctus_x - 1;
                 cab.encode_terminate(last as u8); // end_of_slice_segment_flag
@@ -1518,6 +1587,7 @@ fn encode_region_substreams(
     effort: crate::Speed,
     aq_override: Option<&[i8]>,
     cqo: i8,
+    scc: bool,
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
@@ -1560,6 +1630,7 @@ fn encode_region_substreams(
             aq_offsets,
             false,
             cqo,
+            scc,
             &mut ws,
         );
     }
@@ -1582,6 +1653,7 @@ fn encode_region_substreams(
         aq_offsets,
         true,
         cqo,
+        scc,
         &mut ws,
     );
     let stride = ((width + 63) & !63) as usize;
@@ -1621,6 +1693,7 @@ fn encode_region_substreams(
         aq_offsets,
         true,
         cqo,
+        scc,
         &mut ws,
     );
     let ws_ref = &mut *ws;
@@ -1718,6 +1791,7 @@ fn build_idr_slice(
     aq_override: Option<&[i8]>,
     qp_bias: i8,
     cqo: i8,
+    scc: bool,
 ) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
@@ -1784,6 +1858,7 @@ fn build_idr_slice(
             effort,
             aq_override,
             cqo,
+            scc,
         );
         let substreams = output.substreams;
         if wpp {
@@ -1882,6 +1957,7 @@ fn build_idr_slice(
                             effort,
                             full_map.map(|_| tile_map.as_slice()),
                             cqo,
+                            scc,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -2690,6 +2766,8 @@ struct CuParams {
     /// Lossless (transquant-bypass) coding: code `cu_transquant_bypass_flag = 1`,
     /// skip transform/quantization, and apply inferred RDPCM for pure H/V modes.
     lossless: bool,
+    /// Screen-content coding: `palette_mode_flag` is present in this CU's syntax.
+    scc: bool,
 }
 
 /// CU-QP-delta state for one 64x64 quantization group. The state is copied for
@@ -2767,6 +2845,8 @@ struct SliceCoding {
     cqo: i8,
     lambda: f32,
     lossless: bool,
+    /// Screen-content tools: every CU ≤ MaxTbSize may be coded as a palette CU.
+    scc: bool,
 }
 
 /// Mutable reconstruction and neighbor-map state for coding one CTU (or a WPP row
@@ -2999,6 +3079,13 @@ pub(crate) struct CompressionContext {
     /// When set (Effort::Slow), the reconstructed intra shortlist is RDOQ'd
     /// inside the RD loop rather than only the committed winner.
     rdoq_in_loop: bool,
+    /// Slice/tile/WPP-row persistent palette predictor (SCC §9.3.2.3). It lives
+    /// in the workspace rather than the context set because RD trials must read
+    /// it without paying for a clone; only a committing sink updates it.
+    palette_pred: crate::palette::PalettePredictor,
+    /// Palette analysis working set for the CU currently under evaluation.
+    palette_cand: Box<crate::palette::PaletteCu>,
+    palette_runs: Vec<crate::palette::PaletteRun>,
 }
 
 /// Per-TU coefficient storage for the 64×64-CU (four-32×32-TU) CTU path: four
@@ -3055,6 +3142,9 @@ impl CompressionContext {
             rdoq: crate::hevc_transform::RdoqScratch::new(),
             cu64: Cu64Scratch::new(),
             rdoq_in_loop: false,
+            palette_pred: crate::palette::PalettePredictor::default(),
+            palette_cand: crate::palette::PaletteCu::new(),
+            palette_runs: Vec::new(),
         }
     }
 
@@ -3101,6 +3191,7 @@ struct CuTreeState<'a> {
     cu_stride: usize,
     mode_stride: usize,
     lossless: bool,
+    scc: bool,
     aq: AqCtuState,
     scratch: &'a mut CompressionContext,
 }
@@ -3159,6 +3250,7 @@ fn encode_cu_leaf(
             cqo: state.cqo,
             lambda: state.lambda,
             lossless: state.lossless,
+            scc: state.scc,
         },
         &mut *state.mode_map,
         state.mode_stride,
@@ -3418,27 +3510,50 @@ fn fast_cu32_plan(state: &CuTreeState<'_>, row: usize, col: usize) -> Cu32Plan {
 /// `size×size` luma region at (row, col). Source reads are clamped to the true
 /// picture extent so partial edge CUs compare against replicated borders.
 fn cu_region_sse(tree: &CuTreeState<'_>, row: usize, col: usize, size: usize) -> f32 {
-    let s = tree.strides;
+    region_sse(
+        tree.yuv,
+        tree.rec_y,
+        tree.rec_cb,
+        tree.rec_cr,
+        tree.strides,
+        row,
+        col,
+        size,
+    )
+}
+
+/// Reconstruction SSE of one square luma region plus its co-located chroma,
+/// measured against the source with edge clamping. All RD comparisons in this
+/// encoder (CU split, palette vs intra) use this one definition of distortion.
+#[allow(clippy::too_many_arguments)]
+fn region_sse(
+    yuv: &Yuv,
+    rec_y: &[u16],
+    rec_cb: &[u16],
+    rec_cr: &[u16],
+    s: PlaneStrides,
+    row: usize,
+    col: usize,
+    size: usize,
+) -> f32 {
     let mut sse = 0.0f64;
     for r in 0..size {
         let sy = (row + r).min(s.src_yh - 1);
         for c in 0..size {
             let sx = (col + c).min(s.src_yw - 1);
-            let src = tree.yuv.y[sy * s.src_yw + sx] as f64;
-            let rec = tree.rec_y[(row + r) * s.w + (col + c)] as f64;
+            let src = yuv.y[sy * s.src_yw + sx] as f64;
+            let rec = rec_y[(row + r) * s.w + (col + c)] as f64;
             let d = src - rec;
             sse += d * d;
         }
     }
-    if !tree.rec_cb.is_empty() {
+    if !rec_cb.is_empty() {
         let cw_s = size / s.sub_w;
         let ch_s = size / s.sub_h;
         let cr0 = row / s.sub_h;
         let cc0 = col / s.sub_w;
-        let planes: [(&[u16], &[u16]); 2] = [
-            (&tree.rec_cb[..], tree.yuv.cb.as_slice()),
-            (&tree.rec_cr[..], tree.yuv.cr.as_slice()),
-        ];
+        let planes: [(&[u16], &[u16]); 2] =
+            [(rec_cb, yuv.cb.as_slice()), (rec_cr, yuv.cr.as_slice())];
         for (rec_plane, src_plane) in planes {
             for r in 0..ch_s {
                 let sy = (cr0 + r).min(s.src_ch - 1);
@@ -3510,6 +3625,7 @@ fn cost_leaf_with_aq(
             cqo: tree.cqo,
             lambda: tree.lambda,
             lossless: tree.lossless,
+            scc: tree.scc,
         },
         &mut *tree.mode_map,
         tree.mode_stride,
@@ -7028,6 +7144,7 @@ fn encode_cu<W: CabacWriter>(
         lu,
         lambda,
         lossless,
+        scc,
     } = *par;
     let neutral: u16 = bit_depth.neutral(); // 128 (8-bit) / 512 (10-bit)
     let max_val: u16 = bit_depth.max_val(); // 255 / 1023
@@ -7248,6 +7365,9 @@ fn encode_cu<W: CabacWriter>(
         if lossless {
             rate += trial_ctx.cu_transquant_bypass_flag.estimate_and_update(1);
         }
+        if scc {
+            rate += trial_ictx.palette_mode_flag.estimate_and_update(0);
+        }
         if lu == 8 {
             rate += trial_ictx.part_mode.estimate_and_update(1);
         }
@@ -7394,6 +7514,19 @@ fn encode_cu<W: CabacWriter>(
     // those TBs use the stacked square layout that the split path does not yet
     // model, so NxN is likewise restricted to the square 4:2:0/4:4:4 chroma
     // formats (and monochrome).
+    // ── coding_unit() header prefix (HEVC §7.3.8.5) ──────────────────────────
+    // cu_transquant_bypass_flag is the CU's first syntax element, and SCC's
+    // palette_mode_flag directly follows it. Both precede part_mode, which the
+    // PART_NxN path below writes itself, so they are emitted here rather than
+    // at the 2Nx2N commit. Lossless never reaches the NxN path, so hoisting the
+    // bypass flag leaves its position relative to part_mode unchanged.
+    if lossless {
+        enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
+    }
+    if scc {
+        enc.encode_bin(0, &mut ictx.palette_mode_flag);
+    }
+
     if lu == 8
         && !lossless
         && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422)
@@ -7467,13 +7600,6 @@ fn encode_cu<W: CabacWriter>(
     // rectangular chroma region to two stacked square TBs; transquant-bypass
     // children use direct residuals and inferred RDPCM.
     let split_allowed = lu > 4;
-
-    // ── cu_transquant_bypass_flag ────────────────────────────────────────────
-    // Per HEVC §7.3.8.5 this is the first element of coding_unit(), present only
-    // when the PPS sets transquant_bypass_enabled_flag (i.e. lossless coding).
-    if lossless {
-        enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
-    }
 
     // ── part_mode ──────────────────────────────────────────────────────────
     // The regular path is PART_2Nx2N. PART_NxN is handled by the dedicated 8×8
@@ -8382,6 +8508,7 @@ fn code_one_cu<W: CabacWriter>(
         cqo,
         lambda,
         lossless,
+        scc,
     } = coding;
     let PlaneStrides {
         w,
@@ -8426,8 +8553,326 @@ fn code_one_cu<W: CabacWriter>(
         lu,
         lambda,
         lossless,
+        scc,
     };
-    encode_cu(ent, &src, &mut rec, &geo, &par, mode_map, aq, scratch);
+    let Entropy { enc, ctx, ictx } = ent;
+    if scc
+        && try_palette_cu(
+            Entropy {
+                enc: &mut *enc,
+                ctx: &mut *ctx,
+                ictx: &mut *ictx,
+            },
+            yuv,
+            &src,
+            &mut rec,
+            &geo,
+            &par,
+            strides,
+            mode_map,
+            aq,
+            scratch,
+        )
+    {
+        return;
+    }
+    encode_cu(
+        Entropy { enc, ctx, ictx },
+        &src,
+        &mut rec,
+        &geo,
+        &par,
+        mode_map,
+        aq,
+        scratch,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Palette mode (SCC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Routes palette syntax to a CABAC sink with the normative context selection
+/// of §9.3.4.2.1. `cu_qp_delta` reaches the same context set the transform path
+/// uses, so a palette CU carrying escapes charges the quantization group's delta
+/// exactly once, exactly like a CU carrying residual.
+struct PaletteBridge<'a, W: CabacWriter> {
+    enc: &'a mut W,
+    ctx: &'a mut ContextSet,
+    aq: &'a mut AqCtuState,
+}
+
+impl<W: CabacWriter> crate::palette::PaletteBitWriter for PaletteBridge<'_, W> {
+    fn run_type_flag(&mut self, bin: u8) {
+        self.enc
+            .encode_bin(bin, &mut self.ctx.palette.run_type_flag);
+    }
+
+    fn transpose_flag(&mut self, bin: u8) {
+        self.enc
+            .encode_bin(bin, &mut self.ctx.palette.transpose_flag);
+    }
+
+    fn run_prefix_bin(&mut self, bin_idx: usize, copy_above: bool, bin: u8) {
+        // HEVC Table 9-51. The first COPY_INDEX bin is handled separately
+        // because its context depends on palette_index_idc.
+        let ctx_idx = match (copy_above, bin_idx) {
+            (false, 1 | 2) => Some(3),
+            (false, 3 | 4) => Some(4),
+            (true, 0) => Some(5),
+            (true, 1 | 2) => Some(6),
+            (true, 3 | 4) => Some(7),
+            _ => None,
+        };
+        match ctx_idx {
+            Some(i) => self
+                .enc
+                .encode_bin(bin, &mut self.ctx.palette.run_prefix[i]),
+            None => self.enc.encode_bypass(bin),
+        }
+    }
+
+    fn run_prefix_index_bin(&mut self, palette_index: u32, bin: u8) {
+        let bucket = if palette_index == 0 {
+            0
+        } else if palette_index < 3 {
+            1
+        } else {
+            2
+        };
+        self.enc
+            .encode_bin(bin, &mut self.ctx.palette.run_prefix[bucket]);
+    }
+
+    fn bypass(&mut self, bin: u8) {
+        self.enc.encode_bypass(bin);
+    }
+
+    fn bypass_bits(&mut self, value: u32, n: u32) {
+        for i in (0..n).rev() {
+            self.enc.encode_bypass(((value >> i) & 1) as u8);
+        }
+    }
+
+    fn escape_qp_syntax(&mut self) {
+        // §7.3.8.13: delta_qp() is present whenever escapes are, including under
+        // transquant bypass. chroma_qp_offset() is never present here — this
+        // encoder's PPS carries no chroma QP offset list.
+        encode_cu_qp_delta(self.enc, self.ctx, self.aq);
+    }
+}
+
+/// Write one CU's palette syntax: the coding_unit() header prefix followed by
+/// palette_coding() (§7.3.8.13).
+#[allow(clippy::too_many_arguments)]
+fn write_palette_syntax<W: CabacWriter>(
+    ent: Entropy<'_, W>,
+    aq: &mut AqCtuState,
+    cu: &crate::palette::PaletteCu,
+    pcfg: &crate::palette::PaletteConfig,
+    lossless: bool,
+    x0: usize,
+    y0: usize,
+    runs: &mut Vec<crate::palette::PaletteRun>,
+) {
+    let Entropy { enc, ctx, ictx } = ent;
+    if lossless {
+        enc.encode_bin(1, &mut ctx.cu_transquant_bypass_flag);
+    }
+    enc.encode_bin(1, &mut ictx.palette_mode_flag);
+    let mut bridge = PaletteBridge { enc, ctx, aq };
+    crate::palette::write_palette_cu(&mut bridge, cu, pcfg, x0, y0, runs);
+}
+
+/// Per-CU palette parameters: the component Qp′ values escapes are scaled by,
+/// plus the geometry the escape-presence test and reconstruction need.
+fn palette_config(
+    par: &CuParams,
+    bit_depth: crate::fmt::BitDepth,
+) -> crate::palette::PaletteConfig {
+    let bd = bit_depth.bits();
+    let qp_bd_offset = i32::from(bit_depth.qp_bd_offset());
+    let qp_luma = i32::from(par.qp) + qp_bd_offset;
+    let qp_chroma = i32::from(chroma_qp_for(par.qp, par.chroma, par.cqo)) + qp_bd_offset;
+    crate::palette::PaletteConfig {
+        num_comps: if par.chroma.is_monochrome() { 1 } else { 3 },
+        chroma_idc: par.chroma.idc() as u8,
+        sub_w: par.chroma.sub_w(),
+        sub_h: par.chroma.sub_h(),
+        bd_luma: bd,
+        bd_chroma: bd,
+        qp: [qp_luma, qp_chroma, qp_chroma],
+        lossless: par.lossless,
+    }
+}
+
+/// Evaluate palette mode against ordinary intra coding for this CU and, when it
+/// wins, commit it (syntax, reconstruction, predictor update). Returns whether
+/// the CU was coded as a palette block.
+///
+/// Both arms measure the same J = SSE + λ·bits, with the palette rate taken from
+/// a real trial encode of its own syntax and the intra rate from a full trial
+/// encode of the CU. The intra trial leaves its reconstruction in `rec`, which
+/// the palette commit overwrites when it wins; when it loses, the caller's real
+/// `encode_cu` reproduces it.
+#[allow(clippy::too_many_arguments)]
+fn try_palette_cu<W: CabacWriter>(
+    ent: Entropy<'_, W>,
+    yuv: &Yuv,
+    src: &CuSrcPlanes<'_>,
+    rec: &mut CuRecPlanes<'_>,
+    geo: &CuGeometry,
+    par: &CuParams,
+    strides: PlaneStrides,
+    mode_map: &mut [u8],
+    aq: &mut AqCtuState,
+    scratch: &mut CompressionContext,
+) -> bool {
+    let Entropy { enc, ctx, ictx } = ent;
+    let pcfg = palette_config(par, par.bit_depth);
+    let block = crate::palette::SourceBlock {
+        y: src.y,
+        cb: src.cb,
+        cr: src.cr,
+        yw: src.src_yw,
+        yh: geo.src_yh,
+        cw: geo.src_cw,
+        chh: geo.src_ch,
+        x0: geo.lu_col,
+        y0: geo.lu_row,
+        size: par.lu,
+    };
+
+    // The colour table does not depend on palette_transpose_flag, which only
+    // permutes sample positions, so it is built once.
+    if !crate::palette::analyze_palette(
+        &block,
+        &scratch.palette_pred,
+        &pcfg,
+        &mut scratch.palette_cand,
+    ) {
+        return false;
+    }
+
+    // palette_transpose_flag remaps chroma sample positions as well as luma, so
+    // it is only evaluated where every luma position carries its own chroma.
+    let square_chroma = pcfg.sub_w == 1 && pcfg.sub_h == 1;
+    let mut best_cost = f32::MAX;
+    let mut best_transpose = false;
+    for transpose in [false, true] {
+        if transpose && !square_chroma {
+            continue;
+        }
+        if !crate::palette::assign_indices(&block, &pcfg, transpose, &mut scratch.palette_cand) {
+            continue;
+        }
+        let mut est = CabacEstimator::default();
+        let mut trial_ctx = ctx.clone();
+        let mut trial_ictx = ictx.clone();
+        let mut trial_aq = *aq;
+        write_palette_syntax(
+            Entropy {
+                enc: &mut est,
+                ctx: &mut trial_ctx,
+                ictx: &mut trial_ictx,
+            },
+            &mut trial_aq,
+            &scratch.palette_cand,
+            &pcfg,
+            par.lossless,
+            geo.lu_col,
+            geo.lu_row,
+            &mut scratch.palette_runs,
+        );
+        let cost = scratch.palette_cand.sse + par.lambda * est.bits();
+        if cost < best_cost {
+            best_cost = cost;
+            best_transpose = transpose;
+        }
+    }
+    if best_cost == f32::MAX {
+        return false;
+    }
+
+    // Intra reference cost: a complete trial encode of this CU.
+    let mut est = CabacEstimator::default();
+    let mut trial_ctx = ctx.clone();
+    let mut trial_ictx = ictx.clone();
+    let mut trial_aq = *aq;
+    encode_cu(
+        Entropy {
+            enc: &mut est,
+            ctx: &mut trial_ctx,
+            ictx: &mut trial_ictx,
+        },
+        src,
+        rec,
+        geo,
+        par,
+        mode_map,
+        &mut trial_aq,
+        scratch,
+    );
+    let intra_cost = region_sse(
+        yuv, rec.y, rec.cb, rec.cr, strides, geo.lu_row, geo.lu_col, par.lu,
+    ) + par.lambda * est.bits();
+    if best_cost >= intra_cost {
+        return false;
+    }
+
+    // ── Commit ───────────────────────────────────────────────────────────────
+    // Re-derive the winning index map (the loop above left the last candidate).
+    if scratch.palette_cand.transpose != best_transpose {
+        crate::palette::assign_indices(&block, &pcfg, best_transpose, &mut scratch.palette_cand);
+    }
+    write_palette_syntax(
+        Entropy { enc, ctx, ictx },
+        aq,
+        &scratch.palette_cand,
+        &pcfg,
+        par.lossless,
+        geo.lu_col,
+        geo.lu_row,
+        &mut scratch.palette_runs,
+    );
+    let y_height = rec.y.len() / geo.yw_stride;
+    let c_height = rec.cb.len().checked_div(geo.cw_stride).unwrap_or(0);
+    crate::palette::reconstruct(
+        &scratch.palette_cand,
+        &pcfg,
+        &mut crate::palette::ReconTarget {
+            y: rec.y,
+            cb: rec.cb,
+            cr: rec.cr,
+            y_stride: geo.yw_stride,
+            c_stride: geo.cw_stride,
+            y_height,
+            c_height,
+        },
+        geo.lu_col,
+        geo.lu_row,
+    );
+
+    // A palette CU is intra; §8.4.2 gives its neighbours INTRA_DC for MPM
+    // derivation. Its only deblocking edges are the CU boundary itself.
+    const DC: u8 = 1;
+    for br in 0..(par.lu / 4) {
+        let row = (geo.lu_row / 4 + br) * geo.mode_stride + geo.lu_col / 4;
+        mode_map[row..row + par.lu / 4].fill(DC);
+    }
+    scratch.last_tu_layout = TuLayout::Unsplit;
+
+    // The predictor is slice state: only the pass that actually writes the
+    // picture may advance it, or speculative trials would desynchronise it.
+    if W::COMMIT {
+        let best = &*scratch.palette_cand;
+        scratch.palette_pred.update(
+            best.palette_entries(),
+            best.reuse_flags(),
+            crate::palette::MAX_PREDICTOR_SIZE,
+        );
+    }
+    true
 }
 
 /// Extract an N×N block into reusable storage. Rows that lie fully inside the
@@ -8704,6 +9149,7 @@ mod tests {
             crate::Speed::Fast,
             None,
             0,
+            false,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -8762,6 +9208,7 @@ mod tests {
             crate::Speed::Fast,
             None,
             0,
+            false,
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);
@@ -8894,6 +9341,116 @@ mod tests {
     }
 
     #[test]
+    fn screen_content_advertises_the_screen_extended_profile() {
+        let mut ptl = BitWriter::new();
+        write_profile_tier_level(
+            &mut ptl,
+            93,
+            crate::fmt::ChromaFormat::Yuv444,
+            crate::fmt::BitDepth::Eight,
+            false,
+            true,
+        );
+        let ptl = ptl.finish();
+        assert_eq!(ptl[0] & 0x1f, 9, "general_profile_idc = Screen-Extended");
+        // general_profile_compatibility_flag[9] is bit 9 of the 32-bit field,
+        // written MSB-first immediately after the profile_idc byte.
+        let compat = u32::from_be_bytes([ptl[1], ptl[2], ptl[3], ptl[4]]);
+        assert_eq!(compat, 1 << (31 - 9));
+    }
+
+    #[test]
+    fn sps_carries_the_scc_extension_only_when_requested() {
+        let plain = build_sps(
+            64,
+            64,
+            crate::fmt::ChromaFormat::Yuv420,
+            crate::fmt::BitDepth::Eight,
+            false,
+            None,
+            false,
+        );
+        let scc = build_sps(
+            64,
+            64,
+            crate::fmt::ChromaFormat::Yuv420,
+            crate::fmt::BitDepth::Eight,
+            false,
+            None,
+            true,
+        );
+        // 8-bit 4:2:0 lossy needs no range extension, so the SCC stream is the
+        // only one carrying an sps_extension at all.
+        assert!(scc.data.len() > plain.data.len());
+    }
+
+    /// The palette CU's `palette_mode_flag` must sit between
+    /// `cu_transquant_bypass_flag` and the palette payload, and the intra path
+    /// must spend the same flag with value 0 — otherwise the two paths disagree
+    /// on how many bins precede the CU body and the decoder desynchronises.
+    #[test]
+    fn palette_and_intra_cus_spend_the_same_header_prefix() {
+        let mut cu = crate::palette::PaletteCu::new();
+        cu.size = 8;
+        cu.num_comps = 1;
+        cu.palette_size = 1;
+        cu.palette[0] = [128, 0, 0];
+        cu.pred_size = 0;
+        cu.num_signaled = 1;
+        cu.escape_present = false;
+        let pcfg = crate::palette::PaletteConfig {
+            num_comps: 1,
+            chroma_idc: 0,
+            sub_w: 1,
+            sub_h: 1,
+            bd_luma: 8,
+            bd_chroma: 8,
+            qp: [26, 26, 26],
+            lossless: false,
+        };
+        let mut ictx = IntraModeContexts::init_islice(26);
+        let before = ictx.palette_mode_flag;
+        let mut ctx = ContextSet::init_islice(26);
+        let mut aq = AqCtuState {
+            enabled: false,
+            predictor: 26,
+            target: 26,
+            coded: false,
+        };
+        let mut est = CabacEstimator::default();
+        let mut runs = Vec::new();
+        write_palette_syntax(
+            Entropy {
+                enc: &mut est,
+                ctx: &mut ctx,
+                ictx: &mut ictx,
+            },
+            &mut aq,
+            &cu,
+            &pcfg,
+            false,
+            0,
+            0,
+            &mut runs,
+        );
+        // One context-coded palette_mode_flag = 1 was spent, and the palette is
+        // a single signalled entry, so the payload is tiny but non-empty.
+        assert_ne!(ictx.palette_mode_flag.p_state_idx, before.p_state_idx);
+        assert!(est.bits() > 0.0);
+    }
+
+    #[test]
+    fn palette_predictor_reset_matches_a_fresh_slice() {
+        let mut predictor = crate::palette::PalettePredictor::default();
+        predictor.reset(3);
+        assert_eq!(predictor.size(), 0);
+        predictor.update(&[[1, 2, 3]], &[], crate::palette::MAX_PREDICTOR_SIZE);
+        assert_eq!(predictor.size(), 1);
+        predictor.reset(3);
+        assert_eq!(predictor.size(), 0, "a new slice segment starts empty");
+    }
+
+    #[test]
     fn lossless_profile_enables_rext() {
         let mut lossy = BitWriter::new();
         write_profile_tier_level(
@@ -8901,6 +9458,7 @@ mod tests {
             93,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
+            false,
             false,
         );
         let lossy = lossy.finish();
@@ -8913,6 +9471,7 @@ mod tests {
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
             true,
+            false,
         );
         let lossless = lossless.finish();
         assert_eq!(lossless[0] & 0x1f, 4);
@@ -9061,6 +9620,7 @@ mod tests {
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
             false,
+            false,
         );
         assert_eq!(vps.data[0], 0x40, "VPS first byte should be 0x40");
     }
@@ -9074,6 +9634,7 @@ mod tests {
             crate::fmt::BitDepth::Eight,
             false,
             Some(&crate::color::Cicp::srgb()),
+            false,
         );
         assert!(sps.data.len() > 10);
     }

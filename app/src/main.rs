@@ -46,7 +46,8 @@ fn main() {
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Slow)
-            .with_lossless(false),
+            .with_lossless(false)
+            .with_screen_content(true),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());

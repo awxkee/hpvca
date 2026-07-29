@@ -178,6 +178,8 @@ impl CtxModel {
 /// Minimal CABAC writer interface shared by the real arithmetic coder and the
 /// fractional-bit estimator used by speculative RD trials.
 pub(crate) trait CabacWriter {
+    const COMMIT: bool = false;
+
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel);
     fn encode_bypass(&mut self, bin_val: u8);
 }
@@ -385,6 +387,8 @@ impl CabacEncoder {
 }
 
 impl CabacWriter for CabacEncoder {
+    const COMMIT: bool = true;
+
     #[inline]
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
         CabacEncoder::encode_bin(self, bin_val, ctx);

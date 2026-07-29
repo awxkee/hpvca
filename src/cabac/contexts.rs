@@ -85,6 +85,10 @@ pub(crate) struct ContextSet {
     // (HEVC Table 9-43). Used only when the PPS enables transquant bypass
     // (lossless coding).
     pub(crate) cu_transquant_bypass_flag: CtxModel,
+
+    /// Palette-mode contexts (SCC). Present in every context set so the WPP
+    /// storage/sync process carries them exactly like the rest (§9.3.2.3).
+    pub(crate) palette: PaletteContexts,
 }
 
 impl ContextSet {
@@ -173,6 +177,32 @@ impl ContextSet {
             persistent_rice: false,
 
             cu_transquant_bypass_flag: c(154, qp),
+
+            palette: PaletteContexts::init(qp),
+        }
+    }
+}
+
+/// Palette-mode contexts (§9.3.4.2.1, Table 9-4 SCC). Every palette syntax
+/// element uses initValue 154 across all init types.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaletteContexts {
+    /// `palette_run_type_flag`. The SAME context variable also codes
+    /// `copy_above_indices_for_final_run_flag` — one probability state.
+    pub(crate) run_type_flag: CtxModel,
+    /// `palette_transpose_flag`.
+    pub(crate) transpose_flag: CtxModel,
+    /// `palette_run_prefix`: [0..2] keyed by the palette index for the first
+    /// COPY_INDEX bin, [3..4] for later COPY_INDEX bins, [5..7] for COPY_ABOVE.
+    pub(crate) run_prefix: [CtxModel; 8],
+}
+
+impl PaletteContexts {
+    pub(crate) fn init(qp: u8) -> Self {
+        Self {
+            run_type_flag: CtxModel::init(154, qp),
+            transpose_flag: CtxModel::init(154, qp),
+            run_prefix: [CtxModel::init(154, qp); 8],
         }
     }
 }
@@ -185,6 +215,8 @@ pub(crate) struct IntraModeContexts {
     pub(crate) part_mode: CtxModel,
     pub(crate) prev_intra_luma_pred_flag: CtxModel,
     pub(crate) intra_chroma_pred_mode: CtxModel,
+    /// `palette_mode_flag` (SCC, §9.3.4.2): a single context, initValue 154.
+    pub(crate) palette_mode_flag: CtxModel,
 }
 
 impl IntraModeContexts {
@@ -193,6 +225,7 @@ impl IntraModeContexts {
             part_mode: CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
             intra_chroma_pred_mode: CtxModel::init(63, qp),
+            palette_mode_flag: CtxModel::init(154, qp),
         }
     }
 }

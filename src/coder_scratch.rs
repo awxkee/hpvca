@@ -111,7 +111,9 @@ impl Deref for ScratchLease {
 
 impl DerefMut for ScratchLease {
     fn deref_mut(&mut self) -> &mut CoderScratch {
-        self.0.as_deref_mut().expect("lease is populated until drop")
+        self.0
+            .as_deref_mut()
+            .expect("lease is populated until drop")
     }
 }
 

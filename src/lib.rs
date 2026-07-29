@@ -30,8 +30,8 @@
 #![deny(unreachable_pub)]
 use std::mem::size_of;
 mod aq;
-mod coder_scratch;
 mod cabac;
+mod coder_scratch;
 mod color;
 mod cost;
 mod dct;
@@ -44,6 +44,7 @@ mod intra;
 mod isobmff;
 mod math;
 mod metadata;
+mod palette;
 mod pool;
 mod sao;
 mod ycgco;
@@ -54,12 +55,12 @@ mod avx;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
 
+use crate::math::FastRound;
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
-use crate::math::FastRound;
 
 const MIN_DIM: u32 = 1;
 const MAX_DIM: u32 = 16_384;
@@ -184,6 +185,10 @@ pub struct EncodeConfig {
     pub variance_boost: VarianceBoost,
     /// Effort tier (speed vs compression efficiency). Defaults to [`Speed::Fast`].
     pub speed: Speed,
+    /// Enable HEVC Screen Content Coding tools (palette mode). Off by default:
+    /// it changes the advertised profile to Screen-Extended (profile_idc 9),
+    /// which only SCC-capable decoders accept.
+    pub screen_content: bool,
 }
 
 impl Default for EncodeConfig {
@@ -199,6 +204,7 @@ impl Default for EncodeConfig {
             sao: true,
             variance_boost: VarianceBoost::default(),
             speed: Speed::default(),
+            screen_content: false,
         }
     }
 }
@@ -252,6 +258,13 @@ impl EncodeConfig {
 
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        self
+    }
+
+    /// Enable the Screen Content Coding tool set (see
+    /// [`screen_content`](Self::screen_content)).
+    pub fn with_screen_content(mut self, screen_content: bool) -> Self {
+        self.screen_content = screen_content;
         self
     }
 
@@ -814,6 +827,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -827,6 +841,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -915,6 +930,7 @@ fn encode_gray_alpha_wide(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -928,6 +944,7 @@ fn encode_gray_alpha_wide(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -968,6 +985,7 @@ pub fn encode_yuv_with_alpha(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -989,6 +1007,7 @@ pub fn encode_yuv_with_alpha(
         cfg.sao,
         cfg.variance_boost,
         cfg.speed,
+        cfg.screen_content,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -1022,6 +1041,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         None,
         0,
         None,
+        cfg.screen_content,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -1139,8 +1159,8 @@ fn grid_global_aq_map(
         yuv::rgb_to_yuv(src, width, height, ChromaFormat::Monochrome, bit_depth)
     };
     let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, false);
-    let map = aq::activity_aq_enabled(qp, false)
-        .then(|| grid_aq_offsets(&luma_yuv, qp, variance_boost));
+    let map =
+        aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp, variance_boost));
     (map, cqo)
 }
 
@@ -1237,6 +1257,7 @@ fn encode_cell(
     aq_override: Option<&[i8]>,
     qp_bias: i8,
     chroma_qp_offset: Option<i8>,
+    screen_content: bool,
 ) -> Result<hevc::NaluStream, EncodeError> {
     let (wpp, wpp_threads) = if cell_wpp {
         // A WPP picture cannot run more CTU rows concurrently than it has.
@@ -1262,6 +1283,7 @@ fn encode_cell(
         aq_override,
         qp_bias,
         chroma_qp_offset,
+        screen_content,
     )
 }
 
@@ -1289,11 +1311,22 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(rgb, width, height, 3, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map(
+        rgb,
+        width,
+        height,
+        3,
+        bit_depth,
+        cfg.quality,
+        cfg.lossless,
+        cfg.variance_boost,
+    );
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, width, height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1334,6 +1367,7 @@ fn encode_rgb_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         );
         ws.conv_y = yuv.y;
         ws.conv_cb = yuv.cb;
@@ -1373,11 +1407,22 @@ fn encode_gray_tiled(
     let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(gray, width, height, 1, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map(
+        gray,
+        width,
+        height,
+        1,
+        bit_depth,
+        cfg.quality,
+        cfg.lossless,
+        cfg.variance_boost,
+    );
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, width, height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1407,6 +1452,7 @@ fn encode_gray_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1447,11 +1493,14 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1505,6 +1554,7 @@ fn encode_yuv_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1532,6 +1582,7 @@ fn encode_yuv_alpha_tiled(
             None,
             0,
             Some(0),
+            cfg.screen_content,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1579,11 +1630,14 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, yuv.width, yuv.height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1637,6 +1691,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1673,11 +1728,22 @@ fn encode_rgba_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(rgba, width, height, 4, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map(
+        rgba,
+        width,
+        height,
+        4,
+        bit_depth,
+        cfg.quality,
+        cfg.lossless,
+        cfg.variance_boost,
+    );
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, width, height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1717,6 +1783,7 @@ fn encode_rgba_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1743,6 +1810,7 @@ fn encode_rgba_alpha_tiled(
             None,
             0,
             Some(0),
+            cfg.screen_content,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1789,11 +1857,22 @@ fn encode_gray_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(ya, width, height, 2, bit_depth, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map(
+        ya,
+        width,
+        height,
+        2,
+        bit_depth,
+        cfg.quality,
+        cfg.lossless,
+        cfg.variance_boost,
+    );
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
-        let cell_aq = aq_map.as_deref().map(|m| cell_aq_slice(m, width, height, col, row));
+        let cell_aq = aq_map
+            .as_deref()
+            .map(|m| cell_aq_slice(m, width, height, col, row));
         let (cell_aq_offsets, cell_qp_bias) = match &cell_aq {
             Some((offsets, bias)) => (Some(offsets.as_slice()), *bias),
             None => (None, 0),
@@ -1833,6 +1912,7 @@ fn encode_gray_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            cfg.screen_content,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1858,6 +1938,7 @@ fn encode_gray_alpha_tiled(
             None,
             0,
             Some(0),
+            cfg.screen_content,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
