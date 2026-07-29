@@ -33,7 +33,9 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    let img = image::open("./assets/Screenshot 2026-07-29 at 12.40.11.png")
+        .unwrap()
+        .to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
     let instant = Instant::now();
     let data = hpvca::encode_rgb(
@@ -46,10 +48,11 @@ fn main() {
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Slow)
-            .with_lossless(false),
+            .with_lossless(false)
+            .with_screen_content(true),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
-    fs::write("results.heic", data).unwrap();
+    fs::write("results.heic", data.clone()).unwrap();
     println!("Hello, world!");
 }

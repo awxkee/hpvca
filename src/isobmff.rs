@@ -1631,8 +1631,17 @@ mod tests {
         use crate::hevc::{build_pps, build_sps, build_vps};
         NaluStream {
             nalus: vec![
-                build_vps(16, 16, chroma, bd, false),
-                build_sps(16, 16, chroma, bd, false, Some(&crate::color::Cicp::srgb())),
+                build_vps(16, 16, chroma, bd, false, false, false),
+                build_sps(
+                    16,
+                    16,
+                    chroma,
+                    bd,
+                    false,
+                    Some(&crate::color::Cicp::srgb()),
+                    false,
+                    false,
+                ),
                 build_pps(30, false, false),
             ],
         }
@@ -1650,7 +1659,7 @@ mod tests {
         let bit_depth = crate::fmt::BitDepth::Eight;
         NaluStream {
             nalus: vec![
-                build_vps(16, 16, chroma, bit_depth, true),
+                build_vps(16, 16, chroma, bit_depth, true, false, false),
                 build_sps(
                     16,
                     16,
@@ -1658,6 +1667,8 @@ mod tests {
                     bit_depth,
                     true,
                     Some(&crate::color::Cicp::srgb()),
+                    false,
+                    false,
                 ),
                 build_pps(30, true, false),
             ],
