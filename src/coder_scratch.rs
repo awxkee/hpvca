@@ -46,9 +46,14 @@ pub(crate) struct CoderScratch {
     pub(crate) cu_depth: Vec<u8>,
     /// Per-4×4 luma intra-mode map (MPM derivation).
     pub(crate) mode_map: Vec<u8>,
-    /// Per-4×4 deblocking edge flags.
-    pub(crate) edge_v: Vec<bool>,
-    pub(crate) edge_h: Vec<bool>,
+    /// Per-4×4 deblocking boundary strengths (0 = no edge, 1 = coded-block or
+    /// motion difference, 2 = intra).
+    pub(crate) edge_v: Vec<u8>,
+    pub(crate) edge_h: Vec<u8>,
+    /// Per-4×4 block-vector map for IntraBC: [`crate::hevc::BV_INTRA`] where the
+    /// block is intra (or palette), otherwise a packed integer luma BV. Feeds
+    /// AMVP prediction and deblocking boundary strength.
+    pub(crate) bv_map: Vec<i32>,
     /// Per-4×4 QpY map for AQ deblocking (empty when AQ is off).
     pub(crate) qp_map: Vec<u8>,
     /// Padded source luma for the SAO statistics pass.
@@ -76,6 +81,7 @@ impl CoderScratch {
             mode_map: Vec::new(),
             edge_v: Vec::new(),
             edge_h: Vec::new(),
+            bv_map: Vec::new(),
             qp_map: Vec::new(),
             sao_original: Vec::new(),
             sao_apply: Vec::new(),

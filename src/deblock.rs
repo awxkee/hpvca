@@ -86,8 +86,8 @@ pub(crate) fn deblock(
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
     cqo: i8,
-    edge_v: &[bool],
-    edge_h: &[bool],
+    edge_v: &[u8],
+    edge_h: &[u8],
 ) {
     deblock_impl(
         y, w, h, cb, cr, cw, ch, qp, bit_depth, chroma, cqo, edge_v, edge_h, None, 0,
@@ -110,8 +110,8 @@ pub(crate) fn deblock_with_qp_map(
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
     cqo: i8,
-    edge_v: &[bool],
-    edge_h: &[bool],
+    edge_v: &[u8],
+    edge_h: &[u8],
     qp_map: &[u8],
     qp_stride: usize,
 ) {
@@ -147,8 +147,8 @@ fn deblock_impl(
     bit_depth: crate::fmt::BitDepth,
     chroma: crate::fmt::ChromaFormat,
     cqo: i8,
-    edge_v: &[bool],
-    edge_h: &[bool],
+    edge_v: &[u8],
+    edge_h: &[u8],
     qp_map: Option<&[u8]>,
     qp_stride: usize,
 ) {
@@ -200,6 +200,15 @@ fn deblock_impl(
     }
 }
 
+/// §8.7.2.5.3: the tC table is indexed at Q = QpL + 2·(bS − 1), so a
+/// boundary-strength-1 edge (an IntraBC copy against another copy, with no
+/// coded residual on either side) filters with a strictly smaller clipping
+/// bound than an intra edge.
+#[inline]
+fn tc_offset(bs: u8) -> i32 {
+    2 * (i32::from(bs) - 1)
+}
+
 #[inline]
 fn edge_qp(
     fallback: u8,
@@ -228,7 +237,7 @@ fn deblock_luma(
     qp: u8,
     vertical: bool,
     bit_depth: u8,
-    edges: &[bool],
+    edges: &[u8],
     edge_stride: usize,
     qp_map: Option<&[u8]>,
     qp_stride: usize,
@@ -244,10 +253,11 @@ fn deblock_luma(
         while x < w {
             let mut yk = 0;
             while yk + 4 <= h {
-                if edges[(yk / 4) * edge_stride + x / 4] {
+                let bs = edges[(yk / 4) * edge_stride + x / 4];
+                if bs != 0 {
                     let qp_l = edge_qp(qp, qp_map, qp_stride, x, yk, true);
                     let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
-                    let tc = TC_TABLE[clip3(0, 53, qp_l + 2) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_l + tc_offset(bs)) as usize] << bdshift;
                     filter_luma_segment(y, w, x, yk, true, beta, tc, max_val);
                 }
                 yk += 4;
@@ -259,10 +269,11 @@ fn deblock_luma(
         while yy < h {
             let mut xk = 0;
             while xk + 4 <= w {
-                if edges[(yy / 4) * edge_stride + xk / 4] {
+                let bs = edges[(yy / 4) * edge_stride + xk / 4];
+                if bs != 0 {
                     let qp_l = edge_qp(qp, qp_map, qp_stride, xk, yy, false);
                     let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
-                    let tc = TC_TABLE[clip3(0, 53, qp_l + 2) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_l + tc_offset(bs)) as usize] << bdshift;
                     filter_luma_segment(y, w, xk, yy, false, beta, tc, max_val);
                 }
                 xk += 4;
@@ -430,7 +441,7 @@ fn deblock_chroma(
     bit_depth: u8,
     chroma: crate::fmt::ChromaFormat,
     cqo: i8,
-    edges: &[bool],
+    edges: &[u8],
     edge_stride: usize,
     qp_map: Option<&[u8]>,
     qp_stride: usize,
@@ -446,7 +457,7 @@ fn deblock_chroma(
             while yk + 4 <= chh {
                 let lx = x * chroma.sub_w();
                 let ly = (yk + 1) * chroma.sub_h();
-                if edges[(ly / 4) * edge_stride + lx / 4] {
+                if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, true);
                     let qp_c = chroma_qp(qpi, chroma, cqo);
                     let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
@@ -463,7 +474,7 @@ fn deblock_chroma(
             while xk + 4 <= cw {
                 let lx = (xk + 1) * chroma.sub_w();
                 let ly = yy * chroma.sub_h();
-                if edges[(ly / 4) * edge_stride + lx / 4] {
+                if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, false);
                     let qp_c = chroma_qp(qpi, chroma, cqo);
                     let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
@@ -526,9 +537,9 @@ mod tests {
             row[8..].fill(104);
         }
         let before = y.clone();
-        let mut edge_v = vec![false; (w / 4) * (h / 4)];
+        let mut edge_v = vec![0u8; (w / 4) * (h / 4)];
         let edge_h = edge_v.clone();
-        edge_v[2] = true; // x=8, rows 0..4 only
+        edge_v[2] = 2; // x=8, rows 0..4 only
         deblock(
             &mut y,
             w,

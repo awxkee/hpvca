@@ -42,9 +42,82 @@ pub(crate) const MAX_PREDICTOR_SIZE: usize = MAX_PALETTE_SIZE + DELTA_MAX_PREDIC
 pub(crate) const MAX_CU: usize = 32;
 const MAX_SAMPLES: usize = MAX_CU * MAX_CU;
 
-/// Distinct exact colours tolerated before a block is declared photographic and
+/// Distinct exact colors tolerated before a block is declared photographic and
 /// palette analysis bails out. Bailing early keeps the gate cheap on photos.
 const MAX_DISTINCT: usize = 128;
+
+/// Slots in the color lookup table. A power of two at least twice
+/// [`MAX_DISTINCT`], so linear probing never passes a 50% load factor.
+const COLOR_SLOTS: usize = 256;
+
+/// Open-addressed "have I seen this color" table for the block histogram.
+///
+/// The histogram used to rescan every distinct color found so far for each
+/// sample, which is O(n·distinct) — and it runs on *every* CU that survives the
+/// luma pre-gate, whether or not palette mode ends up being evaluated. On a
+/// photograph that single loop was most of the cost of the screen-content
+/// search. Hashing makes it O(n) while preserving first-seen insertion order,
+/// so the frequency sort downstream sees exactly the same input.
+pub(crate) struct ColorIndex {
+    keys: [u64; COLOR_SLOTS],
+    entry: [u16; COLOR_SLOTS],
+    /// Which call last wrote each slot; bumping `generation` retires the whole
+    /// table without touching memory.
+    stamp: [u32; COLOR_SLOTS],
+    generation: u32,
+}
+
+impl ColorIndex {
+    pub(crate) fn new() -> Box<Self> {
+        Box::new(Self {
+            keys: [0; COLOR_SLOTS],
+            entry: [0; COLOR_SLOTS],
+            stamp: [0; COLOR_SLOTS],
+            generation: 0,
+        })
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped: retire every slot explicitly, once every 4 billion CUs.
+            self.stamp = [0; COLOR_SLOTS];
+            self.generation = 1;
+        }
+    }
+
+    /// Look `key` up, inserting `next` as its entry index when absent. Returns
+    /// the stored index and whether the color had been seen already.
+    #[inline]
+    fn lookup_or_insert(&mut self, key: u64, next: usize) -> (usize, bool) {
+        let mut slot =
+            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (COLOR_SLOTS - 1);
+        loop {
+            if self.stamp[slot] != self.generation {
+                self.stamp[slot] = self.generation;
+                self.keys[slot] = key;
+                self.entry[slot] = next as u16;
+                return (next, false);
+            }
+            if self.keys[slot] == key {
+                return (self.entry[slot] as usize, true);
+            }
+            slot = (slot + 1) & (COLOR_SLOTS - 1);
+        }
+    }
+}
+
+/// Pack a color into the table key. Components are at most 16 bits.
+#[inline]
+fn color_key(sample: &[u16; MAX_COMPONENTS], num_comps: usize) -> u64 {
+    let mut key = u64::from(sample[0]);
+    if num_comps > 1 {
+        key |= u64::from(sample[1]) << 16;
+        key |= u64::from(sample[2]) << 32;
+    }
+    key
+}
 
 /// COPY_ABOVE_MODE (§7.4.9.13). `palette_run_type_flag` carries it directly, so
 /// the writers pass `u8::from(copy_above)`; the constant names the value the
@@ -462,7 +535,7 @@ impl SourceBlock<'_> {
         plane[y * self.cw + x]
     }
 
-    /// The colour triple at index-grid cell `(row, col)`.
+    /// The color triple at index-grid cell `(row, col)`.
     #[inline]
     fn grid_sample(
         &self,
@@ -497,11 +570,6 @@ fn reconstructed(cu: &PaletteCu, cfg: &PaletteConfig, scan: usize, comp: usize) 
     }
 }
 
-/// O(n) pre-gate: how many distinct luma values (at 8-bit resolution) the block
-/// holds. Palette mode needs a *small* colour alphabet, and the number of
-/// distinct colours is at least the number of distinct luma values, so a block
-/// that fails here can never be a cheap palette block. Rejecting photographic
-/// CUs with one linear pass keeps the O(n·distinct) histogram below off them.
 fn distinct_luma_exceeds(src: &SourceBlock<'_>, bd: u8, limit: u32) -> bool {
     let shift = u32::from(bd.saturating_sub(8));
     let mut seen = [0u64; 4];
@@ -526,50 +594,51 @@ pub(crate) fn analyze_palette(
     src: &SourceBlock<'_>,
     predictor: &PalettePredictor,
     cfg: &PaletteConfig,
+    seen: &mut ColorIndex,
     out: &mut PaletteCu,
 ) -> bool {
     let size = src.size;
     debug_assert!(size <= MAX_CU);
-    if distinct_luma_exceeds(src, cfg.bd_luma, MAX_DISTINCT as u32) {
+    // Palette mode only pays when colors actually repeat: it spends a full
+    // sample value per new entry and buys back a short index run per sample. A
+    // block whose colors are more than half distinct can never win that trade.
+    // Luma alone already decides that for most photographic blocks.
+    let repetition_limit = (size * size / 2) as u32;
+    if distinct_luma_exceeds(src, cfg.bd_luma, repetition_limit.min(MAX_DISTINCT as u32)) {
         return false;
     }
 
     let mut colors = [[0u16; MAX_COMPONENTS]; MAX_DISTINCT];
     let mut counts = [0u32; MAX_DISTINCT];
     let mut distinct = 0usize;
+    seen.clear();
     for row in 0..size {
         for col in 0..size {
             let sample = src.grid_sample(row, col, false, cfg);
-            match colors[..distinct]
-                .iter()
-                .position(|candidate| candidate[..cfg.num_comps] == sample[..cfg.num_comps])
-            {
-                Some(k) => counts[k] += 1,
-                None => {
-                    if distinct == MAX_DISTINCT {
-                        return false;
-                    }
-                    colors[distinct] = sample;
-                    counts[distinct] = 1;
-                    distinct += 1;
+            let (k, present) = seen.lookup_or_insert(color_key(&sample, cfg.num_comps), distinct);
+            if present {
+                counts[k] += 1;
+            } else {
+                if distinct == MAX_DISTINCT {
+                    return false;
                 }
+                colors[distinct] = sample;
+                counts[distinct] = 1;
+                distinct += 1;
             }
         }
     }
 
-    // Palette mode only pays when colours actually repeat: it spends a full
-    // sample value per new entry and buys back a short index run per sample. A
-    // block whose colours are more than half distinct can never win that trade,
-    // and rejecting it here avoids the (expensive) intra reference encode.
+    // Same rejection as the luma pre-gate above, now on the real color count.
     if distinct * 2 > size * size {
         return false;
     }
 
-    let tol = colour_tolerance(cfg);
+    let tol = color_tolerance(cfg);
     let mut order: [u8; MAX_DISTINCT] = std::array::from_fn(|i| i as u8);
     order[..distinct].sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]));
 
-    // Representative colours, most frequent first.
+    // Representative colors, most frequent first.
     let mut reps = [[0u16; MAX_COMPONENTS]; MAX_PALETTE_SIZE];
     let mut rep_count = 0usize;
     for &oi in &order[..distinct] {
@@ -590,8 +659,6 @@ pub(crate) fn analyze_palette(
         return false;
     }
 
-    // ── 3. Prefer predictor entries: a reused entry costs a short run, a new
-    // one costs a full sample value per component. ───────────────────────────
     let pred_size = predictor.size().min(MAX_PREDICTOR_SIZE);
     out.pred_size = pred_size;
     out.reused[..pred_size].fill(false);
@@ -612,7 +679,7 @@ pub(crate) fn analyze_palette(
         }
     }
     let num_reused = palette_size;
-    // Remaining representatives are signalled explicitly.
+    // Remaining representatives are signaled explicitly.
     for r in 0..rep_count {
         if rep_taken[r] || palette_size == MAX_PALETTE_SIZE {
             continue;
@@ -645,18 +712,32 @@ pub(crate) fn assign_indices(
 
     let mut escapes = 0usize;
     let escape_index = palette_size as u32;
+    // The palette holds no duplicates, so a zero-distance entry is the unique
+    // nearest one. That makes both shortcuts below — reusing the previous
+    // sample's entry, and stopping the scan on an exact hit — free of any
+    // effect on which index is picked.
+    let mut previous = 0usize;
     for scan in 0..n {
         let (col, row) = scan_pos(scan, size);
         let sample = src.grid_sample(row, col, transpose, cfg);
         let mut best = 0usize;
         let mut best_err = u32::MAX;
-        for (k, entry) in out.palette[..palette_size].iter().enumerate() {
-            let err = max_abs(entry, &sample, cfg.num_comps);
-            if err < best_err {
-                best_err = err;
-                best = k;
+        if max_abs(&out.palette[previous], &sample, cfg.num_comps) == 0 {
+            best = previous;
+            best_err = 0;
+        } else {
+            for (k, entry) in out.palette[..palette_size].iter().enumerate() {
+                let err = max_abs(entry, &sample, cfg.num_comps);
+                if err < best_err {
+                    best_err = err;
+                    best = k;
+                    if err == 0 {
+                        break;
+                    }
+                }
             }
         }
+        previous = best;
         if best_err <= tol {
             out.indices[scan] = best as u32;
             out.escapes[scan] = [0; MAX_COMPONENTS];
@@ -676,7 +757,6 @@ pub(crate) fn assign_indices(
     out.escape_present = escapes != 0;
     out.transpose = transpose;
 
-    // ── 5. Distortion over exactly the samples the decoder writes ────────────
     // Unweighted, matching `cu_region_sse`: the palette J is compared directly
     // against the intra CU's J, so both must measure distortion the same way.
     let mut sse = 0.0f64;
@@ -720,9 +800,9 @@ fn max_abs(a: &[u16; MAX_COMPONENTS], b: &[u16; MAX_COMPONENTS], comps: usize) -
     worst
 }
 
-/// How far two colours may differ and still share a palette entry: half the
+/// How far two colors may differ and still share a palette entry: half the
 /// luma reconstruction step, i.e. the error quantization would introduce anyway.
-fn colour_tolerance(cfg: &PaletteConfig) -> u32 {
+fn color_tolerance(cfg: &PaletteConfig) -> u32 {
     if cfg.lossless {
         return 0;
     }
@@ -1440,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_finds_an_exact_palette_for_a_two_colour_block() {
+    fn analysis_finds_an_exact_palette_for_a_two_color_block() {
         let size = 8;
         let mut y = vec![0u16; size * size];
         for (i, sample) in y.iter_mut().enumerate() {
@@ -1463,7 +1543,8 @@ mod tests {
         let cfg = cfg444();
         let predictor = PalettePredictor::default();
         let mut cu = PaletteCu::new();
-        assert!(analyze_palette(&src, &predictor, &cfg, &mut cu));
+        let mut seen = ColorIndex::new();
+        assert!(analyze_palette(&src, &predictor, &cfg, &mut seen, &mut cu));
         assert!(assign_indices(&src, &cfg, false, &mut cu));
         assert_eq!(cu.palette_size, 2);
         assert!(!cu.escape_present);
@@ -1497,6 +1578,7 @@ mod tests {
         cfg.qp = [4, 4, 4];
         let predictor = PalettePredictor::default();
         let mut cu = PaletteCu::new();
-        assert!(!analyze_palette(&src, &predictor, &cfg, &mut cu));
+        let mut seen = ColorIndex::new();
+        assert!(!analyze_palette(&src, &predictor, &cfg, &mut seen, &mut cu));
     }
 }

@@ -86,6 +86,27 @@ pub(crate) struct ContextSet {
     // (lossless coding).
     pub(crate) cu_transquant_bypass_flag: CtxModel,
 
+    /// part_mode (4 contexts). Intra CUs at the minimum CB size code their
+    /// PART_2Nx2N/PART_NxN bin with context 0, and inter CUs share that same
+    /// state — in a P slice both syntax elements really do use one variable, so
+    /// it lives here rather than in [`IntraModeContexts`].
+    pub(crate) part_mode: [CtxModel; 4],
+
+    pub(crate) cu_skip_flag: [CtxModel; 3],
+    pub(crate) pred_mode_flag: CtxModel,
+    pub(crate) merge_flag: CtxModel,
+    /// merge_idx and ref_idx exist so the context set matches the decoder's
+    /// P-slice state exactly. This encoder codes MaxNumMergeCand = 1 and a
+    /// single active reference, so neither syntax element is ever present.
+    #[allow(dead_code)]
+    pub(crate) merge_idx: CtxModel,
+    #[allow(dead_code)]
+    pub(crate) ref_idx: [CtxModel; 2],
+    /// abs_mvd_greater0_flag (ctx 0) and abs_mvd_greater1_flag (ctx 1).
+    pub(crate) abs_mvd_greater01: [CtxModel; 2],
+    pub(crate) mvp_flag: CtxModel,
+    pub(crate) rqt_root_cbf: CtxModel,
+
     /// Palette-mode contexts (SCC). Present in every context set so the WPP
     /// storage/sync process carries them exactly like the rest (§9.3.2.3).
     pub(crate) palette: PaletteContexts,
@@ -178,10 +199,92 @@ impl ContextSet {
 
             cu_transquant_bypass_flag: c(154, qp),
 
+            part_mode: arr([184, 154, 139, 154], qp),
+            cu_skip_flag: arr([197, 185, 201], qp),
+            pred_mode_flag: c(149, qp),
+            merge_flag: c(110, qp),
+            merge_idx: c(122, qp),
+            ref_idx: arr([153, 153], qp),
+            abs_mvd_greater01: arr([140, 198], qp),
+            mvp_flag: c(168, qp),
+            rqt_root_cbf: c(79, qp),
+
+            palette: PaletteContexts::init(qp),
+        }
+    }
+
+    /// P-slice context initialization (initType 1, §9.3.2.2). Screen-content
+    /// streams code a P slice whose single reference is the current picture, so
+    /// every context — including the ones only intra CUs use — switches to the
+    /// P column of the initialization tables. Values from libde265
+    /// `contextmodel.cc`, cross-checked against the sibling `hpvcd` decoder.
+    pub(crate) fn init_pslice_ext(qp: u8, persistent_rice: bool) -> Self {
+        fn c(iv: u8, qp: u8) -> CtxModel {
+            CtxModel::init(iv, qp)
+        }
+        fn arr<const N: usize>(ivs: [u8; N], qp: u8) -> [CtxModel; N] {
+            ivs.map(|iv| CtxModel::init(iv, qp))
+        }
+        Self {
+            qp,
+            split_cu_flag: arr([107, 139, 126], qp),
+            split_transform_flag: arr([124, 138, 94], qp),
+            cbf_luma: arr([153, 111], qp),
+            cbf_chroma: arr([149, 107, 167, 154, 154], qp),
+            last_sig_coeff_x_prefix: arr(P_LAST_SIG_PREFIX, qp),
+            last_sig_coeff_y_prefix: arr(P_LAST_SIG_PREFIX, qp),
+            sig_coeff_flag: {
+                let mut models = [CtxModel::init(0, qp); 44];
+                for (slot, &iv) in models.iter_mut().zip(P_SIG_COEFF_FLAG.iter()) {
+                    *slot = CtxModel::init(iv, qp);
+                }
+                // The 44-slot array pads the 42 normative values with the last.
+                models[42] = CtxModel::init(P_SIG_COEFF_FLAG[41], qp);
+                models[43] = CtxModel::init(P_SIG_COEFF_FLAG[41], qp);
+                models
+            },
+            coded_sub_block_flag: arr([121, 140, 61, 154], qp),
+            coeff_abs_level_greater1: arr(P_COEFF_G1, qp),
+            coeff_abs_level_greater2: arr([107, 167, 91, 122, 107, 167], qp),
+            sao_merge_flag: c(153, qp),
+            sao_type_idx: c(185, qp),
+            cu_qp_delta_abs: arr([154, 154], qp),
+            stat_coeff: [0; 4],
+            persistent_rice,
+            cu_transquant_bypass_flag: c(154, qp),
+
+            part_mode: arr([154, 139, 154, 154], qp),
+            cu_skip_flag: arr([197, 185, 201], qp),
+            pred_mode_flag: c(149, qp),
+            merge_flag: c(110, qp),
+            merge_idx: c(122, qp),
+            ref_idx: arr([153, 153], qp),
+            abs_mvd_greater01: arr([140, 198], qp),
+            mvp_flag: c(168, qp),
+            rqt_root_cbf: c(79, qp),
+
             palette: PaletteContexts::init(qp),
         }
     }
 }
+
+/// last_significant_coeff_x/y_prefix, initType 1.
+static P_LAST_SIG_PREFIX: [u8; 18] = [
+    125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108,
+];
+
+/// significant_coeff_flag, initType 1 (42 normative values).
+static P_SIG_COEFF_FLAG: [u8; 42] = [
+    155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136,
+    153, 154, 166, 183, 140, 136, 153, 154, 170, 153, 123, 123, 107, 121, 107, 121, 167, 151, 183,
+    140, 151, 183, 140,
+];
+
+/// coeff_abs_level_greater1_flag, initType 1.
+static P_COEFF_G1: [u8; 24] = [
+    154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 137, 169, 194, 166,
+    167, 154, 167, 137, 182,
+];
 
 /// Palette-mode contexts (§9.3.4.2.1, Table 9-4 SCC). Every palette syntax
 /// element uses initValue 154 across all init types.
@@ -212,7 +315,6 @@ impl PaletteContexts {
 ///   part_mode = 184, prev_intra_luma_pred_flag = 184, intra_chroma_pred_mode = 63
 #[derive(Clone)]
 pub(crate) struct IntraModeContexts {
-    pub(crate) part_mode: CtxModel,
     pub(crate) prev_intra_luma_pred_flag: CtxModel,
     pub(crate) intra_chroma_pred_mode: CtxModel,
     /// `palette_mode_flag` (SCC, §9.3.4.2): a single context, initValue 154.
@@ -222,9 +324,17 @@ pub(crate) struct IntraModeContexts {
 impl IntraModeContexts {
     pub(crate) fn init_islice(qp: u8) -> Self {
         Self {
-            part_mode: CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
             intra_chroma_pred_mode: CtxModel::init(63, qp),
+            palette_mode_flag: CtxModel::init(154, qp),
+        }
+    }
+
+    /// P-slice (initType 1) intra-mode contexts.
+    pub(crate) fn init_pslice(qp: u8) -> Self {
+        Self {
+            prev_intra_luma_pred_flag: CtxModel::init(154, qp),
+            intra_chroma_pred_mode: CtxModel::init(152, qp),
             palette_mode_flag: CtxModel::init(154, qp),
         }
     }

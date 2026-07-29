@@ -40,6 +40,7 @@ mod error;
 mod fmt;
 mod hevc;
 mod hevc_transform;
+mod ibc;
 mod intra;
 mod isobmff;
 mod math;
@@ -185,9 +186,9 @@ pub struct EncodeConfig {
     pub variance_boost: VarianceBoost,
     /// Effort tier (speed vs compression efficiency). Defaults to [`Speed::Fast`].
     pub speed: Speed,
-    /// Enable HEVC Screen Content Coding tools (palette mode). Off by default:
-    /// it changes the advertised profile to Screen-Extended (profile_idc 9),
-    /// which only SCC-capable decoders accept.
+    /// Enable the HEVC Screen Content Coding tools (palette mode and intra
+    /// block copy). Off by default: it changes the advertised profile to
+    /// Screen-Extended (profile_idc 9), which only SCC-capable decoders accept.
     pub screen_content: bool,
 }
 

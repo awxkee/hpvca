@@ -175,13 +175,25 @@ impl CtxModel {
     }
 }
 
-/// Minimal CABAC writer interface shared by the real arithmetic coder and the
-/// fractional-bit estimator used by speculative RD trials.
 pub(crate) trait CabacWriter {
     const COMMIT: bool = false;
 
+    /// Everything needed to undo a stretch of coding on this sink.
+    type Snapshot: Copy;
+
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel);
     fn encode_bypass(&mut self, bin_val: u8);
+
+    /// Capture the sink's state so a speculatively coded region can be undone.
+    fn snapshot(&self) -> Self::Snapshot;
+    /// Restore a state captured by [`CabacWriter::snapshot`], discarding
+    /// everything coded since. The sink must be indistinguishable from one that
+    /// never coded it.
+    fn rollback(&mut self, snapshot: Self::Snapshot);
+    /// Running fractional bit count. Differences of this across a coded region
+    /// are the region's rate, on every sink — which is what lets an RD decision
+    /// price a candidate it has already written into the real bitstream.
+    fn coded_bits(&self) -> f32;
 }
 
 /// Fast fractional-bit CABAC sink. It updates context states exactly like the
@@ -200,6 +212,8 @@ impl CabacEstimator {
 }
 
 impl CabacWriter for CabacEstimator {
+    type Snapshot = f32;
+
     #[inline]
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
         self.bits += ctx.estimate_and_update(bin_val);
@@ -208,6 +222,21 @@ impl CabacWriter for CabacEstimator {
     #[inline]
     fn encode_bypass(&mut self, _bin_val: u8) {
         self.bits += 1.0;
+    }
+
+    #[inline]
+    fn snapshot(&self) -> f32 {
+        self.bits
+    }
+
+    #[inline]
+    fn rollback(&mut self, snapshot: f32) {
+        self.bits = snapshot;
+    }
+
+    #[inline]
+    fn coded_bits(&self) -> f32 {
+        self.bits
     }
 }
 
@@ -219,6 +248,8 @@ impl CabacWriter for CabacEstimator {
 pub(crate) struct CabacContextUpdater;
 
 impl CabacWriter for CabacContextUpdater {
+    type Snapshot = ();
+
     #[inline]
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
         ctx.update(bin_val);
@@ -226,6 +257,17 @@ impl CabacWriter for CabacContextUpdater {
 
     #[inline]
     fn encode_bypass(&mut self, _bin_val: u8) {}
+
+    #[inline]
+    fn snapshot(&self) {}
+
+    #[inline]
+    fn rollback(&mut self, _snapshot: ()) {}
+
+    #[inline]
+    fn coded_bits(&self) -> f32 {
+        0.0
+    }
 }
 
 /// HEVC CABAC encoder.
@@ -244,6 +286,10 @@ pub(crate) struct CabacEncoder {
     bit_buffer: u8,        // partial output byte
     bit_count: u8,         // bits filled in bit_buffer (0..8)
     pub(crate) output: Vec<u8>,
+    /// Running fractional bit count, accumulated exactly as [`CabacEstimator`]
+    /// does. It costs one table lookup per bin and lets an RD decision price a
+    /// CU it has already written for real, instead of trial-encoding it twice.
+    bits: f32,
 }
 
 impl CabacEncoder {
@@ -256,6 +302,7 @@ impl CabacEncoder {
             bit_buffer: 0,
             bit_count: 0,
             output: Vec::new(),
+            bits: 0.0,
         }
     }
 
@@ -307,6 +354,7 @@ impl CabacEncoder {
     /// Context-adaptive binary encoding.
     #[inline]
     pub(crate) fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        self.bits += ctx.estimated_bits(bin_val);
         let state = ctx.p_state_idx as usize;
         let lps = RANGE_TAB_LPS[state][(self.m_range >> 6) as usize & 3] as u32;
         self.m_range -= lps;
@@ -329,6 +377,7 @@ impl CabacEncoder {
     /// Equal-probability bypass encoding.
     #[inline]
     pub(crate) fn encode_bypass(&mut self, bin_val: u8) {
+        self.bits += 1.0;
         self.low <<= 1;
         if bin_val != 0 {
             self.low += self.m_range;
@@ -386,8 +435,22 @@ impl CabacEncoder {
     }
 }
 
+/// Complete arithmetic-coder state at a point in the bitstream.
+#[derive(Clone, Copy)]
+pub(crate) struct CabacSnapshot {
+    low: u32,
+    m_range: u32,
+    bits_outstanding: u32,
+    first_bit: bool,
+    bit_buffer: u8,
+    bit_count: u8,
+    output_len: usize,
+    bits: f32,
+}
+
 impl CabacWriter for CabacEncoder {
     const COMMIT: bool = true;
+    type Snapshot = CabacSnapshot;
 
     #[inline]
     fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
@@ -397,6 +460,35 @@ impl CabacWriter for CabacEncoder {
     #[inline]
     fn encode_bypass(&mut self, bin_val: u8) {
         CabacEncoder::encode_bypass(self, bin_val);
+    }
+
+    fn snapshot(&self) -> CabacSnapshot {
+        CabacSnapshot {
+            low: self.low,
+            m_range: self.m_range,
+            bits_outstanding: self.bits_outstanding,
+            first_bit: self.first_bit,
+            bit_buffer: self.bit_buffer,
+            bit_count: self.bit_count,
+            output_len: self.output.len(),
+            bits: self.bits,
+        }
+    }
+
+    fn rollback(&mut self, snapshot: CabacSnapshot) {
+        self.low = snapshot.low;
+        self.m_range = snapshot.m_range;
+        self.bits_outstanding = snapshot.bits_outstanding;
+        self.first_bit = snapshot.first_bit;
+        self.bit_buffer = snapshot.bit_buffer;
+        self.bit_count = snapshot.bit_count;
+        self.output.truncate(snapshot.output_len);
+        self.bits = snapshot.bits;
+    }
+
+    #[inline]
+    fn coded_bits(&self) -> f32 {
+        self.bits
     }
 }
 
