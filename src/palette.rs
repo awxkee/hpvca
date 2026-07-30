@@ -31,9 +31,9 @@
 //!
 pub(crate) const MAX_COMPONENTS: usize = 3;
 
-/// `palette_max_size` signalled in the SPS.
+/// `palette_max_size` signaled in the SPS.
 pub(crate) const MAX_PALETTE_SIZE: usize = 64;
-/// `delta_palette_max_predictor_size` signalled in the SPS.
+/// `delta_palette_max_predictor_size` signaled in the SPS.
 pub(crate) const DELTA_MAX_PREDICTOR_SIZE: usize = 64;
 /// PaletteMaxPredictorSize = palette_max_size + delta_palette_max_predictor_size.
 pub(crate) const MAX_PREDICTOR_SIZE: usize = MAX_PALETTE_SIZE + DELTA_MAX_PREDICTOR_SIZE;
@@ -51,13 +51,6 @@ const MAX_DISTINCT: usize = 128;
 const COLOR_SLOTS: usize = 256;
 
 /// Open-addressed "have I seen this color" table for the block histogram.
-///
-/// The histogram used to rescan every distinct color found so far for each
-/// sample, which is O(n·distinct) — and it runs on *every* CU that survives the
-/// luma pre-gate, whether or not palette mode ends up being evaluated. On a
-/// photograph that single loop was most of the cost of the screen-content
-/// search. Hashing makes it O(n) while preserving first-seen insertion order,
-/// so the frequency sort downstream sees exactly the same input.
 pub(crate) struct ColorIndex {
     keys: [u64; COLOR_SLOTS],
     entry: [u16; COLOR_SLOTS],
@@ -91,8 +84,7 @@ impl ColorIndex {
     /// the stored index and whether the color had been seen already.
     #[inline]
     fn lookup_or_insert(&mut self, key: u64, next: usize) -> (usize, bool) {
-        let mut slot =
-            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (COLOR_SLOTS - 1);
+        let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (COLOR_SLOTS - 1);
         loop {
             if self.stamp[slot] != self.generation {
                 self.stamp[slot] = self.generation;

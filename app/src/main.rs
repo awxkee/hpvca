@@ -28,6 +28,7 @@
  */
 
 use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy, Speed};
+use hpvcd::ImageBuffer;
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
@@ -44,15 +45,27 @@ fn main() {
         img.height(),
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv444)
-            .with_parallelism(ParallelismStrategy::Wpp)
+            .with_parallelism(ParallelismStrategy::Single)
             .with_sao(false)
             .with_quality(70)
-            .with_speed(Speed::Slow)
-            .with_lossless(false)
-            .with_screen_content(true),
+            .with_speed(Speed::Fast)
+            .with_lossless(true)
+            .with_screen_content(false),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
     fs::write("results.heic", data.clone()).unwrap();
+    let decoded = hpvcd::decode_heic(&data).unwrap();
+    let image = image::RgbImage::from_vec(
+        decoded.width,
+        decoded.height,
+        match decoded.pixels {
+            ImageBuffer::Luma8(v) => v,
+            ImageBuffer::Luma16(_) => unreachable!(),
+            ImageBuffer::Rgb8(v) => v,
+            ImageBuffer::Rgb16(_) => unreachable!(),
+        },
+    );
+    image.unwrap().save("results.png").unwrap();
     println!("Hello, world!");
 }
