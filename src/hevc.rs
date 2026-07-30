@@ -339,12 +339,12 @@ pub(crate) fn build_vps(
     }
 }
 
-fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool, persistent_rice: bool) {
+fn write_sps_range_extension(bw: &mut BitWriter, implicit_rdpcm: bool, persistent_rice: bool) {
     bw.write_bit(false); // transform_skip_rotation_enabled_flag
     bw.write_bit(false); // transform_skip_context_enabled_flag
     // In transquant-bypass intra TUs this is inferred for final horizontal
     // and vertical prediction modes; no CU/TU syntax element is required.
-    bw.write_bit(lossless); // implicit_rdpcm_enabled_flag
+    bw.write_bit(implicit_rdpcm); // implicit_rdpcm_enabled_flag
     bw.write_bit(false); // explicit_rdpcm_enabled_flag
     bw.write_bit(false); // extended_precision_processing_flag
     bw.write_bit(false); // intra_smoothing_disabled_flag
@@ -356,7 +356,7 @@ fn write_sps_range_extension(bw: &mut BitWriter, lossless: bool, persistent_rice
     bw.write_bit(false); // cabac_bypass_alignment_enabled_flag
 }
 
-/// `sps_scc_extension()` (§7.3.2.2.3). Only palette mode is signalled here; the
+/// `sps_scc_extension()` (§7.3.2.2.3). Only palette mode is signaled here; the
 /// encoder writes no predictor initializers, so the predictor starts empty in
 /// every slice segment.
 fn write_sps_scc_extension(bw: &mut BitWriter, curr_pic_ref: bool) {
@@ -379,6 +379,7 @@ pub(crate) fn build_sps(
     color: Option<&crate::color::Cicp>,
     scc: bool,
     ibc: bool,
+    implicit_rdpcm: bool,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -494,7 +495,7 @@ pub(crate) fn build_sps(
         if need_range_ext {
             write_sps_range_extension(
                 &mut bw,
-                lossless,
+                implicit_rdpcm,
                 persistent_rice_enabled(chroma, bit_depth, lossless),
             );
         }
@@ -511,14 +512,14 @@ pub(crate) fn build_sps(
 }
 
 /// Write minimal VUI (Annex E §E.2.1). When a [`ColorEncoding`] is supplied its
-/// primaries / transfer / matrix_coefficients and full-range flag are signalled
+/// primaries / transfer / matrix_coefficients and full-range flag are signaled
 /// so the in-stream VUI matches the `colr`/nclx box (a fixed BT.709 matrix here
 /// would silently contradict a non-709 `colr` such as YCgCo, making decoders
 /// apply the wrong inverse matrix).
 ///
 /// When `color` is `None` the colorimetry is left **unspecified**:
 /// `color_description_present_flag = 0`. The `video_signal_type` is still
-/// signalled with `video_full_range_flag` so the sample range is unambiguous —
+/// signaled with `video_full_range_flag` so the sample range is unambiguous —
 /// the encoder always converts in full range, so that flag defaults to set.
 fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
     bw.write_bit(false); // aspect_ratio_info_present_flag
@@ -609,7 +610,7 @@ pub(crate) fn build_pps_tiled(
     bw.write_bit(wpp); // entropy_coding_sync_enabled_flag (WPP)
     if tiled {
         // Uniform tile grid: the decoder derives per-column/row CTB spans itself,
-        // so only the counts and the uniform flag are signalled (HEVC §7.3.2.3).
+        // so only the counts and the uniform flag are signaled (HEVC §7.3.2.3).
         bw.write_ue(tile_cols as u32 - 1); // num_tile_columns_minus1
         bw.write_ue(tile_rows as u32 - 1); // num_tile_rows_minus1
         bw.write_bit(true); // uniform_spacing_flag
@@ -665,6 +666,7 @@ pub(crate) fn encode_intra(
     variance_boost: crate::VarianceBoost,
     effort: crate::Speed,
     scc: bool,
+    implicit_rdpcm: bool,
 ) -> Result<NaluStream, EncodeError> {
     encode_intra_opts(
         yuv,
@@ -683,6 +685,7 @@ pub(crate) fn encode_intra(
         0,
         None,
         scc,
+        implicit_rdpcm,
     )
 }
 
@@ -715,6 +718,9 @@ pub(crate) fn encode_intra_opts(
     // Screen-content coding tools (palette mode). Signals the SPS SCC extension
     // and lets every CU choose palette mode over intra prediction.
     scc: bool,
+    // `implicit_rdpcm_enabled_flag`: a Range Extensions tool that differentially
+    // codes lossless residuals for the pure horizontal/vertical intra modes.
+    implicit_rdpcm: bool,
 ) -> Result<NaluStream, EncodeError> {
     // Transquant-bypass samples are not modified by in-loop filters. Disable
     // the slice-level tool as well so no redundant SAO syntax is emitted.
@@ -746,6 +752,9 @@ pub(crate) fn encode_intra_opts(
     // picture coded as a P slice that references itself, which is a whole-stream
     // decision, so it is resolved here and threaded down as its own flag.
     let ibc = scc;
+    // The tool only exists for transquant-bypass blocks, so it is meaningless
+    // outside lossless coding.
+    let implicit_rdpcm = implicit_rdpcm && lossless;
     let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless, scc, ibc);
     let sps = build_sps(
         width,
@@ -756,6 +765,7 @@ pub(crate) fn encode_intra_opts(
         color.as_ref(),
         scc,
         ibc,
+        implicit_rdpcm,
     );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
@@ -785,6 +795,7 @@ pub(crate) fn encode_intra_opts(
         cqo,
         scc,
         ibc,
+        implicit_rdpcm,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -874,6 +885,7 @@ fn encode_wpp_parallel(
     aq_offsets: &[i8],
     sao_enabled: bool,
     rdoq_in_loop: bool,
+    implicit_rdpcm: bool,
     ibc_hash: Option<&crate::ibc::HashTable>,
 ) -> Vec<Vec<u8>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -938,6 +950,7 @@ fn encode_wpp_parallel(
         let mut lease = crate::coder_scratch::lease();
         let scratch = &mut lease.cc;
         scratch.rdoq_in_loop = rdoq_in_loop;
+        scratch.implicit_rdpcm = implicit_rdpcm;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
             if r >= ctus_y {
@@ -1500,6 +1513,7 @@ fn encode_region_pass(
             aq_offsets,
             sao_enabled,
             scratch.rdoq_in_loop,
+            scratch.implicit_rdpcm,
             ibc_hash,
         )
     } else {
@@ -1657,9 +1671,11 @@ fn encode_region_substreams(
     cqo: i8,
     scc: bool,
     ibc: bool,
+    implicit_rdpcm: bool,
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
+    ws.cc.implicit_rdpcm = implicit_rdpcm;
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact per-QG offset table —
     // unless the caller supplies one sliced from the full picture this region
@@ -1865,6 +1881,7 @@ fn build_idr_slice(
     cqo: i8,
     scc: bool,
     ibc: bool,
+    implicit_rdpcm: bool,
 ) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
@@ -1950,6 +1967,7 @@ fn build_idr_slice(
             cqo,
             scc,
             ibc,
+            implicit_rdpcm,
         );
         let substreams = output.substreams;
         if wpp {
@@ -2050,6 +2068,7 @@ fn build_idr_slice(
                             cqo,
                             scc,
                             ibc,
+                            implicit_rdpcm,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -2402,6 +2421,23 @@ fn sse_plane(orig: &[u16], plane: &[u16], row: usize, col: usize, stride: usize,
 /// `implicit_rdpcm_enabled_flag` and the TU is transform-skipped or transquant
 /// bypassed. HM applies vertical RDPCM to mode 26 and horizontal RDPCM to mode
 /// 10, after the 4:2:2 chroma mode remapping has already been performed.
+/// HEVC §8.4.4.2.6 `disableIntraBoundaryFilter`: the pure-vertical (26) /
+/// horizontal (10) luma boundary filter is **skipped** when
+/// `implicit_rdpcm_enabled_flag` is 1 and the block is transquant-bypass —
+/// those are exactly the blocks whose residual is differentially coded, and
+/// filtering the prediction edge would fight the RDPCM accumulation.
+///
+/// `implicit_rdpcm_enabled_flag` is only ever set for lossless streams, where
+/// every CU is transquant-bypass, so the two conditions collapse into the one
+/// flag. The DC edge filtering of
+/// §8.4.4.2.5 is *not* gated by this variable — HM's `enableEdgeFilters` gates
+/// both, but gating DC as well leaves a residual mismatch against the decoders
+/// that implement the rule, so the narrower spec reading is the correct one.
+#[inline]
+fn intra_boundary_filter_enabled(implicit_rdpcm: bool) -> bool {
+    !implicit_rdpcm
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImplicitRdpcm {
     Off,
@@ -2410,7 +2446,10 @@ enum ImplicitRdpcm {
 }
 
 #[inline]
-fn implicit_rdpcm_mode(intra_mode: u8) -> ImplicitRdpcm {
+fn implicit_rdpcm_mode(intra_mode: u8, enabled: bool) -> ImplicitRdpcm {
+    if !enabled {
+        return ImplicitRdpcm::Off;
+    }
     match intra_mode {
         10 => ImplicitRdpcm::Horizontal,
         26 => ImplicitRdpcm::Vertical,
@@ -3178,6 +3217,10 @@ pub(crate) struct CompressionContext {
     /// When set (Effort::Slow), the reconstructed intra shortlist is RDOQ'd
     /// inside the RD loop rather than only the committed winner.
     rdoq_in_loop: bool,
+    /// `implicit_rdpcm_enabled_flag`. Drives three things that must agree: the
+    /// SPS range-extension bit, whether lossless residuals are differentially
+    /// coded, and whether the intra boundary filter is suppressed.
+    implicit_rdpcm: bool,
     /// Slice/tile/WPP-row persistent palette predictor (SCC §9.3.2.3). It lives
     /// in the workspace rather than the context set because RD trials must read
     /// it without paying for a clone; only a committing sink updates it.
@@ -3246,6 +3289,7 @@ impl CompressionContext {
             rdoq: crate::hevc_transform::RdoqScratch::new(),
             cu64: Cu64Scratch::new(),
             rdoq_in_loop: false,
+            implicit_rdpcm: false,
             palette_pred: crate::palette::PalettePredictor::default(),
             palette_cand: crate::palette::PaletteCu::new(),
             palette_runs: Vec::new(),
@@ -4068,7 +4112,7 @@ fn ctu_cu64_choice(tree: &mut CuTreeState<'_>, row: usize, col: usize) -> Option
                     left,
                     32,
                     mode,
-                    true,
+                    intra_boundary_filter_enabled(tree.scratch.implicit_rdpcm),
                     max_val as i32,
                     &mut tree.scratch.pred,
                     &mut tree.scratch.angular,
@@ -4176,7 +4220,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 &left,
                 32,
                 luma_mode,
-                true,
+                intra_boundary_filter_enabled(tree.scratch.implicit_rdpcm),
                 max_val as i32,
                 &mut tree.scratch.pred,
                 &mut tree.scratch.angular,
@@ -4709,7 +4753,7 @@ fn commit_lossless_luma_leaf(
             &left,
             size,
             mode,
-            true,
+            intra_boundary_filter_enabled(scratch.implicit_rdpcm),
             max_val as i32,
             &mut scratch.pred,
             &mut scratch.angular,
@@ -4725,7 +4769,7 @@ fn commit_lossless_luma_leaf(
     forward_lossless_rdpcm_into(
         &scratch.residual[..len],
         size,
-        implicit_rdpcm_mode(mode),
+        implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
         &mut scratch.levels,
     );
     let log2 = size.trailing_zeros();
@@ -5011,7 +5055,7 @@ fn commit_lossless_chroma_leaf(
             forward_lossless_rdpcm_into(
                 &scratch.residual[..len],
                 side,
-                implicit_rdpcm_mode(mode),
+                implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                 &mut scratch.levels,
             );
             let offset = *cursor + t * len;
@@ -5253,7 +5297,7 @@ fn commit_split_luma(
                 &left,
                 child,
                 mode,
-                true,
+                intra_boundary_filter_enabled(scratch.implicit_rdpcm),
                 max_val as i32,
                 &mut scratch.pred,
                 &mut scratch.angular,
@@ -5276,7 +5320,7 @@ fn commit_split_luma(
             forward_lossless_rdpcm_into(
                 &scratch.residual[..child_len],
                 child,
-                implicit_rdpcm_mode(mode),
+                implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                 &mut scratch.levels,
             );
         } else {
@@ -5541,7 +5585,7 @@ fn commit_split_chroma(
                     forward_lossless_rdpcm_into(
                         &scratch.residual[..child_len],
                         child_side,
-                        implicit_rdpcm_mode(mode),
+                        implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                         &mut scratch.levels,
                     );
                 } else {
@@ -6434,6 +6478,8 @@ fn encode_cu_nxn<W: CabacWriter>(
                 neutral,
             },
         );
+        // PART_NxN is gated on `!lossless`, so `disableIntraBoundaryFilter` is
+        // always 0 here and the edge filters stay on.
         let predict = |mode: u8, dst: &mut [u16], angular: &mut intra::AngularScratch| match mode {
             0 => intra::predict_planar_into(&above, &left, PU, dst),
             1 => intra::predict_dc_into(&above, &left, PU, true, dst),
@@ -7405,6 +7451,7 @@ fn encode_cu<W: CabacWriter>(
     let lambda_mode = lambda.sqrt();
     // The smoothed references depend only on the block, not the mode.
     let (cf, fa, fl) = intra::filter_luma_refs(yc0, &ya, &yl, lu, bit_depth.bits() as u32);
+    let boundary_filter = intra_boundary_filter_enabled(scratch.implicit_rdpcm);
     let predict_luma = |mode: u8, pred: &mut [u16], angular: &mut intra::AngularScratch| {
         let (corner, above, left) = if intra::should_filter_refs(mode, lu) {
             (cf, &fa[..], &fl[..])
@@ -7420,7 +7467,7 @@ fn encode_cu<W: CabacWriter>(
                 left,
                 lu,
                 mode,
-                true,
+                boundary_filter,
                 max_val as i32,
                 pred,
                 angular,
@@ -7581,7 +7628,7 @@ fn encode_cu<W: CabacWriter>(
             forward_lossless_rdpcm_into(
                 &scratch.residual[..num_luma],
                 lu,
-                implicit_rdpcm_mode(mode),
+                implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                 &mut scratch.levels,
             );
         } else {
@@ -7797,7 +7844,7 @@ fn encode_cu<W: CabacWriter>(
     let split_allowed = lu > 4;
 
     // The regular path is PART_2Nx2N. PART_NxN is handled by the dedicated 8×8
-    // path below, where four independent 4×4 prediction modes are signalled.
+    // path below, where four independent 4×4 prediction modes are signaled.
     if lu == 8 {
         enc.encode_bin(1, &mut ctx.part_mode[0]);
     }
@@ -7818,7 +7865,7 @@ fn encode_cu<W: CabacWriter>(
         forward_lossless_rdpcm_into(
             &scratch.best_residual[..num_luma],
             lu,
-            implicit_rdpcm_mode(luma_mode),
+            implicit_rdpcm_mode(luma_mode, scratch.implicit_rdpcm),
             &mut scratch.levels,
         );
     } else {
@@ -8360,7 +8407,7 @@ fn encode_cu<W: CabacWriter>(
                         forward_lossless_rdpcm_into(
                             &scratch.residual[..n_ch],
                             ctb,
-                            implicit_rdpcm_mode(mode),
+                            implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                             &mut scratch.levels,
                         );
                     } else {
@@ -9293,7 +9340,7 @@ fn code_cu_with_screen_content<W: CabacWriter>(
             &mut scratch.palette_colors,
             &mut scratch.palette_cand,
         );
-    // palette_transpose_flag is always signalled 0. It exists to turn vertical
+    // palette_transpose_flag is always signaled 0. It exists to turn vertical
     // structure into long runs under the horizontal traverse scan, but
     // COPY_ABOVE already codes vertical repetition directly, so the transposed
     // candidate never won on any content measured — not even pure one-pixel
@@ -9302,15 +9349,15 @@ fn code_cu_with_screen_content<W: CabacWriter>(
     // second index assignment and rate estimate per CU for nothing.
     // `write_palette_cu` and `reconstruct` still implement the flag, so this is
     // a search decision, not a missing tool.
-    // Lower bound on the palette rate: every signalled entry is coded as raw
+    // Lower bound on the palette rate: every signaled entry is coded as raw
     // sample values, one full-depth field per component. When λ times that
     // alone already loses, no index map can rescue the CU and the (per-sample)
     // index assignment is skipped outright.
-    let signalled_entry_bits =
+    let signaled_entry_bits =
         (scratch.palette_cand.num_signaled * pcfg.num_comps) as f32 * f32::from(pcfg.bd_luma);
     let mut palette_wins = false;
     if palette_available
-        && par.lambda * signalled_entry_bits < best_cost
+        && par.lambda * signaled_entry_bits < best_cost
         && crate::palette::assign_indices(&block, &pcfg, false, &mut scratch.palette_cand)
         // Distortion alone already loses: no rate estimate can rescue it.
         && scratch.palette_cand.sse < best_cost
@@ -9409,7 +9456,7 @@ fn code_cu_with_screen_content<W: CabacWriter>(
 }
 
 /// Bookkeeping shared by the palette and IntraBC commits: §8.4.2 gives both
-/// kinds of CU INTRA_DC for a neighbour's MPM derivation, and neither has any
+/// kinds of CU INTRA_DC for a neighbor's MPM derivation, and neither has any
 /// transform edge beyond its own boundary.
 fn set_screen_content_cu_maps(
     mode_map: &mut [u8],
@@ -9732,6 +9779,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -9790,6 +9838,7 @@ mod tests {
             crate::Speed::Fast,
             None,
             0,
+            false,
             false,
             false,
         );
@@ -10056,6 +10105,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         );
         let scc = build_sps(
             64,
@@ -10065,6 +10115,7 @@ mod tests {
             false,
             None,
             true,
+            false,
             false,
         );
         // 8-bit 4:2:0 lossy needs no range extension, so the SCC stream is the
@@ -10123,7 +10174,7 @@ mod tests {
             &mut runs,
         );
         // One context-coded palette_mode_flag = 1 was spent, and the palette is
-        // a single signalled entry, so the payload is tiny but non-empty.
+        // a single signaled entry, so the payload is tiny but non-empty.
         assert_ne!(ictx.palette_mode_flag.p_state_idx, before.p_state_idx);
         assert!(est.bits() > 0.0);
     }
@@ -10185,12 +10236,73 @@ mod tests {
         assert_eq!(disabled.finish().as_slice(), &[0x00, 0x00]);
     }
 
+    /// HEVC §8.4.4.2.6 `disableIntraBoundaryFilter`: a transquant-bypass block
+    /// in a stream with `implicit_rdpcm_enabled_flag` must not apply the
+    /// pure-vertical/horizontal luma boundary filter. Decoders that implement
+    /// the rule (Apple ImageIO, libde265) otherwise mis-reconstruct exactly the
+    /// first column / row of every mode-26 / mode-10 luma block.
+    #[test]
+    fn transquant_bypass_disables_the_angular_intra_boundary_filter() {
+        assert!(
+            intra_boundary_filter_enabled(false),
+            "no implicit RDPCM keeps the filter"
+        );
+        assert!(
+            !intra_boundary_filter_enabled(true),
+            "implicit RDPCM on transquant bypass drops it"
+        );
+
+        // The gated filter rewrites only the boundary column for mode 26.
+        const N: usize = 8;
+        let corner = 100u16;
+        let above = [100u16; 2 * N];
+        let left = [40u16; 2 * N];
+        let mut scratch = intra::AngularScratch::new();
+        let mut filtered = [0u16; N * N];
+        let mut plain = [0u16; N * N];
+        intra::predict_angular_into(
+            corner,
+            &above,
+            &left,
+            N,
+            26,
+            true,
+            255,
+            &mut filtered,
+            &mut scratch,
+        );
+        intra::predict_angular_into(
+            corner,
+            &above,
+            &left,
+            N,
+            26,
+            false,
+            255,
+            &mut plain,
+            &mut scratch,
+        );
+        assert_ne!(filtered[0], plain[0], "boundary column must differ");
+        assert_eq!(
+            &filtered[1..N],
+            &plain[1..N],
+            "only the boundary column is touched"
+        );
+        assert!(
+            plain.iter().all(|&s| s == 100),
+            "unfiltered mode 26 copies above"
+        );
+    }
+
     #[test]
     fn implicit_rdpcm_mode_is_inferred_from_final_intra_mode() {
-        assert_eq!(implicit_rdpcm_mode(10), ImplicitRdpcm::Horizontal);
-        assert_eq!(implicit_rdpcm_mode(26), ImplicitRdpcm::Vertical);
-        assert_eq!(implicit_rdpcm_mode(0), ImplicitRdpcm::Off);
-        assert_eq!(implicit_rdpcm_mode(34), ImplicitRdpcm::Off);
+        assert_eq!(implicit_rdpcm_mode(10, true), ImplicitRdpcm::Horizontal);
+        assert_eq!(implicit_rdpcm_mode(26, true), ImplicitRdpcm::Vertical);
+        assert_eq!(implicit_rdpcm_mode(0, true), ImplicitRdpcm::Off);
+        assert_eq!(implicit_rdpcm_mode(34, true), ImplicitRdpcm::Off);
+        // Disabled by configuration: no mode is ever differentially coded.
+        assert_eq!(implicit_rdpcm_mode(10, false), ImplicitRdpcm::Off);
+        assert_eq!(implicit_rdpcm_mode(26, false), ImplicitRdpcm::Off);
     }
 
     #[test]
@@ -10326,6 +10438,7 @@ mod tests {
             crate::fmt::BitDepth::Eight,
             false,
             Some(&crate::color::Cicp::srgb()),
+            false,
             false,
             false,
         );

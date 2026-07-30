@@ -190,6 +190,9 @@ pub struct EncodeConfig {
     /// block copy). Off by default: it changes the advertised profile to
     /// Screen-Extended (profile_idc 9), which only SCC-capable decoders accept.
     pub screen_content: bool,
+    /// Enable `implicit_rdpcm_enabled_flag` for lossless coding. Off by
+    /// default; see [`with_implicit_rdpcm`](EncodeConfig::with_implicit_rdpcm).
+    pub implicit_rdpcm: bool,
 }
 
 impl Default for EncodeConfig {
@@ -206,6 +209,7 @@ impl Default for EncodeConfig {
             variance_boost: VarianceBoost::default(),
             speed: Speed::default(),
             screen_content: false,
+            implicit_rdpcm: false,
         }
     }
 }
@@ -266,6 +270,13 @@ impl EncodeConfig {
     /// [`screen_content`](Self::screen_content)).
     pub fn with_screen_content(mut self, screen_content: bool) -> Self {
         self.screen_content = screen_content;
+        self
+    }
+
+    /// Enable implicit residual DPCM for lossless coding (HEVC Range
+    /// Extensions `implicit_rdpcm_enabled_flag`).
+    pub fn with_implicit_rdpcm(mut self, implicit_rdpcm: bool) -> Self {
+        self.implicit_rdpcm = implicit_rdpcm;
         self
     }
 
@@ -829,6 +840,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -843,6 +855,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -932,6 +945,7 @@ fn encode_gray_alpha_wide(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -946,6 +960,7 @@ fn encode_gray_alpha_wide(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -987,6 +1002,7 @@ pub fn encode_yuv_with_alpha(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -1009,6 +1025,7 @@ pub fn encode_yuv_with_alpha(
         cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -1043,6 +1060,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         0,
         None,
         cfg.screen_content,
+        cfg.implicit_rdpcm,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -1259,6 +1277,7 @@ fn encode_cell(
     qp_bias: i8,
     chroma_qp_offset: Option<i8>,
     screen_content: bool,
+    implicit_rdpcm: bool,
 ) -> Result<hevc::NaluStream, EncodeError> {
     let (wpp, wpp_threads) = if cell_wpp {
         // A WPP picture cannot run more CTU rows concurrently than it has.
@@ -1285,6 +1304,7 @@ fn encode_cell(
         qp_bias,
         chroma_qp_offset,
         screen_content,
+        implicit_rdpcm,
     )
 }
 
@@ -1369,6 +1389,7 @@ fn encode_rgb_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         );
         ws.conv_y = yuv.y;
         ws.conv_cb = yuv.cb;
@@ -1454,6 +1475,7 @@ fn encode_gray_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1556,6 +1578,7 @@ fn encode_yuv_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1584,6 +1607,7 @@ fn encode_yuv_alpha_tiled(
             0,
             Some(0),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1693,6 +1717,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1785,6 +1810,7 @@ fn encode_rgba_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1812,6 +1838,7 @@ fn encode_rgba_alpha_tiled(
             0,
             Some(0),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1914,6 +1941,7 @@ fn encode_gray_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1940,6 +1968,7 @@ fn encode_gray_alpha_tiled(
             0,
             Some(0),
             cfg.screen_content,
+            cfg.implicit_rdpcm,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
