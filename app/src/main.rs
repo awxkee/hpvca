@@ -27,16 +27,17 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy, Speed};
+use hpvca::{
+    BitDepth, ChromaFormat, Cicp, EncodeConfig, MatrixCoefficients, ParallelismStrategy, Primaries,
+    Speed, TransferFunction,
+};
 use hpvcd::ImageBuffer;
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/Screenshot 2026-07-29 at 12.40.11.png")
-        .unwrap()
-        .to_rgb8();
+    let img = image::open("./assets/volcanic.png").unwrap().to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
     let instant = Instant::now();
     let data = hpvca::encode_rgb(
@@ -44,28 +45,25 @@ fn main() {
         img.width(),
         img.height(),
         &EncodeConfig::default()
-            .with_chroma(ChromaFormat::Yuv444)
-            .with_parallelism(ParallelismStrategy::Single)
+            .with_chroma(ChromaFormat::Yuv420)
+            .with_parallelism(ParallelismStrategy::Wpp)
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Fast)
             .with_lossless(true)
-            .with_screen_content(false),
+            .with_screen_content(false)
+            .with_implicit_rdpcm(false)
+            .with_persistent_rice(false)
+            .with_lossless_ycbcr(true)
+            .with_cicp(Cicp {
+                matrix: MatrixCoefficients::Smpte170m,
+                full_range: true,
+                transfer: TransferFunction::Srgb,
+                primaries: Primaries::Bt601,
+            }),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
-    fs::write("results.heic", data.clone()).unwrap();
-    let decoded = hpvcd::decode_heic(&data).unwrap();
-    let image = image::RgbImage::from_vec(
-        decoded.width,
-        decoded.height,
-        match decoded.pixels {
-            ImageBuffer::Luma8(v) => v,
-            ImageBuffer::Luma16(_) => unreachable!(),
-            ImageBuffer::Rgb8(v) => v,
-            ImageBuffer::Rgb16(_) => unreachable!(),
-        },
-    );
-    image.unwrap().save("results.png").unwrap();
+    fs::write("results420.heic", data.clone()).unwrap();
     println!("Hello, world!");
 }

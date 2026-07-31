@@ -181,13 +181,13 @@ pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
 fn uses_rext_profile(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    lossless: bool,
+    implicit_rdpcm: bool,
 ) -> bool {
     let is_420 = matches!(
         chroma,
         crate::fmt::ChromaFormat::Yuv420 | crate::fmt::ChromaFormat::Monochrome
     );
-    lossless || !is_420 || bit_depth.bits() > 10
+    implicit_rdpcm || !is_420 || bit_depth.bits() > 10
 }
 
 /// Whether `persistent_rice_adaptation_enabled_flag` is set for this stream.
@@ -201,9 +201,10 @@ fn uses_rext_profile(
 pub(crate) fn persistent_rice_enabled(
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    lossless: bool,
+    implicit_rdpcm: bool,
+    requested: bool,
 ) -> bool {
-    uses_rext_profile(chroma, bit_depth, lossless)
+    requested && uses_rext_profile(chroma, bit_depth, implicit_rdpcm)
 }
 
 fn write_profile_tier_level(
@@ -211,7 +212,7 @@ fn write_profile_tier_level(
     level_idc: u8,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    lossless: bool,
+    implicit_rdpcm: bool,
     scc: bool,
     ibc: bool,
 ) {
@@ -230,7 +231,7 @@ fn write_profile_tier_level(
     // Screen content coding (palette / intra block copy) lives in the
     // Screen-Extended profiles, profile_idc 9. Their constraint block has the
     // same layout as the RExt one, so only the identity changes.
-    let is_rext = scc || uses_rext_profile(chroma, bit_depth, lossless);
+    let is_rext = scc || uses_rext_profile(chroma, bit_depth, implicit_rdpcm);
 
     let (profile_idc, compat): (u32, u32) = if scc {
         (9, 0x0040_0000) // Screen-Extended (profile_compatibility_flag[9])
@@ -264,7 +265,7 @@ fn write_profile_tier_level(
         // picture itself is 4:2:0/4:2:2. Narrower RExt profiles do not permit
         // this tool. Keep the actual bit-depth constraint, but deliberately do
         // not claim max-4:2:2/max-4:2:0/monochrome for lossless RDPCM streams.
-        let constraint_444 = lossless || is_444;
+        let constraint_444 = implicit_rdpcm || is_444;
         bw.write_bit(bits <= 12); // max_12bit_constraint_flag
         bw.write_bit(bits <= 10); // max_10bit_constraint_flag
         bw.write_bit(bits <= 8); // max_8bit_constraint_flag
@@ -294,7 +295,7 @@ pub(crate) fn build_vps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    lossless: bool,
+    implicit_rdpcm: bool,
     scc: bool,
     ibc: bool,
 ) -> Nalu {
@@ -312,7 +313,7 @@ pub(crate) fn build_vps(
     bw.write_bit(true); // vps_temporal_id_nesting_flag
     bw.write_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
 
-    write_profile_tier_level(&mut bw, level, chroma, bit_depth, lossless, scc, ibc);
+    write_profile_tier_level(&mut bw, level, chroma, bit_depth, implicit_rdpcm, scc, ibc);
 
     // vps_sub_layer_ordering_info_present_flag = false → only [0] entry
     bw.write_bit(false);
@@ -375,11 +376,11 @@ pub(crate) fn build_sps(
     height: u32,
     chroma: crate::fmt::ChromaFormat,
     bit_depth: crate::fmt::BitDepth,
-    lossless: bool,
     color: Option<&crate::color::Cicp>,
     scc: bool,
     ibc: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -389,7 +390,7 @@ pub(crate) fn build_sps(
     bw.write_bit(true); // sps_temporal_id_nesting_flag
 
     let sps_level = level_idc_for((width + 63) & !63, (height + 63) & !63);
-    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth, lossless, scc, ibc);
+    write_profile_tier_level(&mut bw, sps_level, chroma, bit_depth, implicit_rdpcm, scc, ibc);
 
     bw.write_ue(0); // sps_seq_parameter_set_id = 0
 
@@ -484,7 +485,7 @@ pub(crate) fn build_sps(
     // sps_extension: RExt profiles require sps_range_extension to be present
     // even when all flags within it are 0 (x265 always writes it for profile_idc=4).
     // Apple's decoder rejects 12-bit streams whose SPS lacks the range extension.
-    let need_range_ext = uses_rext_profile(chroma, bit_depth, lossless);
+    let need_range_ext = uses_rext_profile(chroma, bit_depth, implicit_rdpcm);
     bw.write_bit(need_range_ext || scc); // sps_extension_present_flag
     if need_range_ext || scc {
         bw.write_bit(need_range_ext); // sps_range_extension_flag
@@ -496,7 +497,7 @@ pub(crate) fn build_sps(
             write_sps_range_extension(
                 &mut bw,
                 implicit_rdpcm,
-                persistent_rice_enabled(chroma, bit_depth, lossless),
+                persistent_rice_enabled(chroma, bit_depth, implicit_rdpcm, persistent_rice),
             );
         }
         if scc {
@@ -667,6 +668,7 @@ pub(crate) fn encode_intra(
     effort: crate::Speed,
     scc: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
 ) -> Result<NaluStream, EncodeError> {
     encode_intra_opts(
         yuv,
@@ -686,6 +688,7 @@ pub(crate) fn encode_intra(
         None,
         scc,
         implicit_rdpcm,
+        persistent_rice,
     )
 }
 
@@ -721,6 +724,9 @@ pub(crate) fn encode_intra_opts(
     // `implicit_rdpcm_enabled_flag`: a Range Extensions tool that differentially
     // codes lossless residuals for the pure horizontal/vertical intra modes.
     implicit_rdpcm: bool,
+    // `persistent_rice_adaptation_enabled_flag`: a Range Extensions tool that
+    // carries the coefficient Rice statistic across coefficient groups.
+    persistent_rice: bool,
 ) -> Result<NaluStream, EncodeError> {
     // Transquant-bypass samples are not modified by in-loop filters. Disable
     // the slice-level tool as well so no redundant SAO syntax is emitted.
@@ -755,17 +761,17 @@ pub(crate) fn encode_intra_opts(
     // The tool only exists for transquant-bypass blocks, so it is meaningless
     // outside lossless coding.
     let implicit_rdpcm = implicit_rdpcm && lossless;
-    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, lossless, scc, ibc);
+    let vps = build_vps(width, height, yuv.chroma, yuv.bit_depth, implicit_rdpcm, scc, ibc);
     let sps = build_sps(
         width,
         height,
         yuv.chroma,
         yuv.bit_depth,
-        lossless,
         color.as_ref(),
         scc,
         ibc,
         implicit_rdpcm,
+        persistent_rice,
     );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
@@ -796,6 +802,7 @@ pub(crate) fn encode_intra_opts(
         scc,
         ibc,
         implicit_rdpcm,
+        persistent_rice,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -805,8 +812,15 @@ pub(crate) fn encode_intra_opts(
 /// Initial context state for this slice segment. IntraBC codes the picture as a
 /// P slice, which selects initType 1 for *every* context, not just the inter
 /// ones (§9.3.2.2).
-fn init_context_set(qp: u8, yuv: &Yuv, lossless: bool, ibc: bool) -> ContextSet {
-    let persistent_rice = persistent_rice_enabled(yuv.chroma, yuv.bit_depth, lossless);
+fn init_context_set(
+    qp: u8,
+    yuv: &Yuv,
+    implicit_rdpcm: bool,
+    requested_rice: bool,
+    ibc: bool,
+) -> ContextSet {
+    let persistent_rice =
+        persistent_rice_enabled(yuv.chroma, yuv.bit_depth, implicit_rdpcm, requested_rice);
     if ibc {
         ContextSet::init_pslice_ext(qp, persistent_rice)
     } else {
@@ -886,6 +900,7 @@ fn encode_wpp_parallel(
     sao_enabled: bool,
     rdoq_in_loop: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
     ibc_hash: Option<&crate::ibc::HashTable>,
 ) -> Vec<Vec<u8>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -951,6 +966,7 @@ fn encode_wpp_parallel(
         let scratch = &mut lease.cc;
         scratch.rdoq_in_loop = rdoq_in_loop;
         scratch.implicit_rdpcm = implicit_rdpcm;
+        scratch.persistent_rice = persistent_rice;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
             if r >= ctus_y {
@@ -967,7 +983,7 @@ fn encode_wpp_parallel(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(qp, yuv, lossless, ibc),
+                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1396,6 +1412,10 @@ fn encode_region_pass(
     }
     let ctus_x = w / 64;
     let ctus_y = h / 64;
+    // The SPS profile / range-extension signalling and the residual coder must
+    // agree on this; it was resolved once per encode and stored on the scratch.
+    let implicit_rdpcm = scratch.implicit_rdpcm;
+    let persistent_rice = scratch.persistent_rice;
     // IntraBC searches by source-block hash. Screen content repeats at
     // arbitrary distances, so a windowed motion search would miss nearly all of
     // it; hashing the source once per region turns the search into a lookup
@@ -1422,7 +1442,7 @@ fn encode_region_pass(
 
     let substreams = if !wpp {
         let mut cab = CabacEncoder::new();
-        let mut ctx = init_context_set(qp, yuv, lossless, ibc);
+        let mut ctx = init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc);
         let mut ictx = init_intra_contexts(qp, ibc);
         // The palette predictor is reset at the start of every slice segment
         // (and therefore every tile) alongside the context variables.
@@ -1514,6 +1534,7 @@ fn encode_region_pass(
             sao_enabled,
             scratch.rdoq_in_loop,
             scratch.implicit_rdpcm,
+            scratch.persistent_rice,
             ibc_hash,
         )
     } else {
@@ -1530,7 +1551,7 @@ fn encode_region_pass(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(qp, yuv, lossless, ibc),
+                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1672,10 +1693,12 @@ fn encode_region_substreams(
     scc: bool,
     ibc: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
     ws.cc.implicit_rdpcm = implicit_rdpcm;
+    ws.cc.persistent_rice = persistent_rice;
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact per-QG offset table —
     // unless the caller supplies one sliced from the full picture this region
@@ -1882,6 +1905,7 @@ fn build_idr_slice(
     scc: bool,
     ibc: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
 ) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
@@ -1968,6 +1992,7 @@ fn build_idr_slice(
             scc,
             ibc,
             implicit_rdpcm,
+            persistent_rice,
         );
         let substreams = output.substreams;
         if wpp {
@@ -2069,6 +2094,7 @@ fn build_idr_slice(
                             scc,
                             ibc,
                             implicit_rdpcm,
+                            persistent_rice,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -3221,6 +3247,10 @@ pub(crate) struct CompressionContext {
     /// SPS range-extension bit, whether lossless residuals are differentially
     /// coded, and whether the intra boundary filter is suppressed.
     implicit_rdpcm: bool,
+    /// `persistent_rice_adaptation_enabled_flag`, as requested by the caller.
+    /// The SPS bit and the residual coder's `StatCoeff` state must agree, so
+    /// both derive from [`persistent_rice_enabled`] with this value.
+    persistent_rice: bool,
     /// Slice/tile/WPP-row persistent palette predictor (SCC §9.3.2.3). It lives
     /// in the workspace rather than the context set because RD trials must read
     /// it without paying for a clone; only a committing sink updates it.
@@ -3290,6 +3320,7 @@ impl CompressionContext {
             cu64: Cu64Scratch::new(),
             rdoq_in_loop: false,
             implicit_rdpcm: false,
+            persistent_rice: true,
             palette_pred: crate::palette::PalettePredictor::default(),
             palette_cand: crate::palette::PaletteCu::new(),
             palette_runs: Vec::new(),
@@ -9780,6 +9811,7 @@ mod tests {
             false,
             false,
             false,
+            true,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -9841,6 +9873,7 @@ mod tests {
             false,
             false,
             false,
+            true,
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);
@@ -10101,22 +10134,22 @@ mod tests {
             64,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
-            false,
             None,
             false,
             false,
             false,
+            true,
         );
         let scc = build_sps(
             64,
             64,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
-            false,
             None,
             true,
             false,
             false,
+            true,
         );
         // 8-bit 4:2:0 lossy needs no range extension, so the SCC stream is the
         // only one carrying an sps_extension at all.
@@ -10436,11 +10469,11 @@ mod tests {
             48,
             crate::fmt::ChromaFormat::Yuv420,
             crate::fmt::BitDepth::Eight,
-            false,
             Some(&crate::color::Cicp::srgb()),
             false,
             false,
             false,
+            true,
         );
         assert!(sps.data.len() > 10);
     }
