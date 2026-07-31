@@ -197,6 +197,10 @@ pub struct EncodeConfig {
     /// permits it. On by default; see
     /// [`with_persistent_rice`](EncodeConfig::with_persistent_rice).
     pub persistent_rice: bool,
+    /// Code lossless in the YCbCr domain instead of bit-exact RGB. Only affects
+    /// [`lossless`](Self::lossless); see
+    /// [`with_lossless_ycbcr`](EncodeConfig::with_lossless_ycbcr).
+    pub lossless_ycbcr: bool,
 }
 
 impl Default for EncodeConfig {
@@ -215,6 +219,7 @@ impl Default for EncodeConfig {
             screen_content: false,
             implicit_rdpcm: false,
             persistent_rice: true,
+            lossless_ycbcr: false,
         }
     }
 }
@@ -287,19 +292,15 @@ impl EncodeConfig {
 
     /// Enable persistent Rice adaptation (HEVC Range Extensions
     /// `persistent_rice_adaptation_enabled_flag`).
-    ///
-    /// `coeff_abs_level_remaining` keeps a running per-picture Rice statistic
-    /// instead of restarting each coefficient group at zero. It only applies
-    /// where the stream is already using a Range Extensions profile — 4:2:2,
-    /// 4:4:4, more than 10 bits, or implicit RDPCM — so switching it off never
-    /// widens decoder support on its own: anything that accepts those profiles
-    /// accepts this tool.
-    ///
-    /// **On by default**, because it is worth up to ~24% on lossless synthetic
-    /// content (and under 1% on photographs). Turn it off only to isolate it
-    /// while debugging a decoder.
     pub fn with_persistent_rice(mut self, persistent_rice: bool) -> Self {
         self.persistent_rice = persistent_rice;
+        self
+    }
+
+    /// Code lossless pictures in the **YCbCr** domain rather than as bit-exact
+    /// RGB.
+    pub fn with_lossless_ycbcr(mut self, lossless_ycbcr: bool) -> Self {
+        self.lossless_ycbcr = lossless_ycbcr;
         self
     }
 
@@ -690,18 +691,6 @@ pub fn encode_gray_alpha12_with_alpha(
 }
 
 /// Encode pre-converted planar YCbCr directly, skipping the RGB→YCbCr step.
-///
-/// The [`Yuv`] carries its own chroma format and bit depth; `cfg.chroma` is
-/// **ignored** in favour of what is stored in the planes. This entry point is
-/// for callers that already hold YCbCr data (camera pipeline, decoder output,
-/// etc.). The visible `width`/`height` are read from the [`Yuv`] itself.
-///
-/// Images wider or taller than 512 px are encoded as a HEIF grid of 512×512
-/// tiles automatically.
-///
-/// Plane dimensions must satisfy the chroma subsampling grid. Use
-/// [`Yuv::from_planes`] or [`yuv::rgb_to_yuv`] to produce a conformant
-/// [`Yuv`]; those functions validate plane sizes on construction.
 pub fn encode_yuv(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
     yuv.validate()?;
     cfg.validate()?;
@@ -729,13 +718,6 @@ fn exceeds_single_picture(width: u32, height: u32) -> bool {
 }
 
 /// Whether to package this picture as a HEIF grid of independent cells.
-///
-/// Grid cells are independent HEVC images: intra prediction restarts and the
-/// in-loop filters stop at every cell edge, which measured a 4.5–4.9% BD-rate
-/// penalty on smooth content (~0.1% on detailed content). A single WPP picture
-/// parallelises over CTU rows just as well, so the grid is now used only when
-/// the caller explicitly asks for a grid strategy, or when the picture cannot
-/// be represented as one HEVC picture at all.
 fn use_grid(width: u32, height: u32, parallelism: ParallelismStrategy) -> bool {
     exceeds_single_picture(width, height)
         || (parallelism.uses_grid() && needs_tiling(width, height))
@@ -751,8 +733,8 @@ fn encode_rgb_wide(
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut local_cfg = cfg.clone();
-    if local_cfg.lossless {
-        // Lossless RGB round-trips exactly only as 4:4:4 GBR under the Identity
+    if local_cfg.lossless && !local_cfg.lossless_ycbcr {
+        // Bit-exact RGB round-trips only as 4:4:4 GBR under the Identity
         // matrix: chroma subsampling and the YCgCo transform both discard
         // information (and common decoders can't even invert YCgCo). Force both.
         local_cfg.chroma = ChromaFormat::Yuv444;
@@ -773,10 +755,13 @@ fn encode_rgb_wide(
         std::mem::take(&mut ws.conv_cb),
         std::mem::take(&mut ws.conv_cr),
     );
+    // GBR packing is what makes the RGB round trip bit-exact; the YCbCr lossless
+    // mode deliberately gives that up for a Main-profile-compatible format.
+    let pack_gbr = cfg.lossless && !cfg.lossless_ycbcr;
     let mut yuv = if enc_w != width || enc_h != height {
         let mut padded = std::mem::take(&mut ws.stage);
         pad_buf_into::<3>(&mut padded, rgb, width, height, enc_w, enc_h);
-        let yuv = if cfg.lossless {
+        let yuv = if pack_gbr {
             ycgco::rgb_to_gbr(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
         } else {
             yuv::rgb_to_yuv_into(
@@ -785,7 +770,7 @@ fn encode_rgb_wide(
         };
         ws.stage = padded;
         yuv
-    } else if cfg.lossless {
+    } else if pack_gbr {
         ycgco::rgb_to_gbr(rgb, width, height, cfg.chroma, bit_depth)
     } else {
         yuv::rgb_to_yuv_into(
@@ -1356,7 +1341,7 @@ fn encode_rgb_tiled(
     // encoded_dims returns (512,512) for every subsampling format.
     let (enc_tw, enc_th) = encoded_dims(TILE_SIZE, TILE_SIZE, cfg.chroma);
 
-    if cfg.lossless {
+    if cfg.lossless && !cfg.lossless_ycbcr {
         // The caller (encode_rgb_wide) has already forced 4:4:4 + Identity; keep
         // this idempotent guard so a direct call stays lossless too.
         cfg.chroma = ChromaFormat::Yuv444;
@@ -1390,7 +1375,7 @@ fn encode_rgb_tiled(
         let mut ws = coder_scratch::lease();
         let mut tile = std::mem::take(&mut ws.stage);
         extract_rgb_tile_into(&mut tile, rgb, width, height, col, row, TILE_SIZE, 3);
-        let yuv = if cfg.lossless {
+        let yuv = if cfg.lossless && !cfg.lossless_ycbcr {
             ycgco::rgb_to_gbr(&tile, enc_tw, enc_th, cfg.chroma, bit_depth)
         } else {
             yuv::rgb_to_yuv_into(
@@ -2211,8 +2196,6 @@ mod tests {
         EncodeConfig::new()
     }
 
-    // ── validation ───────────────────────────────────────────────────────
-
     #[test]
     fn rejects_zero_dims() {
         assert!(validate_dims(0, 1).is_err());
@@ -2259,8 +2242,6 @@ mod tests {
         assert!(encode_rgb(&vec![0u8; 48], 4, 4, &cfg()).is_ok());
     }
 
-    // ── 8-bit RGB / RGBA ─────────────────────────────────────────────────
-
     #[test]
     fn encode_rgb8_produces_heic() {
         let out = encode_rgb(&vec![100u8; 16 * 16 * 3], 16, 16, &cfg()).unwrap();
@@ -2288,8 +2269,6 @@ mod tests {
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
     }
-
-    // ── 10-bit RGB / RGBA ────────────────────────────────────────────────
 
     #[test]
     fn encode_rgb10_produces_heic() {
@@ -2369,8 +2348,6 @@ mod tests {
         assert!(out.len() > 100);
     }
 
-    // ── YUV direct API ───────────────────────────────────────────────────
-
     #[test]
     fn encode_yuv_roundtrips() {
         let rgb = vec![128u16; 16 * 16 * 3];
@@ -2422,6 +2399,29 @@ mod tests {
     #[test]
     fn encode_1x1_rgba8_with_alpha() {
         assert!(encode_rgba_with_alpha(&[255, 0, 0, 255], 1, 1, &cfg()).is_ok());
+    }
+
+    #[test]
+    fn lossless_ycbcr_keeps_the_requested_chroma_and_the_main_brand() {
+        let px: Vec<u8> = (0u32..64 * 64 * 3).map(|i| (i % 251) as u8).collect();
+        let base = cfg()
+            .with_chroma(ChromaFormat::Yuv420)
+            .with_parallelism(ParallelismStrategy::Single)
+            .with_lossless(true);
+
+        // Default: forced to 4:4:4 GBR, which is a Range Extensions profile.
+        let exact = encode_rgb(&px, 64, 64, &base).unwrap();
+        assert_eq!(&exact[8..12], b"heix", "RGB-exact lossless is RExt");
+
+        // YCbCr mode: 4:2:0 is honored, so the stream stays Main.
+        let ycbcr = encode_rgb(&px, 64, 64, &base.clone().with_lossless_ycbcr(true)).unwrap();
+        assert_eq!(&ycbcr[8..12], b"heic", "YCbCr lossless stays Main");
+        assert!(
+            ycbcr.len() < exact.len(),
+            "4:2:0 must be smaller than 4:4:4 GBR: {} vs {}",
+            ycbcr.len(),
+            exact.len()
+        );
     }
 
     #[test]
@@ -2551,7 +2551,6 @@ mod tests {
             "expected 2 grid items (color + alpha), got {count}"
         );
     }
-    // ── checked_buffer_size ──────────────────────────────────────────────
 
     #[test]
     fn buffer_size_correct() {

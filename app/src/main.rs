@@ -27,16 +27,17 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use hpvca::{BitDepth, ChromaFormat, EncodeConfig, ParallelismStrategy, Speed};
+use hpvca::{
+    BitDepth, ChromaFormat, Cicp, EncodeConfig, MatrixCoefficients, ParallelismStrategy, Primaries,
+    Speed, TransferFunction,
+};
 use hpvcd::ImageBuffer;
 use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/volcanic.png")
-        .unwrap()
-        .to_rgb8();
+    let img = image::open("./assets/volcanic.png").unwrap().to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
     let instant = Instant::now();
     let data = hpvca::encode_rgb(
@@ -45,14 +46,21 @@ fn main() {
         img.height(),
         &EncodeConfig::default()
             .with_chroma(ChromaFormat::Yuv420)
-            .with_parallelism(ParallelismStrategy::Single)
+            .with_parallelism(ParallelismStrategy::Wpp)
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Fast)
             .with_lossless(true)
             .with_screen_content(false)
             .with_implicit_rdpcm(false)
-            .with_persistent_rice(false),
+            .with_persistent_rice(false)
+            .with_lossless_ycbcr(true)
+            .with_cicp(Cicp {
+                matrix: MatrixCoefficients::Smpte170m,
+                full_range: true,
+                transfer: TransferFunction::Srgb,
+                primaries: Primaries::Bt601,
+            }),
     )
     .unwrap();
     println!("Encoded time: {:?}", instant.elapsed());
