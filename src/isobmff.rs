@@ -1637,11 +1637,11 @@ mod tests {
                     16,
                     chroma,
                     bd,
-                    false,
                     Some(&crate::color::Cicp::srgb()),
                     false,
                     false,
-                    false,
+                    false, // implicit_rdpcm
+                    true,  // persistent_rice
                 ),
                 build_pps(30, false, false),
             ],
@@ -1660,17 +1660,17 @@ mod tests {
         let bit_depth = crate::fmt::BitDepth::Eight;
         NaluStream {
             nalus: vec![
-                build_vps(16, 16, chroma, bit_depth, true, false, false),
+                build_vps(16, 16, chroma, bit_depth, true, false, false), // implicit_rdpcm = true
                 build_sps(
                     16,
                     16,
                     chroma,
                     bit_depth,
-                    true,
                     Some(&crate::color::Cicp::srgb()),
                     false,
                     false,
-                    false,
+                    true, // implicit_rdpcm
+                    true, // persistent_rice
                 ),
                 build_pps(30, true, false),
             ],

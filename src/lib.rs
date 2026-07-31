@@ -165,7 +165,7 @@ pub struct EncodeConfig {
     /// Chroma subsampling format. Ignored by the `gray*` entry points, which
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
-    /// Color metadata written to the `colr` box / VUI.
+    /// Color metadata written to the `colr` box / VUI
     pub color: ColorMetadata,
     /// Optional image metadata (orientation, HDR light level, EXIF).
     pub metadata: Metadata,
@@ -193,6 +193,10 @@ pub struct EncodeConfig {
     /// Enable `implicit_rdpcm_enabled_flag` for lossless coding. Off by
     /// default; see [`with_implicit_rdpcm`](EncodeConfig::with_implicit_rdpcm).
     pub implicit_rdpcm: bool,
+    /// Enable `persistent_rice_adaptation_enabled_flag` where the profile
+    /// permits it. On by default; see
+    /// [`with_persistent_rice`](EncodeConfig::with_persistent_rice).
+    pub persistent_rice: bool,
 }
 
 impl Default for EncodeConfig {
@@ -210,6 +214,7 @@ impl Default for EncodeConfig {
             speed: Speed::default(),
             screen_content: false,
             implicit_rdpcm: false,
+            persistent_rice: true,
         }
     }
 }
@@ -277,6 +282,24 @@ impl EncodeConfig {
     /// Extensions `implicit_rdpcm_enabled_flag`).
     pub fn with_implicit_rdpcm(mut self, implicit_rdpcm: bool) -> Self {
         self.implicit_rdpcm = implicit_rdpcm;
+        self
+    }
+
+    /// Enable persistent Rice adaptation (HEVC Range Extensions
+    /// `persistent_rice_adaptation_enabled_flag`).
+    ///
+    /// `coeff_abs_level_remaining` keeps a running per-picture Rice statistic
+    /// instead of restarting each coefficient group at zero. It only applies
+    /// where the stream is already using a Range Extensions profile — 4:2:2,
+    /// 4:4:4, more than 10 bits, or implicit RDPCM — so switching it off never
+    /// widens decoder support on its own: anything that accepts those profiles
+    /// accepts this tool.
+    ///
+    /// **On by default**, because it is worth up to ~24% on lossless synthetic
+    /// content (and under 1% on photographs). Turn it off only to isolate it
+    /// while debugging a decoder.
+    pub fn with_persistent_rice(mut self, persistent_rice: bool) -> Self {
+        self.persistent_rice = persistent_rice;
         self
     }
 
@@ -841,6 +864,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -856,6 +880,7 @@ fn encode_rgba_with_alpha_wide(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -946,6 +971,7 @@ fn encode_gray_alpha_wide(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     let alpha_yuv = build_mono_yuv(alpha_plane, enc_w, enc_h, width, height, bit_depth);
@@ -961,6 +987,7 @@ fn encode_gray_alpha_wide(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -1003,6 +1030,7 @@ pub fn encode_yuv_with_alpha(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     // Alpha auxiliary image — monochrome, coded at the color image's dimensions.
@@ -1026,6 +1054,7 @@ pub fn encode_yuv_with_alpha(
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
 
     isobmff::wrap_hevc_image_with_alpha(
@@ -1061,6 +1090,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         None,
         cfg.screen_content,
         cfg.implicit_rdpcm,
+        cfg.persistent_rice,
     )?;
     isobmff::wrap_hevc_image(
         &nalu_stream,
@@ -1278,6 +1308,7 @@ fn encode_cell(
     chroma_qp_offset: Option<i8>,
     screen_content: bool,
     implicit_rdpcm: bool,
+    persistent_rice: bool,
 ) -> Result<hevc::NaluStream, EncodeError> {
     let (wpp, wpp_threads) = if cell_wpp {
         // A WPP picture cannot run more CTU rows concurrently than it has.
@@ -1305,6 +1336,7 @@ fn encode_cell(
         chroma_qp_offset,
         screen_content,
         implicit_rdpcm,
+        persistent_rice,
     )
 }
 
@@ -1390,6 +1422,7 @@ fn encode_rgb_tiled(
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         );
         ws.conv_y = yuv.y;
         ws.conv_cb = yuv.cb;
@@ -1476,6 +1509,7 @@ fn encode_gray_tiled(
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1579,6 +1613,7 @@ fn encode_yuv_alpha_tiled(
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
 
         let alpha_tile = extract_plane_tile(
@@ -1608,6 +1643,7 @@ fn encode_yuv_alpha_tiled(
             Some(0),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1718,6 +1754,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )
     })?;
     isobmff::wrap_hevc_grid(
@@ -1811,6 +1848,7 @@ fn encode_rgba_alpha_tiled(
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
 
         // Alpha is always monochrome; TILE_SIZE is already dimension-aligned.
@@ -1839,6 +1877,7 @@ fn encode_rgba_alpha_tiled(
             Some(0),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
         Ok::<_, EncodeError>((color, alpha))
     })?;
@@ -1942,6 +1981,7 @@ fn encode_gray_alpha_tiled(
             Some(grid_cqo),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
 
         let alpha_yuv = build_mono_yuv(
@@ -1969,6 +2009,7 @@ fn encode_gray_alpha_tiled(
             Some(0),
             cfg.screen_content,
             cfg.implicit_rdpcm,
+            cfg.persistent_rice,
         )?;
         Ok::<_, EncodeError>((luma, alpha))
     })?;
