@@ -81,6 +81,13 @@ pub(crate) struct ContextSet {
     /// Whether `persistent_rice_adaptation_enabled_flag` is set in the SPS.
     pub(crate) persistent_rice: bool,
 
+    /// transform_skip_flag (luma ctx 0, chroma ctx 1); initValue 139 in every
+    /// init type (HEVC Table 9-27).
+    pub(crate) transform_skip_flag: [CtxModel; 2],
+    /// Whether the PPS sets `transform_skip_enabled_flag`. When set, every 4×4
+    /// TB of a non-bypass CU carries a transform_skip_flag (§7.3.8.11).
+    pub(crate) transform_skip_enabled: bool,
+
     // cu_transquant_bypass_flag (1 ctx). initValue 154 for all init types
     // (HEVC Table 9-43). Used only when the PPS enables transquant bypass
     // (lossless coding).
@@ -196,6 +203,8 @@ impl ContextSet {
             // cu_transquant_bypass_flag initValue 154 (all init types).
             stat_coeff: [0; 4],
             persistent_rice: false,
+            transform_skip_flag: arr([139, 139], qp),
+            transform_skip_enabled: false,
 
             cu_transquant_bypass_flag: c(154, qp),
 
@@ -251,6 +260,8 @@ impl ContextSet {
             cu_qp_delta_abs: arr([154, 154], qp),
             stat_coeff: [0; 4],
             persistent_rice,
+            transform_skip_flag: arr([139, 139], qp),
+            transform_skip_enabled: false,
             cu_transquant_bypass_flag: c(154, qp),
 
             part_mode: arr([154, 139, 154, 154], qp),

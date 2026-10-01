@@ -7,3 +7,4 @@ metadata
 sweep.py
 Cargo.lock
 *.png
+.DS_Store

@@ -290,9 +290,69 @@ pub(crate) struct CabacEncoder {
     /// does. It costs one table lookup per bin and lets an RD decision price a
     /// CU it has already written for real, instead of trial-encoding it twice.
     bits: f32,
+    /// Optional record of every coded bin, used to re-emit the stream with
+    /// different SAO syntax without re-running the CU decisions (see
+    /// [`BinTrace`]).
+    trace: Option<Vec<u16>>,
+}
+
+/// Packed bin-trace record: the low two bits select the kind.
+///
+/// * regular bin: `p_state_idx << 2 | val_mps << 8 | bin << 9`
+/// * bypass bin: `bin << 2`
+/// * terminate bin: `flag << 2`
+/// * marker: `id << 2`
+///
+/// A regular bin carries the probability state it was coded with, so replaying
+/// it needs no context model: the arithmetic coder output depends only on that
+/// state, the bin and the coder's own registers.
+pub(crate) mod bin_trace {
+    pub(crate) const REGULAR: u16 = 0;
+    pub(crate) const BYPASS: u16 = 1;
+    pub(crate) const TERMINATE: u16 = 2;
+    pub(crate) const MARKER: u16 = 3;
+    /// Start of a CTU's SAO syntax.
+    pub(crate) const SAO_BEGIN: u16 = 0;
+    /// End of a CTU's SAO syntax; its coding_quadtree() follows.
+    pub(crate) const SAO_END: u16 = 1;
 }
 
 impl CabacEncoder {
+    /// An encoder that also records every bin (see [`bin_trace`]).
+    pub(crate) fn with_trace(trace: bool) -> Self {
+        let mut encoder = Self::new();
+        if trace {
+            encoder.trace = Some(Vec::new());
+        }
+        encoder
+    }
+
+    /// Record a marker in the bin trace. No-op when not tracing.
+    #[inline]
+    pub(crate) fn mark(&mut self, id: u16) {
+        if let Some(trace) = &mut self.trace {
+            trace.push(bin_trace::MARKER | (id << 2));
+        }
+    }
+
+    /// [`finish`](Self::finish), also returning the bin trace (empty when not
+    /// tracing).
+    pub(crate) fn finish_with_trace(mut self) -> (Vec<u8>, Vec<u16>) {
+        let trace = self.trace.take().unwrap_or_default();
+        (self.finish(), trace)
+    }
+
+    /// Code one regular bin with an explicit probability state, as recorded in
+    /// a bin trace.
+    #[inline]
+    pub(crate) fn encode_bin_with_state(&mut self, bin_val: u8, p_state_idx: u8, val_mps: u8) {
+        let mut model = CtxModel {
+            p_state_idx,
+            val_mps,
+        };
+        self.encode_bin(bin_val, &mut model);
+    }
+
     pub(crate) fn new() -> Self {
         CabacEncoder {
             low: 0,
@@ -303,6 +363,7 @@ impl CabacEncoder {
             bit_count: 0,
             output: Vec::new(),
             bits: 0.0,
+            trace: None,
         }
     }
 
@@ -354,6 +415,14 @@ impl CabacEncoder {
     /// Context-adaptive binary encoding.
     #[inline]
     pub(crate) fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        if let Some(trace) = &mut self.trace {
+            trace.push(
+                bin_trace::REGULAR
+                    | (u16::from(ctx.p_state_idx) << 2)
+                    | (u16::from(ctx.val_mps) << 8)
+                    | (u16::from(bin_val) << 9),
+            );
+        }
         self.bits += ctx.estimated_bits(bin_val);
         let state = ctx.p_state_idx as usize;
         let lps = RANGE_TAB_LPS[state][(self.m_range >> 6) as usize & 3] as u32;
@@ -377,6 +446,9 @@ impl CabacEncoder {
     /// Equal-probability bypass encoding.
     #[inline]
     pub(crate) fn encode_bypass(&mut self, bin_val: u8) {
+        if let Some(trace) = &mut self.trace {
+            trace.push(bin_trace::BYPASS | (u16::from(bin_val) << 2));
+        }
         self.bits += 1.0;
         self.low <<= 1;
         if bin_val != 0 {
@@ -395,6 +467,9 @@ impl CabacEncoder {
 
     /// Encode end_of_slice_segment_flag (terminate bin).
     pub(crate) fn encode_terminate(&mut self, flag: u8) {
+        if let Some(trace) = &mut self.trace {
+            trace.push(bin_trace::TERMINATE | (u16::from(flag) << 2));
+        }
         self.m_range -= 2;
         if flag != 0 {
             self.low += self.m_range;
@@ -446,6 +521,7 @@ pub(crate) struct CabacSnapshot {
     bit_count: u8,
     output_len: usize,
     bits: f32,
+    trace_len: usize,
 }
 
 impl CabacWriter for CabacEncoder {
@@ -472,6 +548,7 @@ impl CabacWriter for CabacEncoder {
             bit_count: self.bit_count,
             output_len: self.output.len(),
             bits: self.bits,
+            trace_len: self.trace.as_ref().map_or(0, Vec::len),
         }
     }
 
@@ -484,6 +561,9 @@ impl CabacWriter for CabacEncoder {
         self.bit_count = snapshot.bit_count;
         self.output.truncate(snapshot.output_len);
         self.bits = snapshot.bits;
+        if let Some(trace) = &mut self.trace {
+            trace.truncate(snapshot.trace_len);
+        }
     }
 
     #[inline]

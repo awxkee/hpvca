@@ -82,6 +82,7 @@ pub(crate) fn encode_residual<W: CabacWriter>(
         is_luma,
         scan_idx,
         sign_data_hiding,
+        false,
     );
 }
 
@@ -105,8 +106,80 @@ pub(crate) fn estimate_residual_bits(
         is_luma,
         scan_idx,
         sign_data_hiding,
+        false,
     );
     est.bits()
+}
+
+/// [`encode_residual`] for a TB that may be transform-skipped (4×4 only).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_residual_ts<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+    transform_skip: bool,
+) {
+    write_residual(
+        enc,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+        transform_skip,
+    );
+}
+
+/// [`estimate_residual_bits`] for a TB that may be transform-skipped.
+pub(crate) fn estimate_residual_bits_ts(
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+    transform_skip: bool,
+) -> f32 {
+    let mut est = CabacEstimator::default();
+    write_residual(
+        &mut est,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+        transform_skip,
+    );
+    est.bits()
+}
+
+/// [`advance_residual_contexts`] for a TB that may be transform-skipped.
+pub(crate) fn advance_residual_contexts_ts(
+    ctx: &mut ContextSet,
+    coeffs: &[i16],
+    log2_ts: u32,
+    is_luma: bool,
+    scan_idx: u8,
+    sign_data_hiding: bool,
+    transform_skip: bool,
+) {
+    let mut updater = CabacContextUpdater;
+    write_residual(
+        &mut updater,
+        ctx,
+        coeffs,
+        log2_ts,
+        is_luma,
+        scan_idx,
+        sign_data_hiding,
+        transform_skip,
+    );
 }
 
 /// Apply residual-coding context transitions without arithmetic coding or
@@ -129,9 +202,11 @@ pub(crate) fn advance_residual_contexts(
         is_luma,
         scan_idx,
         sign_data_hiding,
+        false,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_residual<W: CabacWriter>(
     enc: &mut W,
     ctx: &mut ContextSet,
@@ -140,6 +215,7 @@ fn write_residual<W: CabacWriter>(
     is_luma: bool,
     scan_idx: u8,
     sign_data_hiding: bool,
+    transform_skip: bool,
 ) {
     let n_coeffs = (1usize << log2_ts) * (1usize << log2_ts);
     debug_assert!(coeffs.len() >= n_coeffs);
@@ -152,6 +228,19 @@ fn write_residual<W: CabacWriter>(
         Some(p) => p,
         None => return, // CBF=0 handled by caller
     };
+
+    // transform_skip_flag (§7.3.8.11): present for every 4×4 TB once the PPS
+    // enables the tool. `transform_skip_enabled` is only ever set for lossy
+    // streams, so no transquant-bypass CU reaches this point with it on.
+    let transform_skip = transform_skip && log2_ts == 2;
+    if ctx.transform_skip_enabled && log2_ts == 2 {
+        enc.encode_bin(
+            transform_skip as u8,
+            &mut ctx.transform_skip_flag[usize::from(!is_luma)],
+        );
+    } else {
+        debug_assert!(!transform_skip, "transform skip coded while disabled");
+    }
 
     // (row, col) of the last significant coefficient in the TU.
     let (last_row, last_col) = scan[last_scan_pos];
@@ -294,6 +383,7 @@ fn write_residual<W: CabacWriter>(
             sb,
             is_luma,
             sign_data_hiding,
+            transform_skip,
             &mut level_state,
         );
     }
@@ -491,6 +581,7 @@ fn encode_coeff_levels<W: CabacWriter>(
     sb: usize,
     is_luma: bool,
     sign_data_hiding: bool,
+    transform_skip: bool,
     st: &mut LevelState,
 ) {
     let n = sig_pos.len();
@@ -569,10 +660,10 @@ fn encode_coeff_levels<W: CabacWriter>(
     // running per-picture statistic, the statistic is updated from the first
     // remaining level coded in the group, and the in-group adaptation is no
     // longer clamped to 4. `sign_data_hiding` is false exactly for
-    // transquant-bypass CUs, which is the "non-transformed" half of the
-    // statistic index.
+    // transquant-bypass CUs, which together with transform-skipped TBs form
+    // the "non-transformed" half of the statistic index.
     let persistent = ctx.persistent_rice;
-    let stat_index = usize::from(!is_luma) * 2 + usize::from(!sign_data_hiding);
+    let stat_index = usize::from(!is_luma) * 2 + usize::from(!sign_data_hiding || transform_skip);
     let mut rice: u32 = if persistent {
         u32::from(ctx.stat_coeff[stat_index] / 4)
     } else {

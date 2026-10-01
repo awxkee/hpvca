@@ -196,6 +196,7 @@ pub(crate) fn wrap_hevc_image_with_alpha(
     let color_sample = color.to_length_prefixed_slices();
     let alpha_sample = alpha.to_length_prefixed_slices();
     let color_hvcc = build_hvcc(color, bit_depth.bits())?;
+    let decoded = decoded_dims(color, width, height);
     let alpha_hvcc = build_hvcc(alpha, bit_depth.bits())?;
 
     const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
@@ -281,6 +282,7 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         let mut clli_idx = 0u8;
 
         let mut colr2_idx = 0u8;
+        let mut clap_idx = 0u8;
         {
             let si = f.len();
             write_box(&mut f, b"ipco");
@@ -297,8 +299,8 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"ispe", 0, 0);
-                w32(&mut f, width);
-                w32(&mut f, height);
+                w32(&mut f, decoded.0);
+                w32(&mut f, decoded.1);
                 patch(&mut f, sh);
             }
             // 4: pixi (color, 3 ch)
@@ -335,6 +337,11 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             }
             // 8+: optional
             let mut next_prop: u8 = 8;
+            if decoded != (width, height) {
+                write_clap(&mut f, decoded, (width, height));
+                clap_idx = next_prop;
+                next_prop += 1;
+            }
             if has_secondary_colr(color_meta) {
                 write_secondary_colr(&mut f, color_meta);
                 colr2_idx = next_prop;
@@ -377,6 +384,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             if colr2_idx != 0 {
                 ca.push(colr2_idx);
             }
+            if clap_idx != 0 {
+                ca.push(0x80 | clap_idx);
+            }
             if irot_idx != 0 {
                 ca.push(0x80 | irot_idx);
             }
@@ -389,13 +399,17 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             w16(&mut f, 1);
             f.push(ca.len() as u8);
             f.extend_from_slice(&ca);
-            // alpha: hvcC(5*) ispe(3) pixi(6) auxC(7)
+            // alpha: hvcC(5*) ispe(3) pixi(6) auxC(7), plus the same crop —
+            // the alpha plane is coded at the colour picture's decoded size.
             w16(&mut f, 2);
-            f.push(4);
+            f.push(if clap_idx != 0 { 5 } else { 4 });
             f.push(0x80 | 5);
             f.push(3);
             f.push(6);
             f.push(7);
+            if clap_idx != 0 {
+                f.push(0x80 | clap_idx);
+            }
             patch(&mut f, si);
         }
 
@@ -431,6 +445,7 @@ pub(crate) fn wrap_hevc_image(
     } = img;
     let hevc_sample = stream.to_length_prefixed_slices();
     let hvcc_data = build_hvcc(stream, bit_depth.bits())?;
+    let decoded = decoded_dims(stream, width, height);
 
     let mut f: Vec<u8> = Vec::new();
 
@@ -525,7 +540,7 @@ pub(crate) fn wrap_hevc_image(
     }
 
     {
-        let extra_props: (u8, u8, u8, u8);
+        let extra_props: (u8, u8, u8, u8, u8);
         let s = f.len();
         write_box(&mut f, b"iprp");
 
@@ -547,8 +562,8 @@ pub(crate) fn wrap_hevc_image(
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"ispe", 0, 0);
-                w32(&mut f, width);
-                w32(&mut f, height);
+                w32(&mut f, decoded.0);
+                w32(&mut f, decoded.1);
                 patch(&mut f, sh);
             }
             // 4: pixi
@@ -569,6 +584,12 @@ pub(crate) fn wrap_hevc_image(
             let mut clli_idx = 0u8;
 
             let mut colr2_idx = 0u8;
+            let mut clap_idx = 0u8;
+            if decoded != (width, height) {
+                write_clap(&mut f, decoded, (width, height));
+                clap_idx = next_prop;
+                next_prop += 1;
+            }
             if has_secondary_colr(color_meta) {
                 write_secondary_colr(&mut f, color_meta);
                 colr2_idx = next_prop;
@@ -599,16 +620,21 @@ pub(crate) fn wrap_hevc_image(
                 next_prop += 1;
             }
             let _ = next_prop;
-            extra_props = (irot_idx, imir_idx, clli_idx, colr2_idx);
+            extra_props = (irot_idx, imir_idx, clli_idx, colr2_idx, clap_idx);
             patch(&mut f, si);
         }
 
         {
-            let (irot_idx, imir_idx, clli_idx, colr2_idx) = extra_props;
+            let (irot_idx, imir_idx, clli_idx, colr2_idx, clap_idx) = extra_props;
             // ipma: hvcC(1*) colr(2) ispe(3) pixi(4) + optionals
             let mut assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
             if colr2_idx != 0 {
                 assoc.push(colr2_idx);
+            }
+            // Transformative properties apply in listed order: crop, then
+            // rotate, then mirror.
+            if clap_idx != 0 {
+                assoc.push(0x80 | clap_idx);
             }
             if irot_idx != 0 {
                 assoc.push(0x80 | irot_idx);
@@ -649,6 +675,39 @@ pub(crate) fn wrap_hevc_image(
     }
 
     Ok(f)
+}
+
+/// Size of the picture the decoder outputs: the visible size rounded up to the
+/// chroma subsampling grid. The SPS conformance window counts in chroma
+/// units, so an odd width (4:2:0 / 4:2:2) or odd height (4:2:0) cannot be
+/// cropped in the bitstream; such pictures carry one extra column/row, and
+/// `ispe` must describe that decoded size. [`write_clap`] then crops it.
+fn decoded_dims(stream: &NaluStream, width: u32, height: u32) -> (u32, u32) {
+    let (sub_w, sub_h) = match sps_chroma_format_idc(stream) {
+        Some(1) => (2, 2),
+        Some(2) => (2, 1),
+        _ => (1, 1),
+    };
+    (
+        width.div_ceil(sub_w) * sub_w,
+        height.div_ceil(sub_h) * sub_h,
+    )
+}
+
+/// `clap` cropping a `decoded` picture to its top-left `visible` region.
+/// Offsets are the aperture center relative to the picture center, in halves.
+fn write_clap(f: &mut Vec<u8>, decoded: (u32, u32), visible: (u32, u32)) {
+    let sh = f.len();
+    write_box(f, b"clap");
+    for clean in [visible.0, visible.1] {
+        w32(f, clean);
+        w32(f, 1);
+    }
+    for (clean, full) in [(visible.0, decoded.0), (visible.1, decoded.1)] {
+        w32(f, (clean as i32 - full as i32) as u32);
+        w32(f, 2);
+    }
+    patch(f, sh);
 }
 
 fn sps_chroma_format_idc(stream: &NaluStream) -> Option<u8> {

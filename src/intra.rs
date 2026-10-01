@@ -1054,8 +1054,8 @@ mod tests {
         // Mode 26 (pure vertical), no boundary filter → every row equals the above row.
         let mut above = [0u16; 33];
         let left = [50u16; 33];
-        for i in 0..8 {
-            above[i] = (10 * i) as u16;
+        for (i, a) in above.iter_mut().take(8).enumerate() {
+            *a = (10 * i) as u16;
         }
         let p = predict_angular(50, &above, &left, 8, 26, false, 255);
         for r in 0..8 {
@@ -1070,8 +1070,8 @@ mod tests {
         // Mode 10 (pure horizontal), no boundary filter → every col equals left col.
         let above = [50u16; 33];
         let mut left = [0u16; 33];
-        for i in 0..8 {
-            left[i] = (10 * i) as u16;
+        for (i, l) in left.iter_mut().take(8).enumerate() {
+            *l = (10 * i) as u16;
         }
         let p = predict_angular(50, &above, &left, 8, 10, false, 255);
         for r in 0..8 {
@@ -1086,8 +1086,8 @@ mod tests {
         // Mode 34 has angle +32 (exact 45°): predSamples[y][x] = ref[x+y+2] = above[x+y+1].
         let mut above = [0u16; 33];
         let left = [0u16; 33];
-        for i in 0..16 {
-            above[i] = (i + 1) as u16;
+        for (i, a) in above.iter_mut().take(16).enumerate() {
+            *a = (i + 1) as u16;
         }
         let p = predict_angular(0, &above, &left, 8, 34, false, 255);
         for y in 0..8 {

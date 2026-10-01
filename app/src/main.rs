@@ -37,7 +37,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let img = image::open("./assets/volcanic.png").unwrap().to_rgb8();
+    let img = image::open("./assets/IMG_0150.PNG").unwrap().to_rgb8();
     let arr = img.to_vec(); //;.iter().map(|&x| x >> 6).collect::<Vec<_>>();
     let instant = Instant::now();
     let data = hpvca::encode_rgb(
@@ -50,11 +50,10 @@ fn main() {
             .with_sao(false)
             .with_quality(70)
             .with_speed(Speed::Fast)
-            .with_lossless(true)
+            .with_lossless(false)
             .with_screen_content(false)
             .with_implicit_rdpcm(false)
-            .with_persistent_rice(false)
-            .with_lossless_ycbcr(true)
+            .with_persistent_rice(true)
             .with_cicp(Cicp {
                 matrix: MatrixCoefficients::Smpte170m,
                 full_range: true,

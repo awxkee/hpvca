@@ -129,6 +129,10 @@ pub(crate) static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 /// selects coefficient levels, coefficient-group significance, CBF and the last
 /// position; no second magnitude replay is needed.
 pub(crate) struct RdoqScratch {
+    /// Whether the perceptual distortion weights apply (see `RDOQ_HF_WEIGHT`).
+    /// Cleared while ranking mode candidates, whose RD comparison measures
+    /// plain pixel SSE; only the committed coefficients are weighted.
+    pub(crate) perceptual: bool,
     cost_coeff: [f32; MAX_TB],
     cost_coeff0: [f32; MAX_TB],
     cost_sig: [f32; MAX_TB],
@@ -136,9 +140,22 @@ pub(crate) struct RdoqScratch {
     group_flags: [u8; 64],
 }
 
+/// Per-frequency weights on RDOQ's distortion term.
+///
+/// A coefficient whose distortion is made cheaper is more readily rounded down
+/// or zeroed. Cheapening high-frequency AC (`row + col >= RDOQ_HF_START · n`)
+/// trades ringing for slight blur, which perceptual metrics strongly prefer;
+/// weighting DC up protects flat areas. Measured against plain SSE weights
+/// (14 images, q40–92): ssimulacra2 −3.4%, CVVDP −4.0% BD-rate (PSNR +3.2%,
+/// which the encoder deliberately does not target).
+const RDOQ_DC_WEIGHT: f32 = 1.8;
+const RDOQ_HF_WEIGHT: f32 = 0.4;
+const RDOQ_HF_START: f32 = 0.7;
+
 impl RdoqScratch {
     pub(crate) fn new() -> Self {
         Self {
+            perceptual: true,
             cost_coeff: [0.0; MAX_TB],
             cost_coeff0: [0.0; MAX_TB],
             cost_sig: [0.0; MAX_TB],
@@ -681,18 +698,6 @@ fn rdoq_lambda_scale() -> f32 {
     1.0
 }
 
-const fn hf_distortion_weight() -> f32 {
-    1.0
-}
-
-const fn hf_start_fraction() -> f32 {
-    0.5
-}
-
-const fn dc_distortion_weight() -> f32 {
-    1.0
-}
-
 fn rdoq_disabled() -> bool {
     false
 }
@@ -720,9 +725,12 @@ fn rdoq_with_sign_hiding_into(
         lambda,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
-    let dc_weight = dc_distortion_weight();
-    let hf_weight = hf_distortion_weight();
-    let hf_start = (hf_start_fraction() * n as f32) as usize;
+    let (dc_weight, hf_weight) = if scratch.perceptual {
+        (RDOQ_DC_WEIGHT, RDOQ_HF_WEIGHT)
+    } else {
+        (1.0, 1.0)
+    };
+    let hf_start = (RDOQ_HF_START * n as f32) as usize;
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
@@ -739,6 +747,7 @@ fn rdoq_with_sign_hiding_into(
     let distortion = RdoqDistortion::new(n, qp, bit_depth);
 
     let RdoqScratch {
+        perceptual: _,
         cost_coeff,
         cost_coeff0,
         cost_sig,
@@ -1193,6 +1202,22 @@ fn sign_bit_hiding_hdq(
             row * n + col
         };
 
+        // Every HEVC coefficient group is a 4×4 spatial sub-block, so an empty
+        // group — most of a large TB — is rejected with four row reads rather
+        // than a 16-entry scan-order gather.
+        let (r0, c0) = group[0];
+        let (block_row, block_col) = (r0 & !3, c0 & !3);
+        debug_assert!(
+            group
+                .iter()
+                .all(|&(r, c)| r & !3 == block_row && c & !3 == block_col)
+        );
+        if (0..4).all(|k| {
+            let start = (block_row + k) * n + block_col;
+            levels[start..start + 4] == [0; 4]
+        }) {
+            continue;
+        }
         let Some(first_nz) = (0..GROUP_SIZE).find(|&i| levels[row_major(i)] != 0) else {
             continue;
         };
@@ -1309,6 +1334,28 @@ pub(crate) fn dequantize_into(
     let factor = scale * per * 16;
     for (dst, &level) in out[..n * n].iter_mut().zip(&level[..n * n]) {
         *dst = ((level as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
+    }
+}
+
+/// Transform skip, forward direction: scale the residual onto the same
+/// fixed-point range as the transform output (`res << (15 − bitDepth −
+/// log2 n)`), so quantization and RDOQ apply unchanged.
+pub(crate) fn transform_skip_fwd_into(res: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+    let shift = 15 - u32::from(bit_depth) - n.trailing_zeros();
+    for (dst, &r) in out[..n * n].iter_mut().zip(&res[..n * n]) {
+        *dst = r << shift;
+    }
+}
+
+/// Transform skip, inverse direction (§8.6.4.2 with `extended_precision`
+/// off): `r = d << (5 + log2 n)`, then the normal `bdShift = 20 − bitDepth`
+/// rounding of the second inverse-transform stage.
+pub(crate) fn transform_skip_inv_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+    let ts_shift = 5 + n.trailing_zeros();
+    let bd_shift = 20 - u32::from(bit_depth);
+    let add = 1i32 << (bd_shift - 1);
+    for (dst, &c) in out[..n * n].iter_mut().zip(&coeff[..n * n]) {
+        *dst = ((c << ts_shift) + add) >> bd_shift;
     }
 }
 
@@ -1516,6 +1563,21 @@ fn inv_transform_32(
 mod tests {
     use super::*;
 
+    #[test]
+    fn transform_skip_scaling_round_trips() {
+        // Without quantization, skip's forward scaling and the normative
+        // inverse must cancel exactly at every supported depth.
+        for bit_depth in [8u8, 10, 12] {
+            let max = (1i32 << bit_depth) - 1;
+            let res: Vec<i32> = (0..16).map(|i| (i * 37 % (2 * max + 1)) - max).collect();
+            let mut coeff = [0i32; 16];
+            let mut back = [0i32; 16];
+            transform_skip_fwd_into(&res, 4, bit_depth, &mut coeff);
+            transform_skip_inv_into(&coeff, 4, bit_depth, &mut back);
+            assert_eq!(&back[..], &res[..], "bit depth {bit_depth}");
+        }
+    }
+
     /// HEVC basis rows are *approximately* orthonormal: they're integer
     /// approximations, so norms cluster tightly around the ideal N·64² and
     /// off-diagonal correlations are small (tens–low hundreds), not zero. A
@@ -1667,9 +1729,9 @@ mod tests {
     #[test]
     fn t32_partial_butterfly_matches_sparse_inverse() {
         let mut coeff = [0i32; MAX_TB];
-        for i in 0..MAX_TB {
+        for (i, c) in coeff.iter_mut().enumerate() {
             if i % 7 != 0 {
-                coeff[i] = ((i as i32 * 41 + 17) & 1023) - 512;
+                *c = ((i as i32 * 41 + 17) & 1023) - 512;
             }
         }
 
@@ -1746,6 +1808,7 @@ mod tests {
         assert!(levels[..64].iter().all(|&level| level == 0));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rdoq_luma_with_sign_hiding(
         coeff: &[i32],
         n: usize,
@@ -1809,7 +1872,7 @@ mod tests {
         let ctx = ContextSet::init_islice(4);
         let levels = rdoq_luma_with_sign_hiding(&coeff, 8, 4, 8, scan, 0, 0.001, &ctx);
 
-        for group in scan.chunks_exact(16) {
+        for group in scan.as_chunks::<16>().0 {
             let first = group
                 .iter()
                 .position(|&(row, col)| levels[row * 8 + col] != 0);
@@ -1930,4 +1993,76 @@ mod tests {
                 .all(|(&a, b)| (a - b).abs() <= 1)
         );
     }
+}
+
+/// Statistics of a plainly quantized TB, for ranking intra mode candidates
+/// before the exact CABAC rate estimate. See [`quantized_tb_stats`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QuantizedTbStats {
+    /// Quantization error, in pixel-domain SSE units.
+    pub(crate) distortion: f32,
+    pub(crate) nonzero: u32,
+    /// Σ log2(1 + |level|) over the significant coefficients.
+    pub(crate) log_levels: f32,
+    /// Scan position of the last significant coefficient.
+    pub(crate) last: usize,
+}
+
+/// Dead-zone quantize `coeff` (no sign hiding, no output) and measure what
+/// the rate proxy and distortion of that TB need, in one scan-order pass.
+///
+/// The distortion is computed in the transform domain: HEVC's core transforms
+/// are orthogonal up to a gain of 2^(15 − bitDepth − log2N) (and a ~1.4%
+/// row-norm excess of the integer matrices), so the coefficient error maps to
+/// pixel SSE without the inverse transform.
+pub(crate) fn quantized_tb_stats(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+) -> QuantizedTbStats {
+    static LOG2_1P: [f32; 16] = [
+        0.0,
+        1.0,
+        1.584_963,
+        2.0,
+        2.321_928,
+        2.584_963,
+        2.807_355,
+        3.0,
+        3.169_925,
+        core::f32::consts::LOG2_10,
+        3.459_432,
+        3.584_963,
+        3.700_44,
+        3.807_355,
+        3.906_891,
+        4.0,
+    ];
+    let log2n = n.trailing_zeros() as i64;
+    let q_bits = 14 + (qp as i64) / 6 + (15 - bit_depth as i64 - log2n);
+    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let offset = 171i64 << (q_bits - 9); // intra, as quantize_impl_into
+    let inv_scale = 1.0f32 / q_scale as f32;
+    let mut stats = QuantizedTbStats::default();
+    let mut coeff_sse = 0.0f32;
+    for (index, &(row, col)) in scan[..n * n].iter().enumerate() {
+        let scaled = (coeff[row * n + col] as i64).abs() * q_scale;
+        let level = (scaled + offset) >> q_bits;
+        let error = (scaled - (level << q_bits)) as f32 * inv_scale;
+        coeff_sse += error * error;
+        if level != 0 {
+            stats.nonzero += 1;
+            stats.last = index;
+            stats.log_levels += if level < 16 {
+                LOG2_1P[level as usize]
+            } else {
+                (1.0 + level as f32).log2()
+            };
+        }
+    }
+    let gain_log2 = 15 - bit_depth as i32 - log2n as i32;
+    stats.distortion = coeff_sse * 1.028 * (-2.0 * gain_log2 as f32).exp2();
+    stats
 }
