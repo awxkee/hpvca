@@ -34,7 +34,9 @@ use crate::{
 
 const ACTIVITY_QP_FLOOR: u8 = 8;
 
-const ACTIVITY_STRENGTH: f32 = 1.25;
+/// QP offset per nat of 8×8 log-variance above/below the picture mean.
+const ACTIVITY_STRENGTH: f32 = 1.625;
+pub(crate) const MAX_AQ_OFFSET: i8 = 6;
 
 /// Natural `log(1+x)` for the non-negative
 ///
@@ -180,11 +182,11 @@ pub(crate) fn activity_qp_offsets(
     qp: u8,
     lossless: bool,
 ) -> Vec<i8> {
-    activity_qp_offsets_clamped(yuv, ctus_x, ctus_y, qp, lossless, 3)
+    activity_qp_offsets_clamped(yuv, ctus_x, ctus_y, qp, lossless, MAX_AQ_OFFSET)
 }
 
 /// [`activity_qp_offsets`] with a caller-chosen clamp. Direct coding requires
-/// ±3 (the lambda-scale table), but a gridded encode computes the picture map
+/// ±[`MAX_AQ_OFFSET`] (the lambda-scale table), but a gridded encode computes the picture map
 /// with a wide clamp so each cell can lift its mean into its slice QP and
 /// re-center the residuals — otherwise cell-level dynamic range is lost to
 /// the clamp before the cells ever see the map.
@@ -217,7 +219,7 @@ pub(crate) fn activity_qp_offsets_clamped(
             } else {
                 (log_variance - mean) * ACTIVITY_STRENGTH
             };
-            // Coding requires ±3 (`code_one_ctu`'s 7-entry lambda-scale table);
+            // Coding requires ±MAX_AQ_OFFSET (`code_one_ctu`'s λ-scale table);
             // gridded analysis widens this and re-clamps after cell rebasing.
             masking.fast_round().clamp(-clamp_hi, clamp_hi) as i8
         })
@@ -276,6 +278,10 @@ mod tests {
             offsets[4..].iter().all(|&offset| offset > 0),
             "textured CTU groups should spend fewer bits: {offsets:?}"
         );
-        assert!(offsets.iter().all(|&offset| (-3..=3).contains(&offset)));
+        assert!(
+            offsets
+                .iter()
+                .all(|&offset| (-MAX_AQ_OFFSET..=MAX_AQ_OFFSET).contains(&offset))
+        );
     }
 }

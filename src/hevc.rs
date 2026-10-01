@@ -719,7 +719,7 @@ pub(crate) fn encode_intra_opts(
     // full-picture map instead.
     aq_override: Option<&[i8]>,
     // Slice-QP bias for a grid cell whose mean activity offset was rebased out
-    // of the ±3 per-QG clamp (see `cell_aq_slice`).
+    // of the ±MAX_AQ_OFFSET per-QG clamp (see `cell_aq_slice`).
     qp_bias: i8,
     // Shared Cb/Cr QP offset: grid cells receive the full picture's value so
     // every cell treats chroma identically; `None` derives it from `yuv`.
@@ -1215,7 +1215,11 @@ fn code_one_ctu(
     // from real neighbour CU depths (a hardcoded neighbour-exists shortcut would
     // desync the moment any neighbouring CTU is coded as a single 64×64 CU).
     let root_ctx = split_cu_context(tree.cu_depth, lu_row0, lu_col0, 0, tree.cu_stride);
-    const AQ_LAMBDA_SCALE: [f32; 7] = [
+    // λ ∝ 2^(QP/3): the scale for a QP offset of −6..=6 (MAX_AQ_OFFSET).
+    static AQ_LAMBDA_SCALE: [f32; 13] = [
+        0.25,
+        0.314_980_27,
+        0.396_850_26,
         0.5,
         0.629_960_54,
         0.793_700_5,
@@ -1223,7 +1227,12 @@ fn code_one_ctu(
         1.259_921_1,
         1.587_401,
         2.0,
+        2.519_842,
+        3.174_802,
+        4.0,
     ];
+    const MAX_AQ: i16 = crate::aq::MAX_AQ_OFFSET as i16;
+    const _: () = assert!(AQ_LAMBDA_SCALE.len() == 2 * MAX_AQ as usize + 1);
     let ctu_index = ctu_row * (strides.w / 64) + ctu_col;
     let qg_offsets: [i8; 4] = std::array::from_fn(|quadrant| {
         aq_offsets
@@ -1240,9 +1249,9 @@ fn code_one_ctu(
     if aq_enabled {
         let mean =
             (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
-        let delta = (mean as i16).clamp(-3, 3);
+        let delta = (mean as i16).clamp(-MAX_AQ, MAX_AQ);
         tree.qp = (i16::from(qp) + delta).clamp(0, 51) as u8;
-        tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
+        tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
         tree.aq.target = tree.qp;
     }
     if let Some((luma_mode, mpm)) = ctu_cu64_choice(&mut tree, lu_row0, lu_col0) {
@@ -1318,7 +1327,7 @@ fn code_one_ctu(
         let col = lu_col0 + dx * 32;
         if tree.aq.enabled {
             let target = (i16::from(qp) + i16::from(qg_offsets[quadrant])).clamp(0, 51) as u8;
-            let delta = (i16::from(target) - i16::from(qp)).clamp(-3, 3);
+            let delta = (i16::from(target) - i16::from(qp)).clamp(-MAX_AQ, MAX_AQ);
             let qp_at = |r: usize, c: usize| tree.qp_map[(r / 4) * tree.mode_stride + c / 4];
             let a = if dx == 1 {
                 qp_at(row, col - 1)
@@ -1332,7 +1341,7 @@ fn code_one_ctu(
             };
             let predictor = ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
             tree.qp = target;
-            tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + 3) as usize];
+            tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
             tree.aq = AqCtuState {
                 enabled: true,
                 predictor,
@@ -2931,6 +2940,15 @@ fn chroma_qp_offset_env() -> Option<i8> {
     None
 }
 
+/// Picture-level Cb/Cr QP offset: more chroma bits for textured pictures
+/// (mean 8×8 log-variance ramping from `LOG_VARIANCE_LOW` to `_HIGH`), none
+/// for flat/dark ones whose chroma is already cheap.
+///
+/// `DEPTH` is where the two perceptual metrics disagree: ssimulacra2 keeps
+/// rewarding chroma bits down to −4, ColorVideoVDP prefers 0 (it spends the
+/// bits on luma). −2 is the compromise — against libx265 it is −4.4% / −1.3%
+/// (ssimulacra2 / CVVDP BD-rate) on Kodak and −0.6% / +2.9% on jyrki31,
+/// versus −5.5% / +0.4% and −0.8% / +6.1% at −4.
 pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
     if lossless {
         return 0;
@@ -2938,7 +2956,7 @@ pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
     if let Some(fixed) = chroma_qp_offset_env() {
         return fixed;
     }
-    const DEPTH: f32 = 4.0;
+    const DEPTH: f32 = 2.0;
     const LOG_VARIANCE_LOW: f32 = 1.2;
     const LOG_VARIANCE_HIGH: f32 = 2.6;
     let mean_log_variance = crate::aq::picture_mean_ctu_log_variance(yuv);
@@ -3075,7 +3093,8 @@ impl AqCtuState {
 
 /// Encode HEVC `cu_qp_delta_abs` and `cu_qp_delta_sign_flag`. The absolute
 /// value uses truncated unary with cMax=5, followed by bypass EG0 for larger
-/// values (HEVC §9.3.3.5). AQ clamps offsets to ±3, but the complete binarizer
+/// values (HEVC §9.3.3.5). AQ clamps per-group offsets to ±MAX_AQ_OFFSET (so a
+/// delta against the predicted QP can reach twice that), and the complete binarizer
 /// avoids baking that policy into the syntax writer.
 fn encode_cu_qp_delta<W: CabacWriter>(enc: &mut W, ctx: &mut ContextSet, aq: &mut AqCtuState) {
     if !aq.enabled || aq.coded {

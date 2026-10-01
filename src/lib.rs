@@ -1200,7 +1200,7 @@ fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8) -> Vec<i8> {
 /// One grid cell's window of the full-picture per-QG map, re-indexed to the
 /// cell's local CTU coordinates, plus the cell's slice-QP bias.
 ///
-/// Per-QG offsets are clamped to ±3 (the lambda-scale table), so a cell whose
+/// Per-QG offsets are clamped to ±`MAX_AQ_OFFSET` (the λ-scale table), so a cell whose
 /// mean activity sits far from the picture mean would saturate the clamp and
 /// lose dynamic range. The rounded mean of the cell's real-content offsets is
 /// lifted into the cell's slice QP instead (each grid cell is an independent
@@ -1238,7 +1238,8 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
         0
     };
     for offset in &mut local {
-        *offset = (i32::from(*offset) - i32::from(bias)).clamp(-3, 3) as i8;
+        let max = i32::from(aq::MAX_AQ_OFFSET);
+        *offset = (i32::from(*offset) - i32::from(bias)).clamp(-max, max) as i8;
     }
     (local, bias)
 }
