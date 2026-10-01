@@ -27,12 +27,10 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-mod aq;
 mod dequant;
 mod satd;
 mod transform;
 
-pub(crate) use aq::ctu_activity_neon;
 pub(crate) use dequant::dequantize_neon;
 pub(crate) use satd::satd_neon;
 pub(crate) use transform::{fwd_transform_neon, inv_transform_neon};

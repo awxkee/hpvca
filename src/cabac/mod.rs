@@ -32,7 +32,7 @@ pub(crate) mod engine;
 pub(crate) mod residual;
 
 pub(crate) use contexts::{ContextSet, IntraModeContexts};
-pub(crate) use engine::{CabacEncoder, CabacEstimator, CabacWriter};
+pub(crate) use engine::{CabacEncoder, CabacEstimator, CabacWriter, bin_trace};
 pub(crate) use residual::{
     MAX_PERSISTENT_RICE, advance_residual_contexts, encode_cbf_chroma, encode_cbf_luma,
     encode_residual, estimate_residual_bits,

@@ -1193,6 +1193,22 @@ fn sign_bit_hiding_hdq(
             row * n + col
         };
 
+        // Every HEVC coefficient group is a 4×4 spatial sub-block, so an empty
+        // group — most of a large TB — is rejected with four row reads rather
+        // than a 16-entry scan-order gather.
+        let (r0, c0) = group[0];
+        let (block_row, block_col) = (r0 & !3, c0 & !3);
+        debug_assert!(
+            group
+                .iter()
+                .all(|&(r, c)| r & !3 == block_row && c & !3 == block_col)
+        );
+        if (0..4).all(|k| {
+            let start = (block_row + k) * n + block_col;
+            levels[start..start + 4] == [0; 4]
+        }) {
+            continue;
+        }
         let Some(first_nz) = (0..GROUP_SIZE).find(|&i| levels[row_major(i)] != 0) else {
             continue;
         };
@@ -1930,4 +1946,76 @@ mod tests {
                 .all(|(&a, b)| (a - b).abs() <= 1)
         );
     }
+}
+
+/// Statistics of a plainly quantized TB, for ranking intra mode candidates
+/// before the exact CABAC rate estimate. See [`quantized_tb_stats`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QuantizedTbStats {
+    /// Quantization error, in pixel-domain SSE units.
+    pub(crate) distortion: f32,
+    pub(crate) nonzero: u32,
+    /// Σ log2(1 + |level|) over the significant coefficients.
+    pub(crate) log_levels: f32,
+    /// Scan position of the last significant coefficient.
+    pub(crate) last: usize,
+}
+
+/// Dead-zone quantize `coeff` (no sign hiding, no output) and measure what
+/// the rate proxy and distortion of that TB need, in one scan-order pass.
+///
+/// The distortion is computed in the transform domain: HEVC's core transforms
+/// are orthogonal up to a gain of 2^(15 − bitDepth − log2N) (and a ~1.4%
+/// row-norm excess of the integer matrices), so the coefficient error maps to
+/// pixel SSE without the inverse transform.
+pub(crate) fn quantized_tb_stats(
+    coeff: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scan: &[(usize, usize)],
+) -> QuantizedTbStats {
+    static LOG2_1P: [f32; 16] = [
+        0.0,
+        1.0,
+        1.584_963,
+        2.0,
+        2.321_928,
+        2.584_963,
+        2.807_355,
+        3.0,
+        3.169_925,
+        core::f32::consts::LOG2_10,
+        3.459_432,
+        3.584_963,
+        3.700_44,
+        3.807_355,
+        3.906_891,
+        4.0,
+    ];
+    let log2n = n.trailing_zeros() as i64;
+    let q_bits = 14 + (qp as i64) / 6 + (15 - bit_depth as i64 - log2n);
+    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let offset = 171i64 << (q_bits - 9); // intra, as quantize_impl_into
+    let inv_scale = 1.0f32 / q_scale as f32;
+    let mut stats = QuantizedTbStats::default();
+    let mut coeff_sse = 0.0f32;
+    for (index, &(row, col)) in scan[..n * n].iter().enumerate() {
+        let scaled = (coeff[row * n + col] as i64).abs() * q_scale;
+        let level = (scaled + offset) >> q_bits;
+        let error = (scaled - (level << q_bits)) as f32 * inv_scale;
+        coeff_sse += error * error;
+        if level != 0 {
+            stats.nonzero += 1;
+            stats.last = index;
+            stats.log_levels += if level < 16 {
+                LOG2_1P[level as usize]
+            } else {
+                (1.0 + level as f32).log2()
+            };
+        }
+    }
+    let gain_log2 = 15 - bit_depth as i32 - log2n as i32;
+    stats.distortion = coeff_sse * 1.028 * (-2.0 * gain_log2 as f32).exp2();
+    stats
 }

@@ -104,27 +104,6 @@ impl Speed {
     }
 }
 
-/// Variance-boost controls for low-contrast detail preservation.
-#[derive(Clone, Copy, Debug)]
-pub struct VarianceBoost {
-    /// Ranked 8x8 variance octile selected inside each 64x64 CTU (1..=8).
-    pub octile: u8,
-    /// Boost curve strength (0 disables variance boost; 1..=4 are typical).
-    pub strength: f32,
-    /// Apply only negative QP boosts instead of combining them with activity AQ.
-    pub boost_only: bool,
-}
-
-impl Default for VarianceBoost {
-    fn default() -> Self {
-        Self {
-            octile: 6,
-            strength: 1.0,
-            boost_only: false,
-        }
-    }
-}
-
 impl ParallelismStrategy {
     /// Whether a picture large enough to tile is coded as a HEIF grid.
     fn uses_grid(self) -> bool {
@@ -178,12 +157,13 @@ pub struct EncodeConfig {
     /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
     /// defaults to [`ParallelismStrategy::Auto`].
     pub parallelism: ParallelismStrategy,
-    /// Enable luma Sample Adaptive Offset filtering. SAO currently requires an
-    /// analysis encode before the final encode, so disabling it nearly halves
-    /// the transform/RDO work at a small compression-efficiency cost.
+    /// Enable luma Sample Adaptive Offset filtering. Its parameters are chosen
+    /// after the picture is coded and spliced in by replaying the recorded
+    /// CABAC bins, so it costs only the analysis and the replay (a few percent
+    /// of encode time) plus ~2 bytes of memory per coded bin while a region is
+    /// in flight. It mostly helps PSNR and screen content; on photographs it is
+    /// roughly neutral for perceptual metrics.
     pub sao: bool,
-    /// Low-contrast variance-boost settings.
-    pub variance_boost: VarianceBoost,
     /// Effort tier (speed vs compression efficiency). Defaults to [`Speed::Fast`].
     pub speed: Speed,
     /// Enable the HEVC Screen Content Coding tools (palette mode and intra
@@ -214,7 +194,6 @@ impl Default for EncodeConfig {
             threads: 0, // auto-detect
             parallelism: ParallelismStrategy::GridWpp,
             sao: true,
-            variance_boost: VarianceBoost::default(),
             speed: Speed::default(),
             screen_content: false,
             implicit_rdpcm: false,
@@ -251,18 +230,6 @@ impl EncodeConfig {
     /// Enable or disable luma Sample Adaptive Offset filtering.
     pub fn with_sao(mut self, sao: bool) -> Self {
         self.sao = sao;
-        self
-    }
-
-    /// Configure low-contrast variance boost. `octile` is 1..=8, typical
-    /// `strength` values are 1..=4 (0 disables it), and `boost_only` disables
-    /// the ordinary activity-masking redistribution.
-    pub fn with_variance_boost(mut self, octile: u8, strength: f32, boost_only: bool) -> Self {
-        self.variance_boost = VarianceBoost {
-            octile,
-            strength,
-            boost_only,
-        };
         self
     }
 
@@ -354,12 +321,6 @@ impl EncodeConfig {
 
     fn validate(&self) -> Result<(), EncodeError> {
         validate_quality(self.quality)?;
-        if !(1..=8).contains(&self.variance_boost.octile)
-            || !self.variance_boost.strength.is_finite()
-            || !(0.0..=4.0).contains(&self.variance_boost.strength)
-        {
-            return Err(EncodeError::InvalidInput);
-        }
         Ok(())
     }
 }
@@ -845,7 +806,6 @@ fn encode_rgba_with_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -861,7 +821,6 @@ fn encode_rgba_with_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -952,7 +911,6 @@ fn encode_gray_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -968,7 +926,6 @@ fn encode_gray_alpha_wide(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -1011,7 +968,6 @@ pub fn encode_yuv_with_alpha(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -1035,7 +991,6 @@ pub fn encode_yuv_with_alpha(
         cfg.lossless,
         cfg.color.cicp,
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         cfg.screen_content,
         cfg.implicit_rdpcm,
@@ -1068,7 +1023,6 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         cfg.parallelism.single_tiles(),
         resolve_threads(cfg.threads),
         cfg.sao,
-        cfg.variance_boost,
         cfg.speed,
         None,
         0,
@@ -1179,7 +1133,6 @@ fn grid_global_aq_map(
     bit_depth: BitDepth,
     quality: u8,
     lossless: bool,
-    variance_boost: VarianceBoost,
 ) -> (Option<Vec<i8>>, i8) {
     let qp = hevc::quality_to_qp(quality);
     if lossless {
@@ -1193,40 +1146,25 @@ fn grid_global_aq_map(
         yuv::rgb_to_yuv(src, width, height, ChromaFormat::Monochrome, bit_depth)
     };
     let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, false);
-    let map =
-        aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp, variance_boost));
+    let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp));
     (map, cqo)
 }
 
 /// [`grid_global_aq_map`] for a source that is already a [`Yuv`].
-fn grid_global_aq_map_from_yuv(
-    yuv: &Yuv,
-    quality: u8,
-    lossless: bool,
-    variance_boost: VarianceBoost,
-) -> (Option<Vec<i8>>, i8) {
+fn grid_global_aq_map_from_yuv(yuv: &Yuv, quality: u8, lossless: bool) -> (Option<Vec<i8>>, i8) {
     let qp = hevc::quality_to_qp(quality);
     if lossless {
         return (None, 0);
     }
     let cqo = hevc::adaptive_chroma_qp_offset(yuv, false);
-    let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(yuv, qp, variance_boost));
+    let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(yuv, qp));
     (map, cqo)
 }
 
-fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8, variance_boost: VarianceBoost) -> Vec<i8> {
+fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8) -> Vec<i8> {
     let ctus_x = (luma_yuv.width as usize).div_ceil(64);
     let ctus_y = (luma_yuv.height as usize).div_ceil(64);
-    aq::activity_qp_offsets_clamped(
-        luma_yuv,
-        ctus_x,
-        ctus_y,
-        qp,
-        false,
-        variance_boost,
-        aq::resolve_ctu_activity(),
-        12,
-    )
+    aq::activity_qp_offsets_clamped(luma_yuv, ctus_x, ctus_y, qp, false, 12)
 }
 
 /// One grid cell's window of the full-picture per-QG map, re-indexed to the
@@ -1286,7 +1224,6 @@ fn encode_cell(
     cell_wpp: bool,
     threads: usize,
     sao: bool,
-    variance_boost: VarianceBoost,
     effort: Speed,
     aq_override: Option<&[i8]>,
     qp_bias: i8,
@@ -1314,7 +1251,6 @@ fn encode_cell(
         false,
         wpp_threads,
         sao,
-        variance_boost,
         effort,
         aq_override,
         qp_bias,
@@ -1349,16 +1285,8 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(
-        rgb,
-        width,
-        height,
-        3,
-        bit_depth,
-        cfg.quality,
-        cfg.lossless,
-        cfg.variance_boost,
-    );
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map(rgb, width, height, 3, bit_depth, cfg.quality, cfg.lossless);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1400,7 +1328,6 @@ fn encode_rgb_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1447,16 +1374,8 @@ fn encode_gray_tiled(
     let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(
-        gray,
-        width,
-        height,
-        1,
-        bit_depth,
-        cfg.quality,
-        cfg.lossless,
-        cfg.variance_boost,
-    );
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map(gray, width, height, 1, bit_depth, cfg.quality, cfg.lossless);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1487,7 +1406,6 @@ fn encode_gray_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1535,8 +1453,7 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1591,7 +1508,6 @@ fn encode_yuv_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1621,7 +1537,6 @@ fn encode_yuv_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             None,
             0,
@@ -1676,8 +1591,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless, cfg.variance_boost);
+    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1732,7 +1646,6 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1776,16 +1689,8 @@ fn encode_rgba_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(
-        rgba,
-        width,
-        height,
-        4,
-        bit_depth,
-        cfg.quality,
-        cfg.lossless,
-        cfg.variance_boost,
-    );
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map(rgba, width, height, 4, bit_depth, cfg.quality, cfg.lossless);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1826,7 +1731,6 @@ fn encode_rgba_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1855,7 +1759,6 @@ fn encode_rgba_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             None,
             0,
@@ -1909,16 +1812,8 @@ fn encode_gray_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map(
-        ya,
-        width,
-        height,
-        2,
-        bit_depth,
-        cfg.quality,
-        cfg.lossless,
-        cfg.variance_boost,
-    );
+    let (aq_map, grid_cqo) =
+        grid_global_aq_map(ya, width, height, 2, bit_depth, cfg.quality, cfg.lossless);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1959,7 +1854,6 @@ fn encode_gray_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             cell_aq_offsets,
             cell_qp_bias,
@@ -1987,7 +1881,6 @@ fn encode_gray_alpha_tiled(
             cell_wpp,
             cell_threads,
             cfg.sao,
-            cfg.variance_boost,
             cfg.speed,
             None,
             0,
@@ -2214,25 +2107,6 @@ mod tests {
         assert!(cfg().with_quality(101).validate().is_err());
         assert!(cfg().with_quality(1).validate().is_ok());
         assert!(cfg().with_quality(100).validate().is_ok());
-    }
-
-    #[test]
-    fn validates_variance_boost_options() {
-        assert!(cfg().with_variance_boost(6, 2.0, false).validate().is_ok());
-        assert!(cfg().with_variance_boost(0, 2.0, false).validate().is_err());
-        assert!(cfg().with_variance_boost(9, 2.0, false).validate().is_err());
-        assert!(
-            cfg()
-                .with_variance_boost(6, -1.0, false)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            cfg()
-                .with_variance_boost(6, f32::NAN, false)
-                .validate()
-                .is_err()
-        );
     }
 
     #[test]

@@ -200,13 +200,20 @@ fn deblock_impl(
     }
 }
 
-/// §8.7.2.5.3: the tC table is indexed at Q = QpL + 2·(bS − 1), so a
-/// boundary-strength-1 edge (an IntraBC copy against another copy, with no
-/// coded residual on either side) filters with a strictly smaller clipping
-/// bound than an intra edge.
+/// `pps_tc_offset_div2` written by every PPS. Intra-only pictures never feed
+/// deblocked samples back into prediction, so the filter is a pure post-filter
+/// here; a slightly weaker tC clip preserves texture and measured BD-rate at identical bytes.
+/// −1 and −3 are both worse; the β offset gains nothing and stays 0.
+pub(crate) const TC_OFFSET_DIV2: i32 = -2;
+
+/// §8.7.2.5.3: the tC table is indexed at
+/// Q = QpL + 2·(bS − 1) + 2·slice_tc_offset_div2, so a boundary-strength-1
+/// edge (an IntraBC copy against another copy, with no coded residual on
+/// either side) filters with a strictly smaller clipping bound than an intra
+/// edge.
 #[inline]
 fn tc_offset(bs: u8) -> i32 {
-    2 * (i32::from(bs) - 1)
+    2 * (i32::from(bs) - 1) + 2 * TC_OFFSET_DIV2
 }
 
 #[inline]
@@ -460,7 +467,7 @@ fn deblock_chroma(
                 if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, true);
                     let qp_c = chroma_qp(qpi, chroma, cqo);
-                    let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_c + tc_offset(2)) as usize] << bdshift;
                     filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
                 }
                 yk += 4;
@@ -477,7 +484,7 @@ fn deblock_chroma(
                 if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
                     let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, false);
                     let qp_c = chroma_qp(qpi, chroma, cqo);
-                    let tc = TC_TABLE[clip3(0, 53, qp_c + 2) as usize] << bdshift;
+                    let tc = TC_TABLE[clip3(0, 53, qp_c + tc_offset(2)) as usize] << bdshift;
                     filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
                 }
                 xk += 4;
