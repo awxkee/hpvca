@@ -154,6 +154,16 @@ fn nalu_header(bw: &mut BitWriter, nal_type: u8) {
     bw.write_bits(1, 3); // nuh_temporal_id_plus1 = 1
 }
 
+/// The coded picture size for a `width`×`height` image: the next multiple of
+/// the minimum luma coding block (8, `log2_min_luma_coding_block_size = 3`).
+/// CTBs on the right/bottom edge are partial; CU-quadtree nodes crossing the
+/// picture edge are split implicitly and nodes beyond it are not coded
+/// (§7.3.8.4), so the encoder never codes more than 7 rows/columns of
+/// padding. The conformance window crops to the visible size.
+pub(crate) const fn coded_dim(x: u32) -> u32 {
+    (x + 7) & !7
+}
+
 /// Write the 88-bit decode_profile_tier_level() block (HEVC spec 7.3.3),
 /// then general_level_idc (8 bits).
 pub(crate) fn level_idc_for(w: u32, h: u32) -> u8 {
@@ -299,8 +309,8 @@ pub(crate) fn build_vps(
     scc: bool,
     ibc: bool,
 ) -> Nalu {
-    let coded_w = (width + 63) & !63;
-    let coded_h = (height + 63) & !63;
+    let coded_w = coded_dim(width);
+    let coded_h = coded_dim(height);
     let level = level_idc_for(coded_w, coded_h);
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 32);
@@ -389,7 +399,7 @@ pub(crate) fn build_sps(
     bw.write_bits(0, 3); // sps_max_sub_layers_minus1 = 0
     bw.write_bit(true); // sps_temporal_id_nesting_flag
 
-    let sps_level = level_idc_for((width + 63) & !63, (height + 63) & !63);
+    let sps_level = level_idc_for(coded_dim(width), coded_dim(height));
     write_profile_tier_level(
         &mut bw,
         sps_level,
@@ -409,12 +419,10 @@ pub(crate) fn build_sps(
         bw.write_bit(false); // separate_color_plane_flag = 0
     }
 
-    // Picture dimensions = multiple of the CTB size (64). This declares full CTBs
-    // with no partial boundary CTBs. Empirically Apple's hardware decoder accepts a
-    // LARGER range of sizes with full-CTB declaration than with multiple-of-8 +
-    // partial CTBs, so we round to 64 and let the conformance window crop.
-    let coded_w = (width + 63) & !63;
-    let coded_h = (height + 63) & !63;
+    // Picture dimensions = multiple of the minimum CB (see `coded_dim`); the
+    // conformance window crops the remainder.
+    let coded_w = coded_dim(width);
+    let coded_h = coded_dim(height);
     bw.write_ue(coded_w);
     bw.write_ue(coded_h);
 
@@ -739,8 +747,8 @@ pub(crate) fn encode_intra_opts(
     let sao = sao && !lossless;
     // WPP needs at least two CTU columns to form a wavefront; otherwise fall back
     // to an ordinary single-substream slice.
-    let ctus_x = (((width + 63) & !63) / 64) as usize;
-    let ctus_y = (((height + 63) & !63) / 64) as usize;
+    let ctus_x = (width as usize).div_ceil(64);
+    let ctus_y = (height as usize).div_ceil(64);
     // `wpp` enables Wavefront Parallel Processing (`entropy_coding_sync`). `tiles`
     // additionally splits the picture into a modest grid of HEVC tiles, each
     // internally WPP'd — the two HEVC parallel tools combined (spec-legal, §7.4.3.3):
@@ -1170,7 +1178,7 @@ fn code_one_ctu(
     };
 
     if sao_enabled {
-        let sao_cols = strides.w / 64;
+        let sao_cols = strides.w.div_ceil(64);
         let sao = sao_params
             .and_then(|params| params.get(ctu_row * sao_cols + ctu_col))
             .copied()
@@ -1233,7 +1241,7 @@ fn code_one_ctu(
     ];
     const MAX_AQ: i16 = crate::aq::MAX_AQ_OFFSET as i16;
     const _: () = assert!(AQ_LAMBDA_SCALE.len() == 2 * MAX_AQ as usize + 1);
-    let ctu_index = ctu_row * (strides.w / 64) + ctu_col;
+    let ctu_index = ctu_row * strides.w.div_ceil(64) + ctu_col;
     let qg_offsets: [i8; 4] = std::array::from_fn(|quadrant| {
         aq_offsets
             .get(ctu_index * 4 + quadrant)
@@ -1311,7 +1319,10 @@ fn code_one_ctu(
             return tree.aq.resolved_qp();
         }
     }
-    cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
+    // A CTB crossing the picture edge splits implicitly (no flag).
+    if node_fit(strides, lu_row0, lu_col0, 64) == NodeFit::Inside {
+        cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
+    }
     // One 32×32 quantization group per quadrant. Each derives its predicted QP
     // per §8.6.1: qPY_A/qPY_B come from the already-coded CU left of / above
     // the group's top-left sample when that CU lies in the SAME CTB (the
@@ -1325,6 +1336,11 @@ fn code_one_ctu(
     {
         let row = lu_row0 + dy * 32;
         let col = lu_col0 + dx * 32;
+        // Quadrants beyond the picture edge do not exist: no CU, no
+        // quantization group, and qPY_PREV carries over the last coded one.
+        if node_fit(strides, row, col, 32) == NodeFit::Outside {
+            continue;
+        }
         if tree.aq.enabled {
             let target = (i16::from(qp) + i16::from(qg_offsets[quadrant])).clamp(0, 51) as u8;
             let delta = (i16::from(target) - i16::from(qp)).clamp(-MAX_AQ, MAX_AQ);
@@ -1410,8 +1426,9 @@ fn encode_region_pass(
     use crate::coder_scratch::fill_resize;
     let sub_w = yuv.chroma.sub_w();
     let sub_h = yuv.chroma.sub_h();
-    let w = ((width + 63) & !63) as usize;
-    let h = ((height + 63) & !63) as usize;
+    // Planes are exactly the coded picture; nothing beyond it is coded or read.
+    let w = coded_dim(width) as usize;
+    let h = coded_dim(height) as usize;
     let cw = w / sub_w;
     let ch = h / sub_h;
     let src_yw = yuv.width as usize;
@@ -1447,8 +1464,8 @@ fn encode_region_pass(
         pad_plane_into(rec_cb, &yuv.cb, src_cw, src_ch, cw, ch);
         pad_plane_into(rec_cr, &yuv.cr, src_cw, src_ch, cw, ch);
     }
-    let ctus_x = w / 64;
-    let ctus_y = h / 64;
+    let ctus_x = w.div_ceil(64);
+    let ctus_y = h.div_ceil(64);
     // The SPS profile / range-extension signalling and the residual coder must
     // agree on this; it was resolved once per encode and stored on the scratch.
     let implicit_rdpcm = scratch.implicit_rdpcm;
@@ -1468,6 +1485,7 @@ fn encode_region_pass(
     }
     let strides = PlaneStrides {
         w,
+        h,
         src_yw,
         src_yh,
         cw,
@@ -1749,8 +1767,8 @@ fn encode_region_substreams(
     // unless the caller supplies one sliced from the full picture this region
     // is a tile/grid cell of (local normalization would mis-allocate rate
     // across cells; see `encode_intra_opts`).
-    let ctus_x = (((width + 63) & !63) / 64) as usize;
-    let ctus_y = (((height + 63) & !63) / 64) as usize;
+    let ctus_x = (width as usize).div_ceil(64);
+    let ctus_y = (height as usize).div_ceil(64);
     let computed_offsets;
     let aq_offsets: &[i8] = if let Some(map) = aq_override {
         map
@@ -1808,8 +1826,8 @@ fn encode_region_substreams(
         &mut ws,
         true,
     );
-    let stride = ((width + 63) & !63) as usize;
-    let coded_h = ((height + 63) & !63) as usize;
+    let stride = coded_dim(width) as usize;
+    let coded_h = coded_dim(height) as usize;
     // The deblocked analysis reconstruction is still resident in the workspace.
     let ws_ref = &mut *ws;
     pad_plane_into(
@@ -1833,7 +1851,7 @@ fn encode_region_substreams(
     let substreams = replay_with_sao(
         &analysis.traces,
         &params,
-        stride / 64,
+        stride.div_ceil(64),
         wpp,
         init_context_set(qp, yuv, ws.cc.implicit_rdpcm, ws.cc.persistent_rice, ibc),
         yuv.bit_depth.bits(),
@@ -2107,10 +2125,10 @@ fn build_idr_slice(
             substreams.into_iter().next().unwrap_or_default()
         }
     } else {
-        let w = ((width + 63) & !63) as usize;
-        let h = ((height + 63) & !63) as usize;
-        let ctus_x = w / 64;
-        let ctus_y = h / 64;
+        let w = coded_dim(width) as usize;
+        let h = coded_dim(height) as usize;
+        let ctus_x = w.div_ceil(64);
+        let ctus_y = h.div_ceil(64);
         // Uniform-spacing CTB boundaries (must match the decoder's derivation from
         // num_tile_columns_minus1/num_tile_rows_minus1 in the PPS).
         let col_bd: Vec<usize> = (0..=tile_cols).map(|i| i * ctus_x / tile_cols).collect();
@@ -2120,8 +2138,9 @@ fn build_idr_slice(
             for ti in 0..tile_cols {
                 let x0 = col_bd[ti] * 64;
                 let y0 = row_bd[tj] * 64;
-                let tw = (col_bd[ti + 1] - col_bd[ti]) * 64;
-                let th = (row_bd[tj + 1] - row_bd[tj]) * 64;
+                // The last tile column/row ends at the picture edge, mid-CTB.
+                let tw = (col_bd[ti + 1] * 64).min(w) - x0;
+                let th = (row_bd[tj + 1] * 64).min(h) - y0;
                 bounds.push((x0, y0, tw, th));
             }
         }
@@ -2144,7 +2163,7 @@ fn build_idr_slice(
                 let Some(map) = full_map else {
                     return Vec::new();
                 };
-                let (ltx, lty) = (tw / 64, th / 64);
+                let (ltx, lty) = (tw.div_ceil(64), th.div_ceil(64));
                 let mut local = vec![0i8; ltx * lty * 4];
                 for r in 0..lty {
                     for c in 0..ltx {
@@ -2892,7 +2911,7 @@ fn is_block_decoded(
         return false;
     }
     let blk = 8usize;
-    let ctus_x = width / ctb;
+    let ctus_x = width.div_ceil(ctb);
     let grid = ctb / blk; // sub-blocks per side
     let order = |r: usize, c: usize| -> i64 {
         let ci = (r / ctb) * ctus_x + (c / ctb);
@@ -3481,7 +3500,11 @@ impl CompressionContext {
 /// edge clamping; `sub_w`/`sub_h` are the chroma subsampling factors.
 #[derive(Clone, Copy)]
 struct PlaneStrides {
+    /// Coded picture width = luma plane stride (a multiple of 8, not of the
+    /// CTB size: right-edge CTBs may be partial).
     w: usize,
+    /// Coded picture height.
+    h: usize,
     src_yw: usize,
     src_yh: usize,
     cw: usize,
@@ -3489,6 +3512,28 @@ struct PlaneStrides {
     src_ch: usize,
     sub_w: usize,
     sub_h: usize,
+}
+
+/// How a CU-quadtree node relates to the coded picture (§7.3.8.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeFit {
+    /// Entirely inside: split_cu_flag is coded (above the minimum CB size).
+    Inside,
+    /// Crosses the right/bottom picture edge: the split is inferred, no flag.
+    Crossing,
+    /// Entirely outside: not coded at all.
+    Outside,
+}
+
+#[inline]
+fn node_fit(strides: PlaneStrides, row: usize, col: usize, size: usize) -> NodeFit {
+    if row >= strides.h || col >= strides.w {
+        NodeFit::Outside
+    } else if row + size > strides.h || col + size > strides.w {
+        NodeFit::Crossing
+    } else {
+        NodeFit::Inside
+    }
 }
 
 /// Mutable picture state shared by recursive CU decisions. All maps are indexed
@@ -4024,6 +4069,10 @@ fn rdo_cu32_plan(
     // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
     let flag = tree.lambda;
 
+    if node_fit(tree.strides, row, col, 32) != NodeFit::Inside {
+        return rdo_edge_cu32_plan(tree, row, col, ctx, ictx);
+    }
+
     let cost_32 = cost_leaf(tree, row, col, 32, ctx, ictx);
 
     let mut cost_split = 0.0;
@@ -4057,6 +4106,44 @@ fn rdo_cu32_plan(
             split_32: true,
             split_16,
         }
+    }
+}
+
+/// [`rdo_cu32_plan`] for a 32×32 node crossing the picture edge: its split is
+/// inferred, children beyond the edge do not exist, crossing 16×16 children
+/// split implicitly into their in-picture 8×8s, and only fully-inside 16×16
+/// children still choose between one 16 and four 8s (their flag is coded).
+fn rdo_edge_cu32_plan(
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    ctx: &ContextSet,
+    ictx: &IntraModeContexts,
+) -> Cu32Plan {
+    let flag = tree.lambda;
+    let mut split_16 = [false; 4];
+    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let r = row + dy * 16;
+        let c = col + dx * 16;
+        split_16[index] = match node_fit(tree.strides, r, c, 16) {
+            NodeFit::Outside => false,
+            NodeFit::Crossing => true,
+            NodeFit::Inside => {
+                let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
+                let mut cost_8 = flag;
+                for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                    cost_8 += cost_leaf(tree, r + ey * 8, c + ex * 8, 8, ctx, ictx);
+                }
+                cost_8 < cost_16
+            }
+        };
+    }
+    Cu32Plan {
+        split_32: true,
+        split_16,
     }
 }
 
@@ -4106,6 +4193,7 @@ fn ctu_cu64_choice(tree: &mut CuTreeState<'_>, row: usize, col: usize) -> Option
     // pred_mode_flag for a P slice and no palette_mode_flag. It is disabled by
     // default; keep it off entirely once those elements are in the syntax.
     if !cu64_enabled()
+        || node_fit(tree.strides, row, col, 64) != NodeFit::Inside
         || tree.lossless
         || tree.scc
         || tree.ibc
@@ -4169,7 +4257,7 @@ fn ctu_cu64_choice(tree: &mut CuTreeState<'_>, row: usize, col: usize) -> Option
                 height: coded_yh,
                 n: 32,
                 ctu: 64,
-                ctus_x: stride / 64,
+                ctus_x: stride.div_ceil(64),
                 min_pu: 8,
                 neutral,
             },
@@ -4284,7 +4372,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 height: coded_yh,
                 n: 32,
                 ctu: 64,
-                ctus_x: stride / 64,
+                ctus_x: stride.div_ceil(64),
                 min_pu: 8,
                 neutral,
             },
@@ -4433,7 +4521,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                     sub_h: 2,
                     luma_w: stride,
                     luma_h: coded_yh,
-                    luma_ctus_x: stride / 64,
+                    luma_ctus_x: stride.div_ceil(64),
                     min_luma_pu: 8,
                     cur_luma_row: row + dy * 32,
                     cur_luma_col: col + dx * 32,
@@ -4496,7 +4584,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 sub_h: 2,
                 luma_w: stride,
                 luma_h: coded_yh,
-                luma_ctus_x: stride / 64,
+                luma_ctus_x: stride.div_ceil(64),
                 min_luma_pu: 8,
                 cur_luma_row: row + dy * 32,
                 cur_luma_col: col + dx * 32,
@@ -4736,14 +4824,20 @@ fn commit_cu32_plan(
     depth: u8,
     plan: Cu32Plan,
 ) {
-    let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.cu_stride);
-    if !plan.split_32 {
-        cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
-        encode_cu_leaf(cab, ctx, ictx, state, row, col, 32, depth);
-        return;
+    // Nodes crossing the picture edge split implicitly: no split_cu_flag.
+    let fit_32 = node_fit(state.strides, row, col, 32);
+    debug_assert!(fit_32 != NodeFit::Outside);
+    debug_assert!(plan.split_32 || fit_32 == NodeFit::Inside);
+    if fit_32 == NodeFit::Inside {
+        let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.cu_stride);
+        if !plan.split_32 {
+            cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
+            encode_cu_leaf(cab, ctx, ictx, state, row, col, 32, depth);
+            return;
+        }
+        cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
     }
 
-    cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
     for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
         .into_iter()
         .enumerate()
@@ -4751,6 +4845,10 @@ fn commit_cu32_plan(
         let child_row = row + dy * 16;
         let child_col = col + dx * 16;
         let child_depth = depth + 1;
+        let fit_16 = node_fit(state.strides, child_row, child_col, 16);
+        if fit_16 == NodeFit::Outside {
+            continue;
+        }
         let child_ctx = split_cu_context(
             state.cu_depth,
             child_row,
@@ -4758,19 +4856,18 @@ fn commit_cu32_plan(
             child_depth,
             state.cu_stride,
         );
-        if plan.split_16[index] {
-            cab.encode_bin(1, &mut ctx.split_cu_flag[child_ctx]);
+        if plan.split_16[index] || fit_16 == NodeFit::Crossing {
+            if fit_16 == NodeFit::Inside {
+                cab.encode_bin(1, &mut ctx.split_cu_flag[child_ctx]);
+            }
             for (cy, cx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                encode_cu_leaf(
-                    cab,
-                    ctx,
-                    ictx,
-                    state,
-                    child_row + cy * 8,
-                    child_col + cx * 8,
-                    8,
-                    child_depth + 1,
-                );
+                let (r8, c8) = (child_row + cy * 8, child_col + cx * 8);
+                // The picture is a multiple of the 8×8 minimum CB, so an 8×8
+                // node is either fully inside or absent.
+                if node_fit(state.strides, r8, c8, 8) == NodeFit::Outside {
+                    continue;
+                }
+                encode_cu_leaf(cab, ctx, ictx, state, r8, c8, 8, child_depth + 1);
             }
         } else {
             cab.encode_bin(0, &mut ctx.split_cu_flag[child_ctx]);
@@ -4807,7 +4904,7 @@ fn commit_lossless_luma_leaf(
     let len = size * size;
     let row = root_row + rel_row;
     let col = root_col + rel_col;
-    let ctus_x = stride / 64;
+    let ctus_x = stride.div_ceil(64);
     let (corner0, above0, left0) = intra::get_reference_samples(
         rec_y,
         intra::LumaRefGeometry {
@@ -5083,7 +5180,7 @@ fn commit_lossless_chroma_leaf(
                     sub_h,
                     luma_w: yw_stride,
                     luma_h: coded_yh,
-                    luma_ctus_x: yw_stride / 64,
+                    luma_ctus_x: yw_stride.div_ceil(64),
                     min_luma_pu: luma_size,
                     cur_luma_row: luma_row + t * side * sub_h,
                     cur_luma_col: luma_col,
@@ -5334,7 +5431,7 @@ fn commit_split_luma(
     let log2_child = child.trailing_zeros();
     let scan_idx = dct::scan_idx_for(mode, log2_child, true, false);
     let scan = dct::coeff_scan(log2_child, scan_idx);
-    let ctus_x = stride / 64;
+    let ctus_x = stride.div_ceil(64);
     let mut residual_ctx = ctx.clone();
     let mut any_nonzero = false;
 
@@ -5556,7 +5653,7 @@ fn commit_split_chroma(
     let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
     let scan_idx = dct::scan_idx_for(mode, child_log2, false, is_444);
     let scan = dct::coeff_scan(child_log2, scan_idx);
-    let luma_ctus_x = yw_stride / 64;
+    let luma_ctus_x = yw_stride.div_ceil(64);
     let ch_row = lu_row / sub_h;
     let ch_col = lu_col / sub_w;
     let mut residual_ctx = ctx_after_luma.clone();
@@ -5844,7 +5941,7 @@ fn evaluate_chroma_mode(
     let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
     let scan_idx = dct::scan_idx_for(candidate.pred_mode, log2_side, false, is_444);
     let scan = dct::coeff_scan(log2_side, scan_idx);
-    let luma_ctus_x = yw_stride / 64;
+    let luma_ctus_x = yw_stride.div_ceil(64);
     let ch_row = lu_row / sub_h;
     let ch_col = lu_col / sub_w;
     let mut distortion = 0.0f32;
@@ -6182,7 +6279,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
                 sub_h: 1,
                 luma_w: yw_stride,
                 luma_h: coded_yh,
-                luma_ctus_x: yw_stride / 64,
+                luma_ctus_x: yw_stride.div_ceil(64),
                 min_luma_pu: 4,
                 cur_luma_row: row,
                 cur_luma_col: col,
@@ -6443,7 +6540,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 height: coded_yh,
                 n: PU,
                 ctu: 64,
-                ctus_x: yw_stride / 64,
+                ctus_x: yw_stride.div_ceil(64),
                 min_pu: 4,
                 neutral,
             },
@@ -6806,7 +6903,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                         sub_h: chroma.sub_h(),
                         luma_w: yw_stride,
                         luma_h: coded_yh,
-                        luma_ctus_x: yw_stride / 64,
+                        luma_ctus_x: yw_stride.div_ceil(64),
                         min_luma_pu: 8,
                         // 4:2:2 stacks two square TBs; anchor each at its own luma row.
                         cur_luma_row: lu_row + stack_index * side * chroma.sub_h(),
@@ -7410,7 +7507,7 @@ fn encode_cu<W: CabacWriter>(
             height: coded_yh,
             n: lu,
             ctu: 64,
-            ctus_x: yw_stride / 64,
+            ctus_x: yw_stride.div_ceil(64),
             min_pu: 8,
             neutral,
         },
@@ -8081,7 +8178,7 @@ fn encode_cu<W: CabacWriter>(
     let chroma_lambda = lambda * chroma_lambda_scale(qp_slice, chroma, cqo);
     let sub_w = chroma.sub_w();
     let sub_h = chroma.sub_h();
-    let luma_ctus_x = yw_stride / 64;
+    let luma_ctus_x = yw_stride.div_ceil(64);
     let ctb = lu / sub_w; // chroma TB side: 4 through 32
     let log2_ctb = ctb.trailing_zeros();
     let is_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444);
@@ -8788,6 +8885,7 @@ fn code_one_cu<W: CabacWriter>(
     } = coding;
     let PlaneStrides {
         w,
+        h: _,
         src_yw,
         src_yh,
         cw,
@@ -10446,18 +10544,68 @@ mod tests {
 
     #[test]
     fn sps_conformance_window() {
-        let sps = build_sps(
-            64,
-            48,
-            crate::fmt::ChromaFormat::Yuv420,
-            crate::fmt::BitDepth::Eight,
-            Some(&crate::color::Cicp::srgb()),
-            false,
-            false,
-            false,
-            true,
-        );
-        assert!(sps.data.len() > 10);
+        // The coded picture is the next multiple of the 8×8 minimum CB (not of
+        // the 64×64 CTB); the conformance window crops it, in chroma units.
+        for ((w, h), coded, crop) in [
+            ((64, 48), (64, 48), None),
+            ((34, 18), (40, 24), Some((3, 3))),
+            ((1174, 842), (1176, 848), Some((1, 3))),
+        ] {
+            let sps = build_sps(
+                w,
+                h,
+                crate::fmt::ChromaFormat::Yuv420,
+                crate::fmt::BitDepth::Eight,
+                Some(&crate::color::Cicp::srgb()),
+                false,
+                false,
+                false,
+                true,
+            );
+            // NAL header (2 bytes), sps_vps_id/max_sub_layers/nesting (1 byte),
+            // profile_tier_level with no sub-layers (12 bytes).
+            let mut pos = 15 * 8;
+            let bit = |p: usize| u32::from((sps.data[p / 8] >> (7 - p % 8)) & 1);
+            let mut ue = || {
+                let mut zeros = 0;
+                while bit(pos) == 0 {
+                    zeros += 1;
+                    pos += 1;
+                }
+                pos += 1;
+                let mut value = 0u32;
+                for _ in 0..zeros {
+                    value = (value << 1) | bit(pos);
+                    pos += 1;
+                }
+                (1 << zeros) - 1 + value
+            };
+            let _sps_id = ue();
+            assert_eq!(ue(), 1, "chroma_format_idc");
+            assert_eq!((ue(), ue()), coded, "pic size for {w}x{h}");
+            let window = bit(pos) == 1;
+            pos += 1;
+            let crop_got = window.then(|| {
+                let mut ue = || {
+                    let mut zeros = 0;
+                    while bit(pos) == 0 {
+                        zeros += 1;
+                        pos += 1;
+                    }
+                    pos += 1;
+                    let mut value = 0u32;
+                    for _ in 0..zeros {
+                        value = (value << 1) | bit(pos);
+                        pos += 1;
+                    }
+                    (1 << zeros) - 1 + value
+                };
+                let (left, right, top, bottom) = (ue(), ue(), ue(), ue());
+                assert_eq!((left, top), (0, 0));
+                (right, bottom)
+            });
+            assert_eq!(crop_got, crop, "conformance window for {w}x{h}");
+        }
     }
 
     #[test]
