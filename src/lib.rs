@@ -726,7 +726,15 @@ fn encode_rgb_wide(
             ycgco::rgb_to_gbr(&padded, enc_w, enc_h, cfg.chroma, bit_depth)
         } else {
             yuv::rgb_to_yuv_into(
-                &padded, enc_w, enc_h, cfg.chroma, bit_depth, conv_y, conv_cb, conv_cr,
+                &padded,
+                enc_w,
+                enc_h,
+                cfg.chroma,
+                bit_depth,
+                &yuv::YcbcrMatrix::new(cfg.color.cicp, bit_depth),
+                conv_y,
+                conv_cb,
+                conv_cr,
             )
         };
         ws.stage = padded;
@@ -735,7 +743,15 @@ fn encode_rgb_wide(
         ycgco::rgb_to_gbr(rgb, width, height, cfg.chroma, bit_depth)
     } else {
         yuv::rgb_to_yuv_into(
-            rgb, width, height, cfg.chroma, bit_depth, conv_y, conv_cb, conv_cr,
+            rgb,
+            width,
+            height,
+            cfg.chroma,
+            bit_depth,
+            &yuv::YcbcrMatrix::new(cfg.color.cicp, bit_depth),
+            conv_y,
+            conv_cb,
+            conv_cr,
         )
     };
     yuv = yuv.with_display(width, height);
@@ -797,7 +813,14 @@ fn encode_rgba_with_alpha_wide(
         }
     }
 
-    let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_w, enc_h, cfg.chroma, bit_depth);
+    let color_yuv = yuv::rgb_to_yuv(
+        &color_buf,
+        enc_w,
+        enc_h,
+        cfg.chroma,
+        bit_depth,
+        &yuv::YcbcrMatrix::new(cfg.color.cicp, bit_depth),
+    );
     let color_stream = hevc::encode_intra(
         &color_yuv,
         enc_w,
@@ -1143,7 +1166,14 @@ fn grid_global_aq_map(
         let y: Vec<u16> = src.iter().step_by(2).copied().collect();
         build_mono_yuv(y, width, height, width, height, bit_depth)
     } else {
-        yuv::rgb_to_yuv(src, width, height, ChromaFormat::Monochrome, bit_depth)
+        yuv::rgb_to_yuv(
+            src,
+            width,
+            height,
+            ChromaFormat::Monochrome,
+            bit_depth,
+            &yuv::YcbcrMatrix::new(None, bit_depth),
+        )
     };
     let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, false);
     let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp));
@@ -1312,6 +1342,7 @@ fn encode_rgb_tiled(
                 enc_th,
                 cfg.chroma,
                 bit_depth,
+                &yuv::YcbcrMatrix::new(cfg.color.cicp, bit_depth),
                 std::mem::take(&mut ws.conv_y),
                 std::mem::take(&mut ws.conv_cb),
                 std::mem::take(&mut ws.conv_cr),
@@ -1720,7 +1751,14 @@ fn encode_rgba_alpha_tiled(
             *alpha = px[3];
         }
 
-        let color_yuv = yuv::rgb_to_yuv(&color_buf, enc_tw, enc_th, cfg.chroma, bit_depth);
+        let color_yuv = yuv::rgb_to_yuv(
+            &color_buf,
+            enc_tw,
+            enc_th,
+            cfg.chroma,
+            bit_depth,
+            &yuv::YcbcrMatrix::new(cfg.color.cicp, bit_depth),
+        );
         let color = encode_cell(
             &color_yuv,
             enc_tw,
@@ -2225,7 +2263,14 @@ mod tests {
     #[test]
     fn encode_yuv_roundtrips() {
         let rgb = vec![128u16; 16 * 16 * 3];
-        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv420, BitDepth::Eight);
+        let yuv = yuv::rgb_to_yuv(
+            &rgb,
+            16,
+            16,
+            ChromaFormat::Yuv420,
+            BitDepth::Eight,
+            &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
+        );
         let out = encode_yuv(&yuv, &cfg()).unwrap();
         assert!(out.len() > 100);
         assert_eq!(&out[4..8], b"ftyp");
@@ -2330,7 +2375,14 @@ mod tests {
     #[test]
     fn tiled_yuv_produces_grid_heic() {
         let rgb = vec![200u16; 1024 * 768 * 3];
-        let yuv = yuv::rgb_to_yuv(&rgb, 1024, 768, ChromaFormat::Yuv420, BitDepth::Eight);
+        let yuv = yuv::rgb_to_yuv(
+            &rgb,
+            1024,
+            768,
+            ChromaFormat::Yuv420,
+            BitDepth::Eight,
+            &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
+        );
         let out = encode_yuv(&yuv, &cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
@@ -2458,7 +2510,14 @@ mod tests {
     #[test]
     fn encode_yuv_with_alpha_roundtrips() {
         let rgb = vec![128u16; 16 * 16 * 3];
-        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv420, BitDepth::Eight);
+        let yuv = yuv::rgb_to_yuv(
+            &rgb,
+            16,
+            16,
+            ChromaFormat::Yuv420,
+            BitDepth::Eight,
+            &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
+        );
         let alpha = vec![200u16; 16 * 16];
         let out = encode_yuv_with_alpha(&yuv, &alpha, &cfg()).unwrap();
         assert!(out.len() > 100);
@@ -2473,7 +2532,14 @@ mod tests {
     #[test]
     fn encode_yuv_with_alpha_444_roundtrips() {
         let rgb = vec![64u16; 16 * 16 * 3];
-        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv444, BitDepth::Eight);
+        let yuv = yuv::rgb_to_yuv(
+            &rgb,
+            16,
+            16,
+            ChromaFormat::Yuv444,
+            BitDepth::Eight,
+            &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
+        );
         let alpha = vec![255u16; 16 * 16];
         let out = encode_yuv_with_alpha(&yuv, &alpha, &cfg()).unwrap();
         assert_eq!(&out[4..8], b"ftyp");
@@ -2482,7 +2548,14 @@ mod tests {
     #[test]
     fn encode_yuv_with_alpha_rejects_bad_alpha_len() {
         let rgb = vec![128u16; 16 * 16 * 3];
-        let yuv = yuv::rgb_to_yuv(&rgb, 16, 16, ChromaFormat::Yuv420, BitDepth::Eight);
+        let yuv = yuv::rgb_to_yuv(
+            &rgb,
+            16,
+            16,
+            ChromaFormat::Yuv420,
+            BitDepth::Eight,
+            &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
+        );
         let short_alpha = vec![0u16; 16 * 16 - 1];
         assert!(encode_yuv_with_alpha(&yuv, &short_alpha, &cfg()).is_err());
     }

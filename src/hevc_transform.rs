@@ -129,6 +129,10 @@ pub(crate) static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 /// selects coefficient levels, coefficient-group significance, CBF and the last
 /// position; no second magnitude replay is needed.
 pub(crate) struct RdoqScratch {
+    /// Whether the perceptual distortion weights apply (see `RDOQ_HF_WEIGHT`).
+    /// Cleared while ranking mode candidates, whose RD comparison measures
+    /// plain pixel SSE; only the committed coefficients are weighted.
+    pub(crate) perceptual: bool,
     cost_coeff: [f32; MAX_TB],
     cost_coeff0: [f32; MAX_TB],
     cost_sig: [f32; MAX_TB],
@@ -151,6 +155,7 @@ const RDOQ_HF_START: f32 = 0.7;
 impl RdoqScratch {
     pub(crate) fn new() -> Self {
         Self {
+            perceptual: true,
             cost_coeff: [0.0; MAX_TB],
             cost_coeff0: [0.0; MAX_TB],
             cost_sig: [0.0; MAX_TB],
@@ -720,7 +725,11 @@ fn rdoq_with_sign_hiding_into(
         lambda,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
-    let (dc_weight, hf_weight) = (RDOQ_DC_WEIGHT, RDOQ_HF_WEIGHT);
+    let (dc_weight, hf_weight) = if scratch.perceptual {
+        (RDOQ_DC_WEIGHT, RDOQ_HF_WEIGHT)
+    } else {
+        (1.0, 1.0)
+    };
     let hf_start = (RDOQ_HF_START * n as f32) as usize;
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
@@ -738,6 +747,7 @@ fn rdoq_with_sign_hiding_into(
     let distortion = RdoqDistortion::new(n, qp, bit_depth);
 
     let RdoqScratch {
+        perceptual: _,
         cost_coeff,
         cost_coeff0,
         cost_sig,

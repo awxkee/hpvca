@@ -3843,41 +3843,6 @@ fn fast_cu_split_score(state: &CuTreeState<'_>, row: usize, col: usize, size: us
     score
 }
 
-/// Build the complete representable 32→16→8 CU plan without coding either
-/// branch. Five source scans (one 32×32 and four 16×16) replace up to 21
-/// transform/quantize/reconstruct leaf trials from the previous implementation.
-#[allow(dead_code)]
-fn fast_cu32_plan(state: &CuTreeState<'_>, row: usize, col: usize) -> Cu32Plan {
-    let parent_score = fast_cu_split_score(state, row, col, 32);
-    // Flat/coherent 32×32 nodes dominate natural images. Avoid even the four
-    // child scans when the parent is nowhere near the split threshold.
-    if parent_score < 0.20 {
-        return Cu32Plan::default();
-    }
-
-    let mut child_scores = [0.0f32; 4];
-    for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
-        .into_iter()
-        .enumerate()
-    {
-        child_scores[index] = fast_cu_split_score(state, row + dy * 16, col + dx * 16, 16);
-    }
-
-    let split_children = child_scores.iter().filter(|&&score| score >= 1.0).count();
-    let strongest_child = child_scores.iter().copied().fold(0.0f32, f32::max);
-    let split_32 = parent_score >= 1.0
-        || split_children >= 2
-        || (strongest_child >= 2.0 && parent_score >= 0.45);
-    if !split_32 {
-        return Cu32Plan::default();
-    }
-
-    Cu32Plan {
-        split_32: true,
-        split_16: child_scores.map(|score| score >= 1.0),
-    }
-}
-
 /// SSE (luma + chroma) between the reconstruction and the source over the
 /// `size×size` luma region at (row, col). Source reads are clamped to the true
 /// picture extent so partial edge CUs compare against replicated borders.
@@ -4017,36 +3982,17 @@ fn cost_leaf_with_aq(
     cu_region_sse(tree, row, col, size) + tree.lambda * est.bits()
 }
 
-/// Source-proxy confidence band for the hybrid CU-quadtree search. Below the
-/// band the node is confidently a single 32 (no trials). Within the band
-/// (ambiguous, near the proxy's own split point of 1.0) real trials always run.
-/// Above the band the proxy's *no-split* verdict is trusted, but its split
-/// plan is not: textured nodes run the real trials at every QP, seeded by the
-/// proxy plan's 8-trial gates.
+/// Rate–distortion CU-quadtree decision for one 32×32 region: the real J of
+/// {32} vs {four 16s, each the cheaper of a 16 and its four 8s}, measured by
+/// actually encoding each candidate (`cost_leaf`), with an exact early exit
+/// once the accumulated split cost reaches the whole-32 cost.
 ///
-/// These trials were once skipped below QP 23 to save time at high quality.
-/// That was wrong and cost 2.6–3.7% BD-rate there: `fast_cu_split_score`
-/// divides its predicted gain by a λ-scaled rate penalty, so as QP falls the
-/// score rises and *every* node lands above the band — exactly where the
-/// proxy's structural plan is trusted blindly. High quality is therefore the
-/// regime that needs the trials most, not least.
-///
-/// (A cheaper SATD-domain estimator was tried in place of the real trials but did
-/// not help: with an uncoded region of `rec_y` holding the source, every block
-/// size predicts from near-perfect source neighbours, so SATD cannot see the
-/// split benefit — that signal only appears once real reconstruction + RDOQ +
-/// CABAC rate are measured, i.e. `cost_leaf`.)
-const CU_RDO_BAND_LOW: f32 = 0.25;
-const CU_RDO_BAND_HIGH: f32 = 3.0;
-/// Within an RDO'd 32, a 16 quadrant only trials its four-8 split when the proxy
-/// itself sees sub-block texture there.
-const CU_RDO_SPLIT8_GATE: f32 = 0.30;
-
-/// Hybrid rate–distortion CU-quadtree decision for one 32×32 region.
-/// - proxy score < LOW → confidently flat: commit a single 32, no trials.
-/// - proxy score ≥ HIGH → trust its no-split verdict, trial its split plan.
-/// - otherwise → measure real J of {32} vs {four 16s, each the cheaper of
-///   16 / four-8} by actually encoding each surviving candidate, and keep it.
+/// A source-statistics proxy (`fast_cu_split_score`) used to skip trials on
+/// "confidently flat" 32s, trust its no-split verdict on textured ones and gate
+/// the 8×8 walk. Trialling every node instead costs ~3% encode time and is
+/// worth −8.5% ssimulacra2 / −4.9% CVVDP BD-rate on screen content (photos
+/// unchanged on average): sharp synthetic edges are exactly where a source
+/// proxy misjudges the coded cost.
 ///
 /// The winning [`Cu32Plan`] is committed once by [`commit_cu32_plan`].
 fn rdo_cu32_plan(
@@ -4056,35 +4002,12 @@ fn rdo_cu32_plan(
     ctx: &ContextSet,
     ictx: &IntraModeContexts,
 ) -> Cu32Plan {
-    let score = fast_cu_split_score(tree, row, col, 32);
-    if score < CU_RDO_BAND_LOW {
-        return Cu32Plan::default();
-    }
-    // Above the band the proxy's *no-split* verdict is still trusted (rare for
-    // high scores, and those nodes are confidently coherent); its split plan is
-    // no longer trusted structurally — it only seeds the 8-trial gates below.
-    let trusted = score >= CU_RDO_BAND_HIGH;
-    let plan = if trusted {
-        let plan = fast_cu32_plan(tree, row, col);
-        if !plan.split_32 {
-            return plan;
-        }
-        Some(plan)
-    } else {
-        None
-    };
-
     // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
     let flag = tree.lambda;
 
     let cost_32 = cost_leaf(tree, row, col, 32, ctx, ictx);
 
-    // Flag accounting differs slightly by region (kept as separately tuned):
-    // the trusted path charges the root split_cu_flag and prices the 8-walk
-    // bare; the band path skips the root flag and folds one flag into the
-    // 8-walk. Both were validated empirically — see the E5 sweep.
-    let (root_flag, walk_flag) = if trusted { (flag, 0.0) } else { (0.0, flag) };
-    let mut cost_split = root_flag;
+    let mut cost_split = 0.0;
     let mut split_16 = [false; 4];
     for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
         .into_iter()
@@ -4099,21 +4022,10 @@ fn rdo_cu32_plan(
             return Cu32Plan::default();
         }
         let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
-        // Only trial the four-8 split where the proxy sees real sub-block
-        // texture (the proxy's own split threshold when its plan is available).
-        let try_8 = match &plan {
-            Some(plan) => plan.split_16[index],
-            None => fast_cu_split_score(tree, r, c, 16) >= CU_RDO_SPLIT8_GATE,
-        };
-        let cost_8 = if try_8 {
-            let mut sum = walk_flag;
-            for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
-                sum += cost_leaf(tree, r + ey * 8, c + ex * 8, 8, ctx, ictx);
-            }
-            sum
-        } else {
-            f32::INFINITY
-        };
+        let mut cost_8 = flag;
+        for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+            cost_8 += cost_leaf(tree, r + ey * 8, c + ex * 8, 8, ctx, ictx);
+        }
         // Both sub-options pay this 16-level split_cu_flag (0 or 1).
         split_16[index] = cost_8 < cost_16;
         cost_split += cost_16.min(cost_8);
@@ -4158,7 +4070,8 @@ fn cu64_enabled() -> bool {
 }
 
 fn cu64_gate() -> f32 {
-    CU_RDO_BAND_LOW
+    // A CTU is a 64×64-CU candidate only if every quadrant is this flat.
+    0.25
 }
 
 fn cu64_margin() -> f32 {
@@ -6639,6 +6552,9 @@ fn encode_cu_nxn<W: CabacWriter>(
                     scan_idx,
                     lambda,
                 };
+                // Candidates are compared on plain pixel SSE, so rank them
+                // with plain-SSE RDOQ; the winner is re-quantized perceptually.
+                scratch.rdoq.perceptual = false;
                 crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                     &tb,
                     1,
@@ -6646,6 +6562,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                     &mut scratch.levels,
                     &mut scratch.rdoq,
                 );
+                scratch.rdoq.perceptual = true;
             } else {
                 crate::hevc_transform::quantize_with_sign_hiding_into(
                     &scratch.coeff,
@@ -7749,12 +7666,18 @@ fn encode_cu<W: CabacWriter>(
                     scan_idx,
                     lambda,
                 };
+                // Candidates are compared on plain pixel SSE, so rank them
+                // with plain-SSE RDOQ (−0.7% BD-rate on both perceptual
+                // metrics vs weighted); the winner is re-quantized
+                // perceptually.
+                scratch.rdoq.perceptual = false;
                 crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
                     &tb,
                     &trial_ctx,
                     &mut scratch.levels,
                     &mut scratch.rdoq,
                 );
+                scratch.rdoq.perceptual = true;
             } else {
                 crate::hevc_transform::quantize_with_sign_hiding_into(
                     &scratch.coeff,
