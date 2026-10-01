@@ -2291,18 +2291,22 @@ mod tests {
     }
 
     #[test]
-    fn odd_dimensions_reported_in_ispe() {
+    fn odd_dimensions_reported_in_clap() {
+        // `ispe` is the decoded (chroma-aligned) size; the visible size lives
+        // in the `clap` crop. See also
+        // `odd_size_420_declares_the_decoded_size_and_crops_with_clap`.
         let rgb = vec![100u8; 281 * 181 * 3];
         let out = encode_rgb(&rgb, 281, 181, &cfg().with_chroma(ChromaFormat::Yuv420)).unwrap();
-
-        let ispe = out
-            .array_windows::<4>()
-            .position(|w| w == b"ispe")
-            .expect("ispe");
-        let wpos = ispe + 4 + 4;
-        let w = u32::from_be_bytes(out[wpos..wpos + 4].try_into().unwrap());
-        let h = u32::from_be_bytes(out[wpos + 4..wpos + 8].try_into().unwrap());
-        assert_eq!((w, h), (281, 181));
+        let be = |at: usize| u32::from_be_bytes(out[at..at + 4].try_into().unwrap());
+        let find = |tag: &[u8; 4]| {
+            out.array_windows::<4>()
+                .position(|w| w == tag)
+                .expect("box present")
+        };
+        let ispe = find(b"ispe");
+        assert_eq!((be(ispe + 8), be(ispe + 12)), (282, 182));
+        let clap = find(b"clap");
+        assert_eq!((be(clap + 4), be(clap + 12)), (281, 181));
     }
 
     #[test]
@@ -2558,5 +2562,27 @@ mod tests {
         );
         let short_alpha = vec![0u16; 16 * 16 - 1];
         assert!(encode_yuv_with_alpha(&yuv, &short_alpha, &cfg()).is_err());
+    }
+
+    #[test]
+    fn odd_size_420_declares_the_decoded_size_and_crops_with_clap() {
+        // 4:2:0 cannot crop an odd row/column in the SPS conformance window,
+        // so the decoder outputs 34×18; `ispe` must say so and `clap` must
+        // crop to the visible 33×17 (libheif rejects an `ispe` mismatch).
+        let (w, h) = (33u32, 17u32);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        for parallelism in [ParallelismStrategy::Single, ParallelismStrategy::Wpp] {
+            let cfg = EncodeConfig::default()
+                .with_chroma(ChromaFormat::Yuv420)
+                .with_parallelism(parallelism);
+            let data = encode_rgb(&rgb, w, h, &cfg).unwrap();
+            let find = |tag: &[u8; 4]| data.windows(4).position(|win| win == tag).unwrap();
+            let be = |at: usize| u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
+            let ispe = find(b"ispe");
+            assert_eq!((be(ispe + 8), be(ispe + 12)), (34, 18));
+            let clap = find(b"clap");
+            assert_eq!((be(clap + 4), be(clap + 12)), (33, 17));
+            assert_eq!((be(clap + 20) as i32, be(clap + 28) as i32), (-1, -1));
+        }
     }
 }
