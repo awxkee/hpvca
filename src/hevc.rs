@@ -1220,8 +1220,8 @@ fn code_one_ctu(
         scratch,
     };
     // With depth-0 leaves possible, the root split_cu_flag context must derive
-    // from real neighbour CU depths (a hardcoded neighbour-exists shortcut would
-    // desync the moment any neighbouring CTU is coded as a single 64×64 CU).
+    // from real neighbor CU depths (a hardcoded neighbor-exists shortcut would
+    // desync the moment any neighboring CTU is coded as a single 64×64 CU).
     let root_ctx = split_cu_context(tree.cu_depth, lu_row0, lu_col0, 0, tree.cu_stride);
     // λ ∝ 2^(QP/3): the scale for a QP offset of −6..=6 (MAX_AQ_OFFSET).
     static AQ_LAMBDA_SCALE: [f32; 13] = [
@@ -4215,7 +4215,7 @@ fn ctu_cu64_choice(tree: &mut CuTreeState<'_>, row: usize, col: usize) -> Option
     let neutral = tree.yuv.bit_depth.neutral();
     let max_val = tree.yuv.bit_depth.max_val();
 
-    // MPM derivation for the CU at the CTU origin: the above neighbour is in the
+    // MPM derivation for the CU at the CTU origin: the above neighbor is in the
     // previous CTB row, so cand_b is always DC (same rule as `encode_cu`).
     let mode_at = |r: usize, c: usize| tree.mode_map[(r / 4) * tree.mode_stride + c / 4];
     let cand_a = if col > 0 && is_block_decoded(row, col - 1, row, col, 64, stride) {
@@ -5438,7 +5438,7 @@ fn commit_split_luma(
     // HEVC performs intra prediction per transform block, not once per CU: each
     // child TB is predicted from the reconstructed samples of the TBs decoded
     // before it (in Z-order, including its siblings inside this CU). Reconstruct
-    // straight into rec_y so the next child sees the updated neighbours, exactly
+    // straight into rec_y so the next child sees the updated neighbors, exactly
     // as the decoder does.
     for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
         .into_iter()
@@ -5659,7 +5659,7 @@ fn commit_split_chroma(
     let mut residual_ctx = ctx_after_luma.clone();
 
     // HEVC predicts each chroma transform block from its own reconstructed
-    // neighbours, exactly like luma. Walk every child TB in decode order and
+    // neighbors, exactly like luma. Walk every child TB in decode order and
     // reconstruct straight into rec_cb/rec_cr so later siblings see it. Cb and Cr
     // form independent prediction chains, so each component is processed in full.
     for component in 0..2 {
@@ -8290,7 +8290,7 @@ fn encode_cu<W: CabacWriter>(
                     luma_ctus_x,
                     min_luma_pu: 8,
                     // 4:2:2 lower TB: anchor decode-order at its own luma row so the
-                    // reconstructed upper TB counts as an available above-neighbour.
+                    // reconstructed upper TB counts as an available above-neighbor.
                     cur_luma_row: lu_row + ctb * sub_h,
                     cur_luma_col: lu_col,
                     neutral,
@@ -8478,7 +8478,7 @@ fn encode_cu<W: CabacWriter>(
                         luma_ctus_x,
                         min_luma_pu: 8,
                         // 4:2:2 lower TB (t=1) anchors decode-order at its own luma
-                        // row so the reconstructed upper TB is an available neighbour.
+                        // row so the reconstructed upper TB is an available neighbor.
                         cur_luma_row: lu_row + t * ctb * sub_h,
                         cur_luma_col: lu_col,
                         neutral,
@@ -9154,7 +9154,7 @@ fn ibc_search(
         ctb_log2: 6,
     };
 
-    // Availability of a luma position for both the AMVP neighbours and the
+    // Availability of a luma position for both the AMVP neighbors and the
     // block-vector source corners is the §6.4.1 z-scan decode-order test.
     let decoded = |x: usize, y: usize| -> bool {
         y < ibc.coded_h && is_block_decoded(y, x, row, col, 64, strides.w)
@@ -10185,9 +10185,9 @@ mod tests {
     }
 
     /// A copied CU's edges take their strength from what sits across them; an
-    /// intra neighbour keeps strength 2, an identically-displaced copy keeps 0.
+    /// intra neighbor keeps strength 2, an identically-displaced copy keeps 0.
     #[test]
-    fn intrabc_edges_take_strength_from_the_neighbouring_block() {
+    fn intrabc_edges_take_strength_from_the_neighboring_block() {
         let stride = 16usize;
         let mut bv_map = vec![crate::ibc::BV_INTRA; stride * stride];
         // Left of the CU at (8,8): another copy with the same block vector.

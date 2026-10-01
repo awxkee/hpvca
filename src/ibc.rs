@@ -127,7 +127,7 @@ pub(crate) fn source_area(cu: &CuGeom, bvx: i32, bvy: i32) -> Option<SourceArea>
 
 /// AMVP predictors for a PART_2Nx2N IntraBC prediction unit (§8.5.3.2.6–8),
 /// specialised for this encoder's stream shape: one reference picture (the
-/// current one), so every available inter neighbour matches the target
+/// current one), so every available inter neighbor matches the target
 /// reference, and `slice_temporal_mvp_enabled_flag` is 0 for an IDR, so there
 /// is no temporal candidate.
 ///
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(preds[0], (-8, 0));
         assert_eq!(preds[1], (0, -8));
 
-        // With no left neighbour at all, the B candidate stands in as A and its
+        // With no left neighbor at all, the B candidate stands in as A and its
         // re-derivation is a duplicate, so the second predictor stays zero.
         let no_left = |x: usize, _y: usize| x >= 64;
         let above_only = |_: usize, _: usize| Some((0i16, -8i16));
