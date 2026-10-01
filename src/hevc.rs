@@ -32,8 +32,9 @@ use crate::{
     aq::{activity_aq_enabled, activity_qp_offsets},
     cabac::{
         CabacEncoder, CabacEstimator, CabacWriter, ContextSet, IntraModeContexts,
-        advance_residual_contexts, encode_cbf_chroma, encode_cbf_luma, encode_residual,
-        estimate_residual_bits,
+        advance_residual_contexts, advance_residual_contexts_ts, encode_cbf_chroma,
+        encode_cbf_luma, encode_residual, encode_residual_ts, estimate_residual_bits,
+        estimate_residual_bits_ts,
     },
     dct,
     error::EncodeError,
@@ -569,11 +570,12 @@ fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
 
 #[cfg(test)]
 pub(crate) fn build_pps(qp: u8, lossless: bool, wpp: bool) -> Nalu {
-    build_pps_tiled(qp, lossless, wpp, 1, 1, 0, false)
+    build_pps_tiled(qp, lossless, wpp, 1, 1, 0, false, false)
 }
 
 /// PPS with an optional uniform tile grid. `tile_cols`/`tile_rows` == 1 means no
 /// tiles (`tiles_enabled_flag = 0`), preserving the exact non-tiled bitstream.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pps_tiled(
     qp: u8,
     lossless: bool,
@@ -582,6 +584,7 @@ pub(crate) fn build_pps_tiled(
     tile_rows: usize,
     cqo: i8,
     ibc: bool,
+    transform_skip: bool,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
@@ -599,7 +602,7 @@ pub(crate) fn build_pps_tiled(
     bw.write_ue(0); // num_ref_idx_l1_default_active_minus1
     bw.write_se(qp as i32 - 26); // init_qp_minus26: carry the full slice QP here
     bw.write_bit(false); // constrained_intra_pred_flag
-    bw.write_bit(false); // transform_skip_enabled_flag
+    bw.write_bit(transform_skip); // transform_skip_enabled_flag
 
     // Activity AQ uses one quantization group per 64x64 CTU.  A CTU-level QG
     // keeps the syntax and QP predictor cheap while still allowing the encoder
@@ -607,9 +610,10 @@ pub(crate) fn build_pps_tiled(
     let aq = activity_aq_enabled(qp, lossless);
     bw.write_bit(aq); // cu_qp_delta_enabled_flag
     if aq {
-        // Quantization groups are 32×32: adaptive quantization steers each CTU
-        // quadrant independently (one cu_qp_delta per group, §8.6.1 prediction).
-        bw.write_ue(1); // diff_cu_qp_delta_depth
+        // Quantization groups are QG_SIZE×QG_SIZE: adaptive quantization steers
+        // each group independently (one cu_qp_delta per group, §8.6.1
+        // prediction). Log2MinCuQpDeltaSize = CtbLog2SizeY − this depth.
+        bw.write_ue(6 - crate::aq::QG_LOG2); // diff_cu_qp_delta_depth
     }
 
     // pps_cb_qp_offset and pps_cr_qp_offset: ALWAYS present (HEVC spec §7.3.2.3)
@@ -797,7 +801,17 @@ pub(crate) fn encode_intra_opts(
     );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
-    let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo, ibc);
+    let transform_skip = transform_skip_enabled(qp_val, lossless) && screen_like(yuv);
+    let pps = build_pps_tiled(
+        qp_val,
+        lossless,
+        wpp,
+        tile_cols,
+        tile_rows,
+        cqo,
+        ibc,
+        transform_skip,
+    );
     // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
     // background workers plus the calling thread give `threads`-way concurrency; the
     // pool (and its threads) is dropped when this function returns.
@@ -824,6 +838,7 @@ pub(crate) fn encode_intra_opts(
         ibc,
         implicit_rdpcm,
         persistent_rice,
+        transform_skip,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -839,14 +854,87 @@ fn init_context_set(
     implicit_rdpcm: bool,
     requested_rice: bool,
     ibc: bool,
+    transform_skip: bool,
 ) -> ContextSet {
     let persistent_rice =
         persistent_rice_enabled(yuv.chroma, yuv.bit_depth, implicit_rdpcm, requested_rice);
-    if ibc {
+    let mut ctx = if ibc {
         ContextSet::init_pslice_ext(qp, persistent_rice)
     } else {
         ContextSet::init_islice_ext(qp, persistent_rice)
+    };
+    ctx.transform_skip_enabled = transform_skip;
+    ctx
+}
+
+/// Highest picture QP (PPS `init_qp`) at which 4×4 transform skip is enabled
+/// (quality ≥ 75). On UI screenshots skip saves 2–7% bytes in the ss2 > 86
+/// region; raising the ceiling to QP 26 / 34 trades ssimulacra2 (−0.4 more)
+/// for ColorVideoVDP (+0.8 / +1.4 worse), so the two metrics only agree here.
+const TRANSFORM_SKIP_MAX_QP: u8 = 20;
+
+/// QP half of the `transform_skip_enabled_flag` decision, keyed on the PPS QP
+/// (never a cell's rebiased slice QP or a CU's AQ-adjusted QP); the content
+/// half is [`screen_like`]. Resolved once per picture, so the PPS bit and
+/// every residual coder of the picture agree.
+fn transform_skip_enabled(qp: u8, lossless: bool) -> bool {
+    !lossless && qp <= TRANSFORM_SKIP_MAX_QP
+}
+
+/// Whether the picture looks like synthetic screen content, where 4×4
+/// transform skip pays: most neighboring luma samples are exactly equal and a
+/// large share of the textured 4×4 blocks hold at most four distinct values
+/// (text, UI strokes, flat fills with hard edges). Natural images never get
+/// close — camera noise makes both statistics tiny — and there the mandatory
+/// per-4×4-TB flag plus skip's poor fit to smooth texture cost ~0.6%.
+///
+/// Measured on 8 screenshots + 38 photos: photos have at most 1.2% few-valued
+/// blocks; UI screenshots 29–68% with ≥89% equal neighbors; game-texture
+/// captures (many few-valued blocks but noisy, ≤33% equal neighbors) lose
+/// slightly with skip and are excluded by the second test.
+fn screen_like(yuv: &Yuv) -> bool {
+    const MIN_FEW_VALUED: f32 = 0.10;
+    const MIN_EQUAL_NEIGHBORS: f32 = 0.60;
+    let w = yuv.width as usize;
+    let h = yuv.height as usize;
+    let y = &yuv.y;
+    let flat_range = 8u16 << (yuv.bit_depth.bits() - 8);
+
+    let mut equal = 0u64;
+    let mut pairs = 0u64;
+    for r in 0..h {
+        let row = &y[r * w..r * w + w];
+        for c in 1..w {
+            equal += u64::from(row[c] == row[c - 1]);
+        }
+        pairs += w.saturating_sub(1) as u64;
+        if r > 0 {
+            let above = &y[(r - 1) * w..(r - 1) * w + w];
+            equal += row.iter().zip(above).filter(|(a, b)| a == b).count() as u64;
+            pairs += w as u64;
+        }
     }
+
+    let mut textured = 0u32;
+    let mut few_valued = 0u32;
+    for br in (0..h.saturating_sub(3)).step_by(4) {
+        for bc in (0..w.saturating_sub(3)).step_by(4) {
+            let mut values = [0u16; 16];
+            for (i, v) in values.iter_mut().enumerate() {
+                *v = y[(br + i / 4) * w + bc + i % 4];
+            }
+            values.sort_unstable();
+            if values[15] - values[0] <= flat_range {
+                continue;
+            }
+            textured += 1;
+            let distinct = 1 + values.windows(2).filter(|p| p[0] != p[1]).count();
+            few_valued += u32::from(distinct <= 4);
+        }
+    }
+    textured > 0
+        && few_valued as f32 >= MIN_FEW_VALUED * textured as f32
+        && equal as f32 >= MIN_EQUAL_NEIGHBORS * pairs as f32
 }
 
 fn init_intra_contexts(qp: u8, ibc: bool) -> IntraModeContexts {
@@ -923,6 +1011,7 @@ fn encode_wpp_parallel(
     rdoq_in_loop: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
+    transform_skip: bool,
     ibc_hash: Option<&crate::ibc::HashTable>,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u16>>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -990,6 +1079,7 @@ fn encode_wpp_parallel(
         scratch.rdoq_in_loop = rdoq_in_loop;
         scratch.implicit_rdpcm = implicit_rdpcm;
         scratch.persistent_rice = persistent_rice;
+        scratch.transform_skip = transform_skip;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
             if r >= ctus_y {
@@ -1006,7 +1096,14 @@ fn encode_wpp_parallel(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc),
+                    init_context_set(
+                        qp,
+                        yuv,
+                        implicit_rdpcm,
+                        persistent_rice,
+                        ibc,
+                        transform_skip,
+                    ),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1217,51 +1314,29 @@ fn code_one_ctu(
         ibc,
         ibc_hash,
         aq,
+        qg_offsets: std::array::from_fn(|z| {
+            let ctu_index = ctu_row * strides.w.div_ceil(64) + ctu_col;
+            aq_offsets
+                .get(ctu_index * crate::aq::QGS_PER_CTU + z)
+                .copied()
+                .unwrap_or(0)
+        }),
+        slice_qp: qp,
+        slice_lambda: lambda,
+        prev_qp: aq_predictor,
         scratch,
     };
     // With depth-0 leaves possible, the root split_cu_flag context must derive
     // from real neighbor CU depths (a hardcoded neighbor-exists shortcut would
     // desync the moment any neighboring CTU is coded as a single 64×64 CU).
     let root_ctx = split_cu_context(tree.cu_depth, lu_row0, lu_col0, 0, tree.cu_stride);
-    // λ ∝ 2^(QP/3): the scale for a QP offset of −6..=6 (MAX_AQ_OFFSET).
-    static AQ_LAMBDA_SCALE: [f32; 13] = [
-        0.25,
-        0.314_980_27,
-        0.396_850_26,
-        0.5,
-        0.629_960_54,
-        0.793_700_5,
-        1.0,
-        1.259_921_1,
-        1.587_401,
-        2.0,
-        2.519_842,
-        3.174_802,
-        4.0,
-    ];
-    const MAX_AQ: i16 = crate::aq::MAX_AQ_OFFSET as i16;
-    const _: () = assert!(AQ_LAMBDA_SCALE.len() == 2 * MAX_AQ as usize + 1);
-    let ctu_index = ctu_row * strides.w.div_ceil(64) + ctu_col;
-    let qg_offsets: [i8; 4] = std::array::from_fn(|quadrant| {
-        aq_offsets
-            .get(ctu_index * 4 + quadrant)
-            .copied()
-            .unwrap_or(0)
-    });
-    // A 64×64 CU spans all four quantization groups but resets IsCuQpDeltaCoded
+    // A 64×64 CU spans every quantization group but resets IsCuQpDeltaCoded
     // only once (§7.3.8.4: the reset fires at every quadtree node whose size is
     // at least the QG size, so the 64 node is the group), i.e. it carries a
     // single cu_qp_delta. Give it — and both arms of the decision trial below —
-    // the mean of its four groups' offsets so the comparison is made at the
+    // the mean of its groups' offsets so the comparison is made at the
     // operating point the CU would actually be coded at.
-    if aq_enabled {
-        let mean =
-            (qg_offsets.iter().map(|&o| i16::from(o)).sum::<i16>() as f32 / 4.0).fast_round();
-        let delta = (mean as i16).clamp(-MAX_AQ, MAX_AQ);
-        tree.qp = (i16::from(qp) + delta).clamp(0, 51) as u8;
-        tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
-        tree.aq.target = tree.qp;
-    }
+    tree.start_qg(lu_row0, lu_col0, 64);
     if let Some((luma_mode, mpm)) = ctu_cu64_choice(&mut tree, lu_row0, lu_col0) {
         // Real rate trial: one 64×64 CU vs the four unsplit 32×32 CUs the flat
         // gate guarantees. Both trials write scratch reconstruction the commit
@@ -1323,17 +1398,9 @@ fn code_one_ctu(
     if node_fit(strides, lu_row0, lu_col0, 64) == NodeFit::Inside {
         cab.encode_bin(1, &mut ctx.split_cu_flag[root_ctx]);
     }
-    // One 32×32 quantization group per quadrant. Each derives its predicted QP
-    // per §8.6.1: qPY_A/qPY_B come from the already-coded CU left of / above
-    // the group's top-left sample when that CU lies in the SAME CTB (the
-    // per-4×4 qp_map holds every coded CU's QpY exactly as a decoder derives
-    // it), otherwise from qPY_PREV — the last CU of the previous group in
-    // decoding order, threaded across CTUs and reset per WPP row / region.
-    let mut prev_qp = aq_predictor;
-    for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
-        .into_iter()
-        .enumerate()
-    {
+    // Quantization groups start at every quadtree node of at least QG_SIZE
+    // (`CuTreeState::start_qg`, called by the 32×32 planner and committer).
+    for (dy, dx) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
         let row = lu_row0 + dy * 32;
         let col = lu_col0 + dx * 32;
         // Quadrants beyond the picture edge do not exist: no CU, no
@@ -1341,35 +1408,10 @@ fn code_one_ctu(
         if node_fit(strides, row, col, 32) == NodeFit::Outside {
             continue;
         }
-        if tree.aq.enabled {
-            let target = (i16::from(qp) + i16::from(qg_offsets[quadrant])).clamp(0, 51) as u8;
-            let delta = (i16::from(target) - i16::from(qp)).clamp(-MAX_AQ, MAX_AQ);
-            let qp_at = |r: usize, c: usize| tree.qp_map[(r / 4) * tree.mode_stride + c / 4];
-            let a = if dx == 1 {
-                qp_at(row, col - 1)
-            } else {
-                prev_qp
-            };
-            let b = if dy == 1 {
-                qp_at(row - 1, col)
-            } else {
-                prev_qp
-            };
-            let predictor = ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
-            tree.qp = target;
-            tree.lambda = lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
-            tree.aq = AqCtuState {
-                enabled: true,
-                predictor,
-                target,
-                coded: false,
-            };
-        }
         let plan = rdo_cu32_plan(&mut tree, row, col, ctx, ictx);
         commit_cu32_plan(cab, ctx, ictx, &mut tree, row, col, 1, plan);
-        prev_qp = tree.aq.resolved_qp();
     }
-    prev_qp
+    tree.prev_qp
 }
 
 /// Coded substreams of one region. The reconstruction stays inside the
@@ -1470,6 +1512,7 @@ fn encode_region_pass(
     // agree on this; it was resolved once per encode and stored on the scratch.
     let implicit_rdpcm = scratch.implicit_rdpcm;
     let persistent_rice = scratch.persistent_rice;
+    let transform_skip = scratch.transform_skip;
     // IntraBC searches by source-block hash. Screen content repeats at
     // arbitrary distances, so a windowed motion search would miss nearly all of
     // it; hashing the source once per region turns the search into a lookup
@@ -1498,7 +1541,14 @@ fn encode_region_pass(
     let mut traces: Vec<Vec<u16>> = Vec::new();
     let substreams = if !wpp {
         let mut cab = CabacEncoder::with_trace(trace);
-        let mut ctx = init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc);
+        let mut ctx = init_context_set(
+            qp,
+            yuv,
+            implicit_rdpcm,
+            persistent_rice,
+            ibc,
+            transform_skip,
+        );
         let mut ictx = init_intra_contexts(qp, ibc);
         // The palette predictor is reset at the start of every slice segment
         // (and therefore every tile) alongside the context variables.
@@ -1594,6 +1644,7 @@ fn encode_region_pass(
             scratch.rdoq_in_loop,
             scratch.implicit_rdpcm,
             scratch.persistent_rice,
+            scratch.transform_skip,
             ibc_hash,
         );
         traces = row_traces;
@@ -1612,7 +1663,14 @@ fn encode_region_pass(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc),
+                    init_context_set(
+                        qp,
+                        yuv,
+                        implicit_rdpcm,
+                        persistent_rice,
+                        ibc,
+                        transform_skip,
+                    ),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1757,11 +1815,13 @@ fn encode_region_substreams(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
+    transform_skip: bool,
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
     ws.cc.implicit_rdpcm = implicit_rdpcm;
     ws.cc.persistent_rice = persistent_rice;
+    ws.cc.transform_skip = transform_skip;
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact per-QG offset table —
     // unless the caller supplies one sliced from the full picture this region
@@ -1853,7 +1913,14 @@ fn encode_region_substreams(
         &params,
         stride.div_ceil(64),
         wpp,
-        init_context_set(qp, yuv, ws.cc.implicit_rdpcm, ws.cc.persistent_rice, ibc),
+        init_context_set(
+            qp,
+            yuv,
+            ws.cc.implicit_rdpcm,
+            ws.cc.persistent_rice,
+            ibc,
+            ws.cc.transform_skip,
+        ),
         yuv.bit_depth.bits(),
     );
     // The analysis pass's reconstruction (and, in tests, its recon copies)
@@ -2030,6 +2097,7 @@ fn build_idr_slice(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
+    transform_skip: bool,
 ) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
@@ -2116,6 +2184,7 @@ fn build_idr_slice(
             ibc,
             implicit_rdpcm,
             persistent_rice,
+            transform_skip,
         );
         let substreams = output.substreams;
         if wpp {
@@ -2164,12 +2233,13 @@ fn build_idr_slice(
                     return Vec::new();
                 };
                 let (ltx, lty) = (tw.div_ceil(64), th.div_ceil(64));
-                let mut local = vec![0i8; ltx * lty * 4];
+                const QGS: usize = crate::aq::QGS_PER_CTU;
+                let mut local = vec![0i8; ltx * lty * QGS];
                 for r in 0..lty {
                     for c in 0..ltx {
-                        for q in 0..4 {
-                            local[(r * ltx + c) * 4 + q] = map
-                                .get(((y0 / 64 + r) * ctus_x + x0 / 64 + c) * 4 + q)
+                        for q in 0..QGS {
+                            local[(r * ltx + c) * QGS + q] = map
+                                .get(((y0 / 64 + r) * ctus_x + x0 / 64 + c) * QGS + q)
                                 .copied()
                                 .unwrap_or(0);
                         }
@@ -2210,6 +2280,7 @@ fn build_idr_slice(
                             ibc,
                             implicit_rdpcm,
                             persistent_rice,
+                            transform_skip,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -3327,6 +3398,8 @@ struct TuTreeScratch {
     cb_nz: [bool; 8],
     cr_nz: [bool; 8],
     y_scan_idx: [u8; 4],
+    /// transform_skip_flag of each 4×4 luma child (always false for larger TBs).
+    y_ts: [bool; 4],
     chroma_scan_idx: [u8; 8],
     split: [bool; 85],
     node_y_nz: [bool; 85],
@@ -3348,6 +3421,7 @@ impl TuTreeScratch {
             cb_nz: [false; 8],
             cr_nz: [false; 8],
             y_scan_idx: [0; 4],
+            y_ts: [false; 4],
             chroma_scan_idx: [0; 8],
             split: [false; 85],
             node_y_nz: [false; 85],
@@ -3410,6 +3484,8 @@ pub(crate) struct CompressionContext {
     /// The SPS bit and the residual coder's `StatCoeff` state must agree, so
     /// both derive from [`persistent_rice_enabled`] with this value.
     persistent_rice: bool,
+    /// PPS `transform_skip_enabled_flag` (see [`transform_skip_enabled`]).
+    transform_skip: bool,
     /// Slice/tile/WPP-row persistent palette predictor (SCC §9.3.2.3). It lives
     /// in the workspace rather than the context set because RD trials must read
     /// it without paying for a clone; only a committing sink updates it.
@@ -3479,6 +3555,7 @@ impl CompressionContext {
             rdoq_in_loop: false,
             implicit_rdpcm: false,
             persistent_rice: true,
+            transform_skip: false,
             palette_pred: crate::palette::PalettePredictor::default(),
             palette_cand: crate::palette::PaletteCu::new(),
             palette_runs: Vec::new(),
@@ -3562,7 +3639,92 @@ struct CuTreeState<'a> {
     /// Source-block hash index for the IntraBC search, built once per region.
     ibc_hash: Option<&'a crate::ibc::HashTable>,
     aq: AqCtuState,
+    /// This CTU's AQ offsets, one per quantization group in Z order.
+    qg_offsets: [i8; crate::aq::QGS_PER_CTU],
+    slice_qp: u8,
+    slice_lambda: f32,
+    /// qPY_PREV: QpY of the last CU of the previous quantization group in
+    /// decoding order (§8.6.1), threaded across CTUs and reset per WPP row /
+    /// region by the caller.
+    prev_qp: u8,
     scratch: &'a mut CompressionContext,
+}
+
+/// λ ∝ 2^(QP/3): the scale for an AQ QP offset of −MAX_AQ_OFFSET..=MAX_AQ_OFFSET.
+static AQ_LAMBDA_SCALE: [f32; 13] = [
+    0.25,
+    0.314_980_27,
+    0.396_850_26,
+    0.5,
+    0.629_960_54,
+    0.793_700_5,
+    1.0,
+    1.259_921_1,
+    1.587_401,
+    2.0,
+    2.519_842,
+    3.174_802,
+    4.0,
+];
+const MAX_AQ: i16 = crate::aq::MAX_AQ_OFFSET as i16;
+const _: () = assert!(AQ_LAMBDA_SCALE.len() == 2 * MAX_AQ as usize + 1);
+
+impl CuTreeState<'_> {
+    /// Begin a quantization group at the quadtree node (`row`, `col`, `size`)
+    /// if the node is at least QG_SIZE (§7.3.8.4 resets IsCuQpDeltaCoded
+    /// there; smaller nodes stay in their parent's group): set the node's AQ
+    /// target QP and λ and derive the predicted QP per §8.6.1. qPY_A/qPY_B
+    /// come from the coded CU left of / above the group when it lies in the
+    /// same CTB (the per-4×4 `qp_map` holds each coded CU's QpY exactly as a
+    /// decoder derives it), otherwise from qPY_PREV.
+    fn start_qg(&mut self, row: usize, col: usize, size: usize) {
+        if !self.aq.enabled || size < crate::aq::QG_SIZE {
+            return;
+        }
+        // A node larger than one group (a 32×32 CU, or the 64 node) carries a
+        // single cu_qp_delta: code it at the mean of the groups it covers.
+        let side = (size / crate::aq::QG_SIZE).min(64 / crate::aq::QG_SIZE);
+        let (qr0, qc0) = (
+            (row % 64) / crate::aq::QG_SIZE,
+            (col % 64) / crate::aq::QG_SIZE,
+        );
+        let mut sum = 0i16;
+        for qr in qr0..qr0 + side {
+            for qc in qc0..qc0 + side {
+                sum += i16::from(self.qg_offsets[crate::aq::qg_z(qr, qc)]);
+            }
+        }
+        let offset = (f32::from(sum) / (side * side) as f32).fast_round() as i16;
+        let target = (i16::from(self.slice_qp) + offset).clamp(0, 51) as u8;
+        let delta = (i16::from(target) - i16::from(self.slice_qp)).clamp(-MAX_AQ, MAX_AQ);
+        let qp_at = |r: usize, c: usize| self.qp_map[(r / 4) * self.mode_stride + c / 4];
+        let a = if !col.is_multiple_of(64) {
+            qp_at(row, col - 1)
+        } else {
+            self.prev_qp
+        };
+        let b = if !row.is_multiple_of(64) {
+            qp_at(row - 1, col)
+        } else {
+            self.prev_qp
+        };
+        self.qp = target;
+        self.lambda = self.slice_lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
+        self.aq = AqCtuState {
+            enabled: true,
+            predictor: ((u16::from(a) + u16::from(b) + 1) >> 1) as u8,
+            target,
+            coded: false,
+        };
+    }
+
+    /// Close the quantization group begun at a node of `size`: its last CU's
+    /// QpY becomes qPY_PREV for the next group.
+    fn end_qg(&mut self, size: usize) {
+        if self.aq.enabled && size >= crate::aq::QG_SIZE {
+            self.prev_qp = self.aq.resolved_qp();
+        }
+    }
 }
 
 #[inline]
@@ -4066,13 +4228,16 @@ fn rdo_cu32_plan(
     ctx: &ContextSet,
     ictx: &IntraModeContexts,
 ) -> Cu32Plan {
-    // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
-    let flag = tree.lambda;
-
     if node_fit(tree.strides, row, col, 32) != NodeFit::Inside {
         return rdo_edge_cu32_plan(tree, row, col, ctx, ictx);
     }
 
+    // Trials run each node in its own quantization-group operating point;
+    // qPY_PREV is left untouched (only the commit advances it). Start the
+    // group before reading λ: the split-flag cost uses the group's λ.
+    tree.start_qg(row, col, 32);
+    // A coded split_cu_flag is a single context bin ≈ 1 bit; charge λ for each.
+    let flag = tree.lambda;
     let cost_32 = cost_leaf(tree, row, col, 32, ctx, ictx);
 
     let mut cost_split = 0.0;
@@ -4089,6 +4254,7 @@ fn rdo_cu32_plan(
         if cost_split >= cost_32 {
             return Cu32Plan::default();
         }
+        tree.start_qg(r, c, 16);
         let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
         let mut cost_8 = flag;
         for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
@@ -4120,6 +4286,7 @@ fn rdo_edge_cu32_plan(
     ctx: &ContextSet,
     ictx: &IntraModeContexts,
 ) -> Cu32Plan {
+    tree.start_qg(row, col, 32);
     let flag = tree.lambda;
     let mut split_16 = [false; 4];
     for (index, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
@@ -4132,6 +4299,7 @@ fn rdo_edge_cu32_plan(
             NodeFit::Outside => false,
             NodeFit::Crossing => true,
             NodeFit::Inside => {
+                tree.start_qg(r, c, 16);
                 let cost_16 = cost_leaf(tree, r, c, 16, ctx, ictx);
                 let mut cost_8 = flag;
                 for (ey, ex) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
@@ -4828,11 +4996,13 @@ fn commit_cu32_plan(
     let fit_32 = node_fit(state.strides, row, col, 32);
     debug_assert!(fit_32 != NodeFit::Outside);
     debug_assert!(plan.split_32 || fit_32 == NodeFit::Inside);
+    state.start_qg(row, col, 32);
     if fit_32 == NodeFit::Inside {
         let split_ctx = split_cu_context(state.cu_depth, row, col, depth, state.cu_stride);
         if !plan.split_32 {
             cab.encode_bin(0, &mut ctx.split_cu_flag[split_ctx]);
             encode_cu_leaf(cab, ctx, ictx, state, row, col, 32, depth);
+            state.end_qg(32);
             return;
         }
         cab.encode_bin(1, &mut ctx.split_cu_flag[split_ctx]);
@@ -4849,6 +5019,7 @@ fn commit_cu32_plan(
         if fit_16 == NodeFit::Outside {
             continue;
         }
+        state.start_qg(child_row, child_col, 16);
         let child_ctx = split_cu_context(
             state.cu_depth,
             child_row,
@@ -4873,7 +5044,9 @@ fn commit_cu32_plan(
             cab.encode_bin(0, &mut ctx.split_cu_flag[child_ctx]);
             encode_cu_leaf(cab, ctx, ictx, state, child_row, child_col, 16, child_depth);
         }
+        state.end_qg(16);
     }
+    state.end_qg(32);
 }
 
 #[inline]
@@ -5403,6 +5576,174 @@ fn advance_lossless_luma_tree_context(
     }
 }
 
+/// Per-TB choice between the 4×4 DST and transform skip for a committed luma
+/// TB at transform depth 1 (an 8×8 CU's split children and the NxN PUs — the
+/// only 4×4 luma TBs this encoder produces).
+///
+/// On entry `scratch.residual[..16]` holds the raster residual and
+/// `scratch.levels` its committed (perceptually weighted) DST RDOQ levels. On
+/// return `scratch.levels` holds the winner's levels and `scratch.inverse[..16]`
+/// its reconstructed residual. Returns whether skip won and by how much it
+/// lowers the committed DST's RD cost (0 when the DST stays).
+///
+/// Candidates are priced as residual-domain SSE + λ·(cbf + residual syntax
+/// incl. the flag) on clones of `ctx`. Skip is quantized by plain-SSE RDOQ —
+/// the perceptual weights are a frequency notion with no meaning for sample-
+/// domain coefficients — so it must also beat the DST quantized the same way.
+/// Against the perceptual DST alone it wins whenever the weights deliberately
+/// dropped high frequencies (higher plain SSE), and on textured captures that
+/// spent 2–7% more bytes for no perceptual gain.
+fn choose_luma4x4_transform(
+    scratch: &mut CompressionContext,
+    ctx: &ContextSet,
+    tb: LumaTb4x4<'_>,
+) -> (bool, f32) {
+    use crate::hevc_transform::MAX_TB;
+    const N: usize = 4;
+    const LEN: usize = N * N;
+    let LumaTb4x4 {
+        qp,
+        bit_depth,
+        scan,
+        scan_idx,
+        lambda,
+    } = tb;
+    let rd_cost = |levels: &[i16], inverse: &[i32], residual: &[i32], ts: bool| -> f32 {
+        let mut packed = [0i16; LEN];
+        let mut nonzero = false;
+        for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
+            *dst = levels[r * N + c];
+            nonzero |= *dst != 0;
+        }
+        let mut rctx = ctx.clone();
+        let mut bits = rctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+        if nonzero {
+            bits += estimate_residual_bits_ts(&mut rctx, &packed, 2, true, scan_idx, true, ts);
+        }
+        let sse: i64 = residual[..LEN]
+            .iter()
+            .zip(&inverse[..LEN])
+            .map(|(&a, &b)| {
+                let d = i64::from(a - b);
+                d * d
+            })
+            .sum();
+        sse as f32 + lambda * bits
+    };
+    // Plain-SSE RDOQ of `scratch.coeff` into `levels`.
+    let plain_rdoq = |scratch: &mut CompressionContext, levels: &mut [i16; MAX_TB]| {
+        let perceptual = scratch.rdoq.perceptual;
+        scratch.rdoq.perceptual = false;
+        crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
+            &crate::hevc_transform::RdoqTb {
+                coeff: &scratch.coeff,
+                n: N,
+                qp,
+                bit_depth,
+                scan,
+                scan_idx,
+                lambda,
+            },
+            1,
+            ctx,
+            levels,
+            &mut scratch.rdoq,
+        );
+        scratch.rdoq.perceptual = perceptual;
+    };
+
+    // Committed DST (levels already chosen by the caller's RDOQ).
+    crate::hevc_transform::run_dequantize(
+        scratch.dequantize,
+        &scratch.levels,
+        N,
+        qp,
+        bit_depth,
+        &mut scratch.dequant,
+    );
+    crate::hevc_transform::run_inv_transform(
+        scratch.inv_transform,
+        &scratch.dequant,
+        N,
+        bit_depth,
+        &mut scratch.inverse,
+        &mut scratch.transform_tmp,
+        true,
+    );
+    let j_dst = rd_cost(&scratch.levels, &scratch.inverse, &scratch.residual, false);
+
+    // Reference: the DST under the same plain-SSE criterion skip is held to.
+    // Its levels and reconstruction are scored only, never committed.
+    crate::hevc_transform::run_fwd_transform(
+        scratch.fwd_transform,
+        &scratch.residual[..LEN],
+        N,
+        bit_depth,
+        &mut scratch.coeff,
+        &mut scratch.transform_tmp,
+        true,
+    );
+    let mut levels = [0i16; MAX_TB];
+    plain_rdoq(scratch, &mut levels);
+    let mut dequant = [0i32; MAX_TB];
+    let mut inverse = [0i32; MAX_TB];
+    crate::hevc_transform::run_dequantize(
+        scratch.dequantize,
+        &levels,
+        N,
+        qp,
+        bit_depth,
+        &mut dequant,
+    );
+    crate::hevc_transform::run_inv_transform(
+        scratch.inv_transform,
+        &dequant,
+        N,
+        bit_depth,
+        &mut inverse,
+        &mut scratch.transform_tmp,
+        true,
+    );
+    let j_ref = j_dst.min(rd_cost(&levels, &inverse, &scratch.residual, false));
+
+    // Transform-skip candidate.
+    crate::hevc_transform::transform_skip_fwd_into(
+        &scratch.residual,
+        N,
+        bit_depth,
+        &mut scratch.coeff,
+    );
+    plain_rdoq(scratch, &mut levels);
+    crate::hevc_transform::run_dequantize(
+        scratch.dequantize,
+        &levels,
+        N,
+        qp,
+        bit_depth,
+        &mut dequant,
+    );
+    crate::hevc_transform::transform_skip_inv_into(&dequant, N, bit_depth, &mut inverse);
+    let j_ts = rd_cost(&levels, &inverse, &scratch.residual, true);
+
+    if j_ts < j_ref {
+        scratch.levels[..LEN].copy_from_slice(&levels[..LEN]);
+        scratch.inverse[..LEN].copy_from_slice(&inverse[..LEN]);
+        (true, j_dst - j_ts)
+    } else {
+        (false, 0.0)
+    }
+}
+
+/// Quantization parameters of one 4×4 luma TB (see [`choose_luma4x4_transform`]).
+#[derive(Clone, Copy)]
+struct LumaTb4x4<'a> {
+    qp: u8,
+    bit_depth: u8,
+    scan: &'a [(usize, usize)],
+    scan_idx: u8,
+    lambda: f32,
+}
+
 fn commit_split_luma(
     scratch: &mut CompressionContext,
     rec_y: &mut [u16],
@@ -5530,6 +5871,22 @@ fn commit_split_luma(
                 &mut scratch.rdoq,
             );
         }
+        // Transform skip only exists for 4×4 TBs; the decision also leaves the
+        // winner's reconstructed residual in `scratch.inverse`.
+        let ts_decided = !lossless && child == 4 && residual_ctx.transform_skip_enabled;
+        let transform_skip = ts_decided
+            && choose_luma4x4_transform(
+                scratch,
+                &residual_ctx,
+                LumaTb4x4 {
+                    qp,
+                    bit_depth,
+                    scan,
+                    scan_idx,
+                    lambda,
+                },
+            )
+            .0;
 
         let packed_offset = index * child_len;
         let packed = &mut scratch.tu_tree.y_zz[packed_offset..packed_offset + child_len];
@@ -5541,16 +5898,18 @@ fn commit_split_luma(
         }
         scratch.tu_tree.y_nz[index] = nonzero;
         scratch.tu_tree.y_scan_idx[index] = scan_idx;
+        scratch.tu_tree.y_ts[index] = transform_skip;
         any_nonzero |= nonzero;
         let _ = residual_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
-            advance_residual_contexts(
+            advance_residual_contexts_ts(
                 &mut residual_ctx,
                 packed,
                 log2_child,
                 true,
                 scan_idx,
                 !lossless,
+                transform_skip,
             );
         }
 
@@ -5565,23 +5924,25 @@ fn commit_split_luma(
                     .copy_from_slice(&scratch.orig[orig_base..orig_base + child]);
             }
         } else {
-            crate::hevc_transform::run_dequantize(
-                scratch.dequantize,
-                &scratch.levels,
-                child,
-                qp,
-                bit_depth,
-                &mut scratch.dequant,
-            );
-            crate::hevc_transform::run_inv_transform(
-                scratch.inv_transform,
-                &scratch.dequant,
-                child,
-                bit_depth,
-                &mut scratch.inverse,
-                &mut scratch.transform_tmp,
-                true,
-            );
+            if !ts_decided {
+                crate::hevc_transform::run_dequantize(
+                    scratch.dequantize,
+                    &scratch.levels,
+                    child,
+                    qp,
+                    bit_depth,
+                    &mut scratch.dequant,
+                );
+                crate::hevc_transform::run_inv_transform(
+                    scratch.inv_transform,
+                    &scratch.dequant,
+                    child,
+                    bit_depth,
+                    &mut scratch.inverse,
+                    &mut scratch.transform_tmp,
+                    true,
+                );
+            }
             for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
                 .chunks_exact(child)
                 .zip(scratch.pred[..child_len].chunks_exact(child))
@@ -6772,6 +7133,31 @@ fn encode_cu_nxn<W: CabacWriter>(
             &mut scratch.levels,
             &mut scratch.rdoq,
         );
+        let ts_decided = rdoq_ctx.transform_skip_enabled;
+        let mut transform_skip = false;
+        if ts_decided {
+            for (dst, (&o, &p)) in scratch.residual[..PU_LEN].iter_mut().zip(
+                scratch.orig[..PU_LEN]
+                    .iter()
+                    .zip(&scratch.best_pred[..PU_LEN]),
+            ) {
+                *dst = i32::from(o) - i32::from(p);
+            }
+            let (ts, gain) = choose_luma4x4_transform(
+                scratch,
+                &rdoq_ctx,
+                LumaTb4x4 {
+                    qp,
+                    bit_depth: bit_depth.bits(),
+                    scan,
+                    scan_idx,
+                    lambda,
+                },
+            );
+            transform_skip = ts;
+            // The mode loop priced this PU with the DST; skip only lowers it.
+            nxn_cost -= gain;
+        }
         let offset = pu_index * PU_LEN;
         let packed = &mut scratch.tu_tree.y_zz[offset..offset + PU_LEN];
         let mut nonzero = false;
@@ -6782,28 +7168,39 @@ fn encode_cu_nxn<W: CabacWriter>(
         }
         scratch.tu_tree.y_nz[pu_index] = nonzero;
         scratch.tu_tree.y_scan_idx[pu_index] = scan_idx;
+        scratch.tu_tree.y_ts[pu_index] = transform_skip;
         let _ = rdoq_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
-            advance_residual_contexts(&mut rdoq_ctx, packed, 2, true, scan_idx, true);
+            advance_residual_contexts_ts(
+                &mut rdoq_ctx,
+                packed,
+                2,
+                true,
+                scan_idx,
+                true,
+                transform_skip,
+            );
         }
 
-        crate::hevc_transform::run_dequantize(
-            scratch.dequantize,
-            &scratch.levels,
-            PU,
-            qp,
-            bit_depth.bits(),
-            &mut scratch.dequant,
-        );
-        crate::hevc_transform::run_inv_transform(
-            scratch.inv_transform,
-            &scratch.dequant,
-            PU,
-            bit_depth.bits(),
-            &mut scratch.inverse,
-            &mut scratch.transform_tmp,
-            true,
-        );
+        if !ts_decided {
+            crate::hevc_transform::run_dequantize(
+                scratch.dequantize,
+                &scratch.levels,
+                PU,
+                qp,
+                bit_depth.bits(),
+                &mut scratch.dequant,
+            );
+            crate::hevc_transform::run_inv_transform(
+                scratch.inv_transform,
+                &scratch.dequant,
+                PU,
+                bit_depth.bits(),
+                &mut scratch.inverse,
+                &mut scratch.transform_tmp,
+                true,
+            );
+        }
         intra::reconstruct_into(
             &scratch.best_pred[..PU_LEN],
             &scratch.inverse[..PU_LEN],
@@ -7153,7 +7550,7 @@ fn encode_split_transform_tree<W: CabacWriter>(
         encode_cu_qp_delta_if_needed(enc, ctx, aq, need_qp);
         if y_nz {
             let offset = child_index * child_len;
-            encode_residual(
+            encode_residual_ts(
                 enc,
                 ctx,
                 &scratch.tu_tree.y_zz[offset..offset + child_len],
@@ -7161,6 +7558,7 @@ fn encode_split_transform_tree<W: CabacWriter>(
                 true,
                 scratch.tu_tree.y_scan_idx[child_index],
                 sign_data_hiding,
+                scratch.tu_tree.y_ts[child_index],
             );
         }
 
@@ -8133,13 +8531,14 @@ fn encode_cu<W: CabacWriter>(
                 r += tctx.cbf_luma[0].estimate_and_update(nz as u8);
                 if nz {
                     let off = i * child_len;
-                    r += estimate_residual_bits(
+                    r += estimate_residual_bits_ts(
                         &mut tctx,
                         &scratch.tu_tree.y_zz[off..off + child_len],
                         log2_child,
                         true,
                         scratch.tu_tree.y_scan_idx[i],
                         !lossless,
+                        scratch.tu_tree.y_ts[i],
                     );
                 }
             }
@@ -8427,13 +8826,14 @@ fn encode_cu<W: CabacWriter>(
                         continue;
                     }
                     let offset = index * child_len;
-                    advance_residual_contexts(
+                    advance_residual_contexts_ts(
                         &mut residual_ctx_after_luma,
                         &scratch.tu_tree.y_zz[offset..offset + child_len],
                         child_log2,
                         true,
                         scratch.tu_tree.y_scan_idx[index],
                         !lossless,
+                        scratch.tu_tree.y_ts[index],
                     );
                 }
             }
@@ -9678,6 +10078,69 @@ fn extract_block_dyn_into(
 mod tests {
     use super::*;
 
+    fn luma_only_yuv(w: usize, h: usize, y: Vec<u16>) -> Yuv {
+        Yuv {
+            y,
+            cb: vec![128; (w / 2) * (h / 2)],
+            cr: vec![128; (w / 2) * (h / 2)],
+            width: w as u32,
+            height: h as u32,
+            display_w: w as u32,
+            display_h: h as u32,
+            chroma: crate::fmt::ChromaFormat::Yuv420,
+            bit_depth: crate::fmt::BitDepth::Eight,
+        }
+    }
+
+    #[test]
+    fn screen_like_accepts_ui_and_rejects_photographic_noise() {
+        let (w, h) = (128usize, 96usize);
+        // Flat panels with one-pixel dark strokes: a crude UI/text raster.
+        let ui: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (r, c) = (i / w, i % w);
+                if (r % 12 == 5 && c % 40 < 30) || (c % 9 == 4 && r % 12 < 9) {
+                    30
+                } else if c < 64 {
+                    235
+                } else {
+                    200
+                }
+            })
+            .collect();
+        assert!(screen_like(&luma_only_yuv(w, h, ui)));
+
+        // A smooth ramp with deterministic sensor-like noise.
+        let mut state = 0x2545_f491u32;
+        let photo: Vec<u16> = (0..w * h)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((i % w) as u32 + (i / w) as u32 + state % 24) as u16
+            })
+            .collect();
+        assert!(!screen_like(&luma_only_yuv(w, h, photo)));
+    }
+
+    #[test]
+    fn transform_skip_flag_is_coded_only_for_4x4_tbs_when_enabled() {
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 3;
+        coeffs[5] = -1;
+        let bits = |enabled: bool, log2: u32| {
+            let mut ctx = ContextSet::init_islice(22);
+            ctx.transform_skip_enabled = enabled;
+            let n = 1usize << (2 * log2);
+            estimate_residual_bits(&mut ctx, &coeffs[..n], log2, true, 0, true)
+        };
+        assert!(bits(true, 2) > bits(false, 2));
+        assert_eq!(bits(true, 3), bits(false, 3));
+        assert!(!transform_skip_enabled(TRANSFORM_SKIP_MAX_QP, true));
+        assert!(!transform_skip_enabled(TRANSFORM_SKIP_MAX_QP + 1, false));
+        assert!(transform_skip_enabled(TRANSFORM_SKIP_MAX_QP, false));
+    }
+
     #[test]
     fn cu_qp_delta_uses_truncated_unary_and_sign_bypass() {
         #[derive(Default)]
@@ -9914,6 +10377,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -9975,6 +10439,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);

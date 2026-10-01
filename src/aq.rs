@@ -38,6 +38,26 @@ const ACTIVITY_QP_FLOOR: u8 = 8;
 const ACTIVITY_STRENGTH: f32 = 1.625;
 pub(crate) const MAX_AQ_OFFSET: i8 = 6;
 
+pub(crate) const QG_LOG2: u32 = 5;
+pub(crate) const QG_SIZE: usize = 1 << QG_LOG2;
+const QGS_PER_SIDE: usize = 64 / QG_SIZE;
+/// Quantization groups per 64×64 CTU; the AQ map holds this many offsets per
+/// CTU in Z-scan order.
+pub(crate) const QGS_PER_CTU: usize = QGS_PER_SIDE * QGS_PER_SIDE;
+
+/// Z-scan index of the quantization group at (`row`, `col`) — in QG units
+/// within its CTU.
+pub(crate) const fn qg_z(row: usize, col: usize) -> usize {
+    let mut z = 0;
+    let mut bit = 0;
+    while (1 << bit) < QGS_PER_SIDE {
+        z |= ((col >> bit) & 1) << (2 * bit);
+        z |= ((row >> bit) & 1) << (2 * bit + 1);
+        bit += 1;
+    }
+    z
+}
+
 /// Natural `log(1+x)` for the non-negative
 ///
 /// `1+x` is reduced to `m * 2^e`, with
@@ -121,59 +141,51 @@ pub(crate) fn picture_mean_ctu_log_variance(yuv: &Yuv) -> f32 {
     picture_sum / (ctus_x * ctus_y).max(1) as f32
 }
 
-/// Mean `ln(1+variance)` of the 8×8 blocks inside each 32×32 quadrant
-/// (Z order) of one CTU, from the unpadded source. Quadrants fully outside the
+/// Mean `ln(1+variance)` of the 8×8 blocks inside each quantization group of
+/// one CTU (Z order), from the unpadded source. Groups fully outside the
 /// picture report `NaN` and are excluded from picture-level normalization.
-fn ctu_quadrant_log_variances(yuv: &Yuv, ctu_row: usize, ctu_col: usize) -> [f32; 4] {
+fn ctu_qg_log_variances(yuv: &Yuv, ctu_row: usize, ctu_col: usize) -> [f32; QGS_PER_CTU] {
     let width = yuv.width as usize;
     let height = yuv.height as usize;
     let shift = yuv.bit_depth.bits().saturating_sub(8);
-    let mut out = [f32::NAN; 4];
-    for (quadrant, (dy, dx)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
-        .into_iter()
-        .enumerate()
-    {
-        let row0 = ctu_row * 64 + dy * 32;
-        let col0 = ctu_col * 64 + dx * 32;
-        if row0 >= height || col0 >= width {
-            continue;
-        }
-        let row_end = (row0 + 32).min(height);
-        let col_end = (col0 + 32).min(width);
-        let mut log_sum = 0.0f32;
-        let mut blocks = 0.0f32;
-        let mut block_row = row0;
-        while block_row < row_end {
-            let mut block_col = col0;
-            let band_end = (block_row + 8).min(row_end);
-            while block_col < col_end {
-                let cols = (block_col + 8).min(col_end) - block_col;
-                let mut sum = 0.0f32;
-                let mut sum_sq = 0.0f32;
-                let mut count = 0.0f32;
-                for r in block_row..band_end {
-                    for &sample in &yuv.y[r * width + block_col..r * width + block_col + cols] {
-                        let sample = f32::from(sample >> shift);
-                        sum += sample;
-                        sum_sq = fmla(sample, sample, sum_sq);
-                        count += 1.0;
-                    }
-                }
-                let mean = sum / count;
-                let variance = (sum_sq / count - mean * mean).max(0.0);
-                log_sum += log1p(variance);
-                blocks += 1.0;
-                block_col += 8;
+    let mut out = [f32::NAN; QGS_PER_CTU];
+    for qr in 0..QGS_PER_SIDE {
+        for qc in 0..QGS_PER_SIDE {
+            let row0 = ctu_row * 64 + qr * QG_SIZE;
+            let col0 = ctu_col * 64 + qc * QG_SIZE;
+            if row0 >= height || col0 >= width {
+                continue;
             }
-            block_row += 8;
+            let row_end = (row0 + QG_SIZE).min(height);
+            let col_end = (col0 + QG_SIZE).min(width);
+            let mut log_sum = 0.0f32;
+            let mut blocks = 0.0f32;
+            for block_row in (row0..row_end).step_by(8) {
+                let band_end = (block_row + 8).min(row_end);
+                for block_col in (col0..col_end).step_by(8) {
+                    let cols = (block_col + 8).min(col_end) - block_col;
+                    let (mut sum, mut sum_sq, mut count) = (0.0f32, 0.0f32, 0.0f32);
+                    for r in block_row..band_end {
+                        for &sample in &yuv.y[r * width + block_col..r * width + block_col + cols] {
+                            let sample = f32::from(sample >> shift);
+                            sum += sample;
+                            sum_sq = fmla(sample, sample, sum_sq);
+                            count += 1.0;
+                        }
+                    }
+                    let mean = sum / count;
+                    log_sum += log1p((sum_sq / count - mean * mean).max(0.0));
+                    blocks += 1.0;
+                }
+            }
+            out[qg_z(qr, qc)] = log_sum / blocks.max(1.0);
         }
-        out[quadrant] = log_sum / blocks.max(1.0);
     }
     out
 }
 
-/// Per-quantization-group (32×32) QP offsets, indexed `ctu_index * 4 +
-/// quadrant` in Z order: activity masking against the picture mean of the
+/// Per-quantization-group QP offsets, indexed `ctu_index * QGS_PER_CTU +
+/// qg_z(..)`: activity masking against the picture mean of the
 /// per-group mean 8×8 log-variance.
 pub(crate) fn activity_qp_offsets(
     yuv: &Yuv,
@@ -202,10 +214,10 @@ pub(crate) fn activity_qp_offsets_clamped(
         return Vec::new();
     }
     let clamp_hi = f32::from(max_offset);
-    let mut qg_log_variance = Vec::with_capacity(ctus_x * ctus_y * 4);
+    let mut qg_log_variance = Vec::with_capacity(ctus_x * ctus_y * QGS_PER_CTU);
     for row in 0..ctus_y {
         for col in 0..ctus_x {
-            qg_log_variance.extend_from_slice(&ctu_quadrant_log_variances(yuv, row, col));
+            qg_log_variance.extend_from_slice(&ctu_qg_log_variances(yuv, row, col));
         }
     }
     let valid = qg_log_variance.iter().filter(|v| !v.is_nan());
@@ -268,14 +280,14 @@ mod tests {
             bit_depth: BitDepth::Eight,
         };
         let offsets = activity_qp_offsets(&yuv, 2, 1, 38, false);
-        // Offsets are per 32×32 quantization group: four per CTU in Z order.
-        assert_eq!(offsets.len(), 8);
+        // Offsets are per quantization group, QGS_PER_CTU per CTU in Z order.
+        assert_eq!(offsets.len(), 2 * QGS_PER_CTU);
         assert!(
-            offsets[..4].iter().all(|&offset| offset < 0),
+            offsets[..QGS_PER_CTU].iter().all(|&offset| offset < 0),
             "flat CTU groups should spend more bits: {offsets:?}"
         );
         assert!(
-            offsets[4..].iter().all(|&offset| offset > 0),
+            offsets[QGS_PER_CTU..].iter().all(|&offset| offset > 0),
             "textured CTU groups should spend fewer bits: {offsets:?}"
         );
         assert!(

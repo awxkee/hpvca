@@ -12,7 +12,6 @@ license = "BSD-3-Clause OR Apache-2.0"
 authors = ["Radzivon Bartoshyk"]
 documentation = "https://docs.rs/hpvca"
 categories = ["multimedia::images", "compression", "encoding"]
-homepage = "https://github.com/awxkee/hpvca"
 repository = "https://github.com/awxkee/hpvca"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.94.0"

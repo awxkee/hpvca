@@ -1337,6 +1337,28 @@ pub(crate) fn dequantize_into(
     }
 }
 
+/// Transform skip, forward direction: scale the residual onto the same
+/// fixed-point range as the transform output (`res << (15 − bitDepth −
+/// log2 n)`), so quantization and RDOQ apply unchanged.
+pub(crate) fn transform_skip_fwd_into(res: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+    let shift = 15 - u32::from(bit_depth) - n.trailing_zeros();
+    for (dst, &r) in out[..n * n].iter_mut().zip(&res[..n * n]) {
+        *dst = r << shift;
+    }
+}
+
+/// Transform skip, inverse direction (§8.6.4.2 with `extended_precision`
+/// off): `r = d << (5 + log2 n)`, then the normal `bdShift = 20 − bitDepth`
+/// rounding of the second inverse-transform stage.
+pub(crate) fn transform_skip_inv_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+    let ts_shift = 5 + n.trailing_zeros();
+    let bd_shift = 20 - u32::from(bit_depth);
+    let add = 1i32 << (bd_shift - 1);
+    for (dst, &c) in out[..n * n].iter_mut().zip(&coeff[..n * n]) {
+        *dst = ((c << ts_shift) + add) >> bd_shift;
+    }
+}
+
 /// Inverse integer transform (spec 8.6.4.2) into reusable output/intermediate
 /// buffers. Only the first `n*n` entries are touched.
 #[inline]
@@ -1540,6 +1562,21 @@ fn inv_transform_32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transform_skip_scaling_round_trips() {
+        // Without quantization, skip's forward scaling and the normative
+        // inverse must cancel exactly at every supported depth.
+        for bit_depth in [8u8, 10, 12] {
+            let max = (1i32 << bit_depth) - 1;
+            let res: Vec<i32> = (0..16).map(|i| (i * 37 % (2 * max + 1)) - max).collect();
+            let mut coeff = [0i32; 16];
+            let mut back = [0i32; 16];
+            transform_skip_fwd_into(&res, 4, bit_depth, &mut coeff);
+            transform_skip_inv_into(&coeff, 4, bit_depth, &mut back);
+            assert_eq!(&back[..], &res[..], "bit depth {bit_depth}");
+        }
+    }
 
     /// HEVC basis rows are *approximately* orthonormal: they're integer
     /// approximations, so norms cluster tightly around the ideal N·64² and

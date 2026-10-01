@@ -155,7 +155,7 @@ pub struct EncodeConfig {
     /// hardware threads reported by the platform (falling back to 1).
     pub threads: usize,
     /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
-    /// defaults to [`ParallelismStrategy::Auto`].
+    /// defaults to [`ParallelismStrategy::Wpp`].
     pub parallelism: ParallelismStrategy,
     /// Enable luma Sample Adaptive Offset filtering. Its parameters are chosen
     /// after the picture is coded and spliced in by replaying the recorded
@@ -192,7 +192,7 @@ impl Default for EncodeConfig {
             color: ColorMetadata::default(), // sRGB ICC profile
             metadata: Metadata::default(),
             threads: 0, // auto-detect
-            parallelism: ParallelismStrategy::GridWpp,
+            parallelism: ParallelismStrategy::default(),
             sao: true,
             speed: Speed::default(),
             screen_content: false,
@@ -1211,7 +1211,8 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
     let global_ctus_x = (width as usize).div_ceil(64);
     let global_ctus_y = (height as usize).div_ceil(64);
     let cell_ctus = (TILE_SIZE / 64) as usize;
-    let mut local = vec![0i8; cell_ctus * cell_ctus * 4];
+    const QGS: usize = aq::QGS_PER_CTU;
+    let mut local = vec![0i8; cell_ctus * cell_ctus * QGS];
     let mut sum = 0i32;
     let mut count = 0i32;
     for r in 0..cell_ctus {
@@ -1219,12 +1220,12 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
             let global_row = row as usize * cell_ctus + r;
             let global_col = col as usize * cell_ctus + c;
             let in_picture = global_row < global_ctus_y && global_col < global_ctus_x;
-            for q in 0..4 {
+            for q in 0..QGS {
                 let offset = map
-                    .get((global_row * global_ctus_x + global_col) * 4 + q)
+                    .get((global_row * global_ctus_x + global_col) * QGS + q)
                     .copied()
                     .unwrap_or(0);
-                local[(r * cell_ctus + c) * 4 + q] = offset;
+                local[(r * cell_ctus + c) * QGS + q] = offset;
                 if in_picture {
                     sum += i32::from(offset);
                     count += 1;
@@ -2128,6 +2129,22 @@ mod tests {
         EncodeConfig::new()
     }
 
+    /// The HEIF-grid layout, which the `tiled_*` tests exercise explicitly
+    /// (the default is a single picture).
+    fn grid_cfg() -> EncodeConfig {
+        cfg().with_parallelism(ParallelismStrategy::GridWpp)
+    }
+
+    #[test]
+    fn default_layout_is_one_picture_not_a_grid() {
+        let px: Vec<u8> = (0u32..1024 * 768 * 3).map(|i| (i % 251) as u8).collect();
+        let out = encode_rgb(&px, 1024, 768, &EncodeConfig::default()).unwrap();
+        assert!(
+            !out.windows(4).any(|w| w == b"grid"),
+            "default must not grid"
+        );
+    }
+
     #[test]
     fn rejects_zero_dims() {
         assert!(validate_dims(0, 1).is_err());
@@ -2353,7 +2370,7 @@ mod tests {
         // 1024×768 triggers 2×2 GridWpp tiling. Quality 30 also exercises
         // activity AQ independently inside every WPP-coded grid cell.
         let px: Vec<u8> = (0u32..1024 * 768 * 3).map(|i| (i % 256) as u8).collect();
-        let out = encode_rgb(&px, 1024, 768, &cfg().with_quality(30)).unwrap();
+        let out = encode_rgb(&px, 1024, 768, &grid_cfg().with_quality(30)).unwrap();
         assert!(out.len() > 1000);
         assert_eq!(&out[4..8], b"ftyp");
         // A grid HEIC has a 'grid' item type in iinf.
@@ -2366,14 +2383,14 @@ mod tests {
     #[test]
     fn tiled_rgb10_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 3];
-        let out = encode_rgb10(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgb10(&px, 1024, 768, &grid_cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
     #[test]
     fn tiled_gray8_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768).map(|i| (i % 256) as u8).collect();
-        let out = encode_gray(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_gray(&px, 1024, 768, &grid_cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
@@ -2388,7 +2405,7 @@ mod tests {
             BitDepth::Eight,
             &yuv::YcbcrMatrix::new(None, BitDepth::Eight),
         );
-        let out = encode_yuv(&yuv, &cfg()).unwrap();
+        let out = encode_yuv(&yuv, &grid_cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
     }
 
@@ -2419,7 +2436,7 @@ mod tests {
     #[test]
     fn tiled_rgba8_with_alpha_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768 * 4).map(|i| (i % 256) as u8).collect();
-        let out = encode_rgba_with_alpha(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgba_with_alpha(&px, 1024, 768, &grid_cfg()).unwrap();
         assert!(
             out.array_windows::<4>().any(|w| w == b"grid"),
             "expected grid item"
@@ -2437,7 +2454,7 @@ mod tests {
     #[test]
     fn tiled_rgba10_with_alpha_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 4];
-        let out = encode_rgba10_with_alpha(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgba10_with_alpha(&px, 1024, 768, &grid_cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
         assert!(out.array_windows::<4>().any(|w| w == b"auxl"));
     }
@@ -2445,7 +2462,7 @@ mod tests {
     #[test]
     fn tiled_gray_alpha8_with_alpha_produces_grid_heic() {
         let px: Vec<u8> = (0u32..1024 * 768 * 2).map(|i| (i % 256) as u8).collect();
-        let out = encode_gray_alpha_with_alpha(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_gray_alpha_with_alpha(&px, 1024, 768, &grid_cfg()).unwrap();
         assert!(out.array_windows::<4>().any(|w| w == b"grid"));
         assert!(out.array_windows::<4>().any(|w| w == b"auxl"));
     }
@@ -2453,7 +2470,7 @@ mod tests {
     #[test]
     fn tiled_alpha_grid_has_correct_ispe() {
         let px: Vec<u8> = vec![200u8; 1024 * 768 * 4];
-        let out = encode_rgba_with_alpha(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgba_with_alpha(&px, 1024, 768, &grid_cfg()).unwrap();
         // Must contain an ispe 1024×768 for the color grid item.
         let mut found = false;
         let mut i = 0;
@@ -2474,7 +2491,7 @@ mod tests {
     #[test]
     fn tiled_alpha_has_two_grid_items() {
         let px: Vec<u8> = vec![128u8; 1024 * 768 * 4];
-        let out = encode_rgba_with_alpha(&px, 1024, 768, &cfg()).unwrap();
+        let out = encode_rgba_with_alpha(&px, 1024, 768, &grid_cfg()).unwrap();
         // Two 'grid' entries in iinf: color grid + alpha grid.
         let count = out.array_windows::<4>().filter(|w| *w == b"grid").count();
         assert_eq!(
