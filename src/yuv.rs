@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn dimensions_monochrome() {
         let yuv = rgb_to_yuv(
-            &vec![128u16; 4 * 4 * 3],
+            &[128u16; 4 * 4 * 3],
             4,
             4,
             ChromaFormat::Monochrome,
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn dimensions_444() {
         let yuv = rgb_to_yuv(
-            &vec![128u16; 4 * 4 * 3],
+            &[128u16; 4 * 4 * 3],
             4,
             4,
             ChromaFormat::Yuv444,
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn dimensions_422() {
         let yuv = rgb_to_yuv(
-            &vec![128u16; 4 * 4 * 3],
+            &[128u16; 4 * 4 * 3],
             4,
             4,
             ChromaFormat::Yuv422,

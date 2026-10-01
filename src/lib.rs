@@ -2167,9 +2167,9 @@ mod tests {
 
     #[test]
     fn rejects_wrong_buffer_size() {
-        assert!(encode_rgb(&vec![0u8; 46], 4, 4, &cfg()).is_err());
-        assert!(encode_rgb(&vec![0u8; 49], 4, 4, &cfg()).is_err());
-        assert!(encode_rgb(&vec![0u8; 48], 4, 4, &cfg()).is_ok());
+        assert!(encode_rgb(&[0u8; 46], 4, 4, &cfg()).is_err());
+        assert!(encode_rgb(&[0u8; 49], 4, 4, &cfg()).is_err());
+        assert!(encode_rgb(&[0u8; 48], 4, 4, &cfg()).is_ok());
     }
 
     #[test]

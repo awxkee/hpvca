@@ -1729,9 +1729,9 @@ mod tests {
     #[test]
     fn t32_partial_butterfly_matches_sparse_inverse() {
         let mut coeff = [0i32; MAX_TB];
-        for i in 0..MAX_TB {
+        for (i, c) in coeff.iter_mut().enumerate() {
             if i % 7 != 0 {
-                coeff[i] = ((i as i32 * 41 + 17) & 1023) - 512;
+                *c = ((i as i32 * 41 + 17) & 1023) - 512;
             }
         }
 
@@ -1808,6 +1808,7 @@ mod tests {
         assert!(levels[..64].iter().all(|&level| level == 0));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rdoq_luma_with_sign_hiding(
         coeff: &[i32],
         n: usize,
@@ -1871,7 +1872,7 @@ mod tests {
         let ctx = ContextSet::init_islice(4);
         let levels = rdoq_luma_with_sign_hiding(&coeff, 8, 4, 8, scan, 0, 0.001, &ctx);
 
-        for group in scan.chunks_exact(16) {
+        for group in scan.as_chunks::<16>().0 {
             let first = group
                 .iter()
                 .position(|&(row, col)| levels[row * 8 + col] != 0);

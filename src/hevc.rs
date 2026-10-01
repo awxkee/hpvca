@@ -5326,8 +5326,11 @@ fn commit_lossless_chroma_leaf(
     let scan = dct::coeff_scan(side.trailing_zeros(), scan_idx);
     scratch.tu_tree.node_chroma_side[node] = side as u8;
     scratch.tu_tree.node_chroma_scan_idx[node] = scan_idx;
-    for t in 0..stacked {
-        scratch.tu_tree.node_chroma_offset[node][t] = (*cursor + t * len) as u16;
+    for (t, offset) in scratch.tu_tree.node_chroma_offset[node][..stacked]
+        .iter_mut()
+        .enumerate()
+    {
+        *offset = (*cursor + t * len) as u16;
     }
 
     for component in 0..2 {
@@ -7428,9 +7431,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             ictx,
         );
         let scan_idx = dct::scan_idx_for(best.pred_mode, side.trailing_zeros(), false, false);
-        for index in 0..stacked {
-            scratch.tu_tree.chroma_scan_idx[index] = scan_idx;
-        }
+        scratch.tu_tree.chroma_scan_idx[..stacked].fill(scan_idx);
         encode_chroma_mode(enc, ictx, best.syntax_idx);
     }
 
@@ -9142,9 +9143,7 @@ fn encode_cu<W: CabacWriter>(
             debug_assert!(cursor <= 1024);
             let _ = aggregate_lossless_chroma(&mut scratch.tu_tree, 0, lu, chroma);
         } else if shared_chroma {
-            for index in 0..n_chroma_tb {
-                scratch.tu_tree.chroma_scan_idx[index] = chroma_tb_scan_idx;
-            }
+            scratch.tu_tree.chroma_scan_idx[..n_chroma_tb].fill(chroma_tb_scan_idx);
         } else if split_chroma_tree {
             commit_split_chroma(
                 scratch,
