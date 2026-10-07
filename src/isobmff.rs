@@ -201,6 +201,15 @@ pub(crate) fn wrap_hevc_image_with_alpha(
 
     const ALPHA_URN: &[u8] = b"urn:mpeg:hevc:2015:auxid:1\0";
 
+    // EXIF item payload: 4-byte tiff header offset (0) + raw TIFF bytes.
+    let exif_payload: Option<Vec<u8>> = metadata.exif.as_ref().map(|e| {
+        let mut p = Vec::with_capacity(e.len() + 4);
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.extend_from_slice(e);
+        p
+    });
+    let item_count: u16 = if exif_payload.is_some() { 3 } else { 2 };
+
     let mut f: Vec<u8> = Vec::new();
 
     write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc));
@@ -229,27 +238,34 @@ pub(crate) fn wrap_hevc_image_with_alpha(
 
     let color_offset_patch_pos;
     let alpha_offset_patch_pos;
+    let mut exif_offset_patch_pos = 0usize;
     {
         let s = f.len();
         write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x40); // base_offset_size=4, index_size=0
-        w16(&mut f, 2);
+        w16(&mut f, item_count);
         color_offset_patch_pos = write_iloc_item(&mut f, 1, color_sample.len() as u32);
         alpha_offset_patch_pos = write_iloc_item(&mut f, 2, alpha_sample.len() as u32);
+        if let Some(p) = &exif_payload {
+            exif_offset_patch_pos = write_iloc_item(&mut f, 3, p.len() as u32);
+        }
         patch(&mut f, s);
     }
 
     {
         let s = f.len();
         write_fullbox(&mut f, b"iinf", 0, 0);
-        w16(&mut f, 2);
-        for id in [1u16, 2u16] {
+        w16(&mut f, item_count);
+        for (id, kind) in [(1u16, b"hvc1"), (2, b"hvc1"), (3, b"Exif")]
+            .into_iter()
+            .take(item_count as usize)
+        {
             let si = f.len();
             write_fullbox(&mut f, b"infe", 2, 0);
             w16(&mut f, id);
             w16(&mut f, 0);
-            f.extend_from_slice(b"hvc1");
+            f.extend_from_slice(kind);
             f.push(0);
             patch(&mut f, si);
         }
@@ -263,6 +279,15 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             let sr = f.len();
             write_box(&mut f, b"auxl");
             w16(&mut f, 2);
+            w16(&mut f, 1);
+            w16(&mut f, 1);
+            patch(&mut f, sr);
+        }
+        // EXIF (3) describes the color item (1).
+        if exif_payload.is_some() {
+            let sr = f.len();
+            write_box(&mut f, b"cdsc");
+            w16(&mut f, 3);
             w16(&mut f, 1);
             w16(&mut f, 1);
             patch(&mut f, sr);
@@ -379,37 +404,34 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 2);
+            // Descriptive properties precede transformative ones, which apply
+            // in listed order: crop, then rotate, then mirror.
+            let mut transforms: Vec<u8> = Vec::new();
+            for idx in [clap_idx, irot_idx, imir_idx] {
+                if idx != 0 {
+                    transforms.push(0x80 | idx);
+                }
+            }
             // color: hvcC(1*) colr(2) ispe(3) pixi(4) + optionals
             let mut ca: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
             if colr2_idx != 0 {
                 ca.push(colr2_idx);
             }
-            if clap_idx != 0 {
-                ca.push(0x80 | clap_idx);
-            }
-            if irot_idx != 0 {
-                ca.push(0x80 | irot_idx);
-            }
-            if imir_idx != 0 {
-                ca.push(0x80 | imir_idx);
-            }
             if clli_idx != 0 {
                 ca.push(clli_idx);
             }
+            ca.extend_from_slice(&transforms);
             w16(&mut f, 1);
             f.push(ca.len() as u8);
             f.extend_from_slice(&ca);
-            // alpha: hvcC(5*) ispe(3) pixi(6) auxC(7), plus the same crop —
-            // the alpha plane is coded at the colour picture's decoded size.
+            // alpha: hvcC(5*) ispe(3) pixi(6) auxC(7), plus the color item's
+            // crop/rotation/mirror — the alpha plane is coded at the colour
+            // picture's decoded size and must be transformed with it.
+            let mut aa: Vec<u8> = vec![0x80 | 5, 3, 6, 7];
+            aa.extend_from_slice(&transforms);
             w16(&mut f, 2);
-            f.push(if clap_idx != 0 { 5 } else { 4 });
-            f.push(0x80 | 5);
-            f.push(3);
-            f.push(6);
-            f.push(7);
-            if clap_idx != 0 {
-                f.push(0x80 | clap_idx);
-            }
+            f.push(aa.len() as u8);
+            f.extend_from_slice(&aa);
             patch(&mut f, si);
         }
 
@@ -424,10 +446,18 @@ pub(crate) fn wrap_hevc_image_with_alpha(
     f.extend_from_slice(&color_sample);
     let alpha_abs = f.len() as u32;
     f.extend_from_slice(&alpha_sample);
+    let exif_abs = f.len() as u32;
+    if let Some(p) = &exif_payload {
+        f.extend_from_slice(p);
+    }
     patch(&mut f, mdat_start);
 
     f[color_offset_patch_pos..color_offset_patch_pos + 4].copy_from_slice(&color_abs.to_be_bytes());
     f[alpha_offset_patch_pos..alpha_offset_patch_pos + 4].copy_from_slice(&alpha_abs.to_be_bytes());
+    if exif_payload.is_some() {
+        f[exif_offset_patch_pos..exif_offset_patch_pos + 4]
+            .copy_from_slice(&exif_abs.to_be_bytes());
+    }
 
     Ok(f)
 }
@@ -631,8 +661,11 @@ pub(crate) fn wrap_hevc_image(
             if colr2_idx != 0 {
                 assoc.push(colr2_idx);
             }
-            // Transformative properties apply in listed order: crop, then
-            // rotate, then mirror.
+            if clli_idx != 0 {
+                assoc.push(clli_idx);
+            }
+            // Transformative properties come after every descriptive one and
+            // apply in listed order: crop, then rotate, then mirror.
             if clap_idx != 0 {
                 assoc.push(0x80 | clap_idx);
             }
@@ -641,9 +674,6 @@ pub(crate) fn wrap_hevc_image(
             }
             if imir_idx != 0 {
                 assoc.push(0x80 | imir_idx);
-            }
-            if clli_idx != 0 {
-                assoc.push(clli_idx);
             }
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
@@ -1135,14 +1165,15 @@ pub(crate) fn wrap_hevc_grid(
             if colr2_idx != 0 {
                 ga.push(colr2_idx); // secondary ICC colr, non-essential
             }
+            if clli_idx != 0 {
+                ga.push(clli_idx);
+            }
+            // Transformative properties last.
             if irot_idx != 0 {
                 ga.push(0x80 | irot_idx);
             }
             if imir_idx != 0 {
                 ga.push(0x80 | imir_idx);
-            }
-            if clli_idx != 0 {
-                ga.push(clli_idx);
             }
             f.push(ga.len() as u8);
             f.extend_from_slice(&ga);
@@ -1553,7 +1584,7 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
                 f.extend_from_slice(ALPHA_URN);
                 patch(&mut f, sh);
             }
-            // 9+: orientation / HDR (color grid only)
+            // 9+: orientation (both grids) / HDR (color grid only)
             let mut next: u8 = 9;
             if has_secondary_colr(color_meta) {
                 write_secondary_colr(&mut f, color_meta);
@@ -1607,14 +1638,15 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             if colr2_idx != 0 {
                 ga.push(colr2_idx); // secondary ICC colr, non-essential
             }
+            if clli_idx != 0 {
+                ga.push(clli_idx);
+            }
+            // Transformative properties last.
             if irot_idx != 0 {
                 ga.push(0x80 | irot_idx);
             }
             if imir_idx != 0 {
                 ga.push(0x80 | imir_idx);
-            }
-            if clli_idx != 0 {
-                ga.push(clli_idx);
             }
             f.push(ga.len() as u8);
             f.extend_from_slice(&ga);
@@ -1626,12 +1658,18 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
                 f.push(0x80 | 6);
                 f.push(0x80 | 2);
             }
-            // Alpha grid: ispe_full(3) pixi(7) auxC(8)
+            // Alpha grid: ispe_full(3) pixi(7) auxC(8), then the color grid's
+            // rotation/mirror (transforms apply to alpha auxiliary items too).
+            let mut aa: Vec<u8> = vec![3, 7, 8];
+            if irot_idx != 0 {
+                aa.push(0x80 | irot_idx);
+            }
+            if imir_idx != 0 {
+                aa.push(0x80 | imir_idx);
+            }
             w16(&mut f, alpha_grid_id);
-            f.push(3);
-            f.push(3);
-            f.push(7);
-            f.push(8);
+            f.push(aa.len() as u8);
+            f.extend_from_slice(&aa);
 
             patch(&mut f, si);
         }
@@ -1936,5 +1974,262 @@ mod tests {
         let ipma_pos = s.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
         assert_eq!(entry_count, 2);
+    }
+
+    /// Child boxes of `b[start..end]` as (fourcc, payload start, box end).
+    fn boxes(b: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = start;
+        while pos + 8 <= end {
+            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            out.push((b[pos + 4..pos + 8].try_into().unwrap(), pos + 8, pos + sz));
+            pos += sz;
+        }
+        out
+    }
+
+    /// The (payload start, end) of the first child `cc` of `b[start..end]`.
+    fn child(b: &[u8], start: usize, end: usize, cc: &[u8; 4]) -> (usize, usize) {
+        let (_, s, e) = *boxes(b, start, end)
+            .iter()
+            .find(|(c, ..)| c == cc)
+            .unwrap_or_else(|| panic!("no {} box", String::from_utf8_lossy(cc)));
+        (s, e)
+    }
+
+    fn rd16(b: &[u8], at: usize) -> u16 {
+        u16::from_be_bytes(b[at..at + 2].try_into().unwrap())
+    }
+
+    fn rd32(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// The `meta` payload range (after the full-box header).
+    fn meta(b: &[u8]) -> (usize, usize) {
+        let (s, e) = child(b, 0, b.len(), b"meta");
+        (s + 4, e)
+    }
+
+    /// ipco children fourccs, in 1-based index order (index 0 unused).
+    fn ipco_kinds(b: &[u8]) -> Vec<[u8; 4]> {
+        let (ms, me) = meta(b);
+        let (ps, pe) = child(b, ms, me, b"iprp");
+        let (s, e) = child(b, ps, pe, b"ipco");
+        let mut kinds = vec![*b"    "];
+        kinds.extend(boxes(b, s, e).iter().map(|(c, ..)| *c));
+        kinds
+    }
+
+    /// ipma associations as (item_ID, property fourccs); version 0, flags 0.
+    fn ipma_entries(b: &[u8]) -> Vec<(u16, Vec<[u8; 4]>)> {
+        let kinds = ipco_kinds(b);
+        let (ms, me) = meta(b);
+        let (ps, pe) = child(b, ms, me, b"iprp");
+        let (s, _) = child(b, ps, pe, b"ipma");
+        let mut pos = s + 4;
+        let count = rd32(b, pos);
+        pos += 4;
+        (0..count)
+            .map(|_| {
+                let id = rd16(b, pos);
+                let n = b[pos + 2] as usize;
+                let props = b[pos + 3..pos + 3 + n]
+                    .iter()
+                    .map(|&a| kinds[(a & 0x7f) as usize])
+                    .collect();
+                pos += 3 + n;
+                (id, props)
+            })
+            .collect()
+    }
+
+    const TRANSFORMS: [&[u8; 4]; 3] = [b"clap", b"irot", b"imir"];
+
+    /// Every item lists descriptive properties before transformative ones.
+    fn assert_descriptive_first(b: &[u8]) {
+        for (id, props) in ipma_entries(b) {
+            if let Some(t) = props.iter().position(|p| TRANSFORMS.contains(&p)) {
+                assert!(
+                    props[t..].iter().all(|p| TRANSFORMS.contains(&p)),
+                    "item {id}: descriptive property after a transform: {:?}",
+                    props
+                        .iter()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    fn rotated_metadata() -> crate::metadata::Metadata {
+        crate::metadata::Metadata::new()
+            .with_orientation(crate::metadata::Orientation::Transpose)
+            .with_content_light_level(crate::metadata::ContentLightLevel::new(1000, 400))
+    }
+
+    fn wrap_alpha(width: u32, metadata: &crate::metadata::Metadata) -> Vec<u8> {
+        wrap_hevc_image_with_alpha(
+            &make_test_stream(),
+            &make_test_stream(),
+            width,
+            16,
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn alpha_with_exif_writes_exif_item_and_cdsc() {
+        let exif = b"MM\0\x2a\0\0\0\x08exif-body".to_vec();
+        let b = wrap_alpha(
+            16,
+            &crate::metadata::Metadata::new().with_exif(exif.clone()),
+        );
+        let (ms, me) = meta(&b);
+
+        let (is, ie) = child(&b, ms, me, b"iinf");
+        assert_eq!(rd16(&b, is + 4), 3, "iinf entry_count");
+        let infes: Vec<(u16, [u8; 4])> = boxes(&b, is + 6, ie)
+            .iter()
+            .map(|&(_, s, _)| (rd16(&b, s + 4), b[s + 8..s + 12].try_into().unwrap()))
+            .collect();
+        assert_eq!(infes, vec![(1, *b"hvc1"), (2, *b"hvc1"), (3, *b"Exif")]);
+
+        let (rs, re) = child(&b, ms, me, b"iref");
+        let refs: Vec<([u8; 4], u16, u16, u16)> = boxes(&b, rs + 4, re)
+            .iter()
+            .map(|&(c, s, _)| (c, rd16(&b, s), rd16(&b, s + 2), rd16(&b, s + 4)))
+            .collect();
+        assert_eq!(refs, vec![(*b"auxl", 2, 1, 1), (*b"cdsc", 3, 1, 1)]);
+
+        // iloc v0 with base_offset_size=4: id(2) dri(2) base(4) count(2) off(4) len(4).
+        let (ls, _) = child(&b, ms, me, b"iloc");
+        assert_eq!(rd16(&b, ls + 6), 3, "iloc item_count");
+        let item3 = ls + 8 + 2 * 18;
+        assert_eq!(rd16(&b, item3), 3);
+        let off = rd32(&b, item3 + 10) as usize;
+        let len = rd32(&b, item3 + 14) as usize;
+        let mut expected = vec![0u8; 4];
+        expected.extend_from_slice(&exif);
+        assert_eq!(&b[off..off + len], expected.as_slice());
+        let (_, _, md_e) = *boxes(&b, 0, b.len())
+            .iter()
+            .find(|(c, ..)| c == b"mdat")
+            .unwrap();
+        assert_eq!(off + len, md_e, "EXIF is the last mdat payload");
+    }
+
+    #[test]
+    fn alpha_transforms_associated_with_both_items() {
+        // Odd width forces a clap crop on top of irot + imir.
+        let b = wrap_alpha(15, &rotated_metadata());
+        assert_descriptive_first(&b);
+        let entries = ipma_entries(&b);
+        assert_eq!(entries.len(), 2);
+        let tail = |props: &[[u8; 4]]| props[props.len() - 3..].to_vec();
+        let want = vec![*b"clap", *b"irot", *b"imir"];
+        assert_eq!(tail(&entries[0].1), want, "color transforms");
+        assert_eq!(tail(&entries[1].1), want, "alpha transforms");
+        assert!(entries[0].1.contains(b"clli"), "clli on color");
+        assert!(!entries[1].1.contains(b"clli"), "clli must not be on alpha");
+    }
+
+    #[test]
+    fn alpha_without_metadata_unchanged_layout() {
+        let b = wrap_alpha(16, &crate::metadata::Metadata::default());
+        let (ms, me) = meta(&b);
+        let (is, _) = child(&b, ms, me, b"iinf");
+        assert_eq!(rd16(&b, is + 4), 2);
+        let entries = ipma_entries(&b);
+        assert_eq!(entries[1].1, vec![*b"hvcC", *b"ispe", *b"pixi", *b"auxC"]);
+    }
+
+    #[test]
+    fn single_image_clli_before_transforms() {
+        let b = wrap_hevc_image(
+            &make_test_stream(),
+            15,
+            16,
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &rotated_metadata(),
+            },
+        )
+        .unwrap();
+        assert_descriptive_first(&b);
+        let props = &ipma_entries(&b)[0].1;
+        assert!(props.contains(b"clli") && props.contains(b"irot"));
+    }
+
+    fn grid_dims() -> GridDims {
+        GridDims {
+            cols: 2,
+            rows: 1,
+            tile_w: 16,
+            tile_h: 16,
+            full_w: 32,
+            full_h: 16,
+        }
+    }
+
+    #[test]
+    fn grid_clli_before_transforms() {
+        let tiles = [make_test_stream(), make_test_stream()];
+        let b = wrap_hevc_grid(
+            &tiles,
+            grid_dims(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &rotated_metadata(),
+            },
+        )
+        .unwrap();
+        assert_descriptive_first(&b);
+        let entries = ipma_entries(&b);
+        assert!(
+            entries
+                .iter()
+                .any(|(_, p)| p.contains(b"clli") && p.contains(b"irot"))
+        );
+    }
+
+    #[test]
+    fn grid_alpha_transforms_on_both_grids() {
+        let tiles = [make_test_stream(), make_test_stream()];
+        let b = wrap_hevc_grid_with_alpha(
+            &tiles,
+            &tiles,
+            grid_dims(),
+            ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &crate::color::ColorMetadata::default(),
+                metadata: &rotated_metadata(),
+            },
+        )
+        .unwrap();
+        assert_descriptive_first(&b);
+        let entries = ipma_entries(&b);
+        // Item IDs: color tiles 1..=2, color grid 3, alpha tiles 4..=5, alpha grid 6.
+        let props = |id: u16| &entries.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert!(props(3).ends_with(&[*b"irot", *b"imir"]), "color grid");
+        assert!(props(3).contains(b"clli"));
+        assert_eq!(
+            props(6),
+            &vec![*b"ispe", *b"pixi", *b"auxC", *b"irot", *b"imir"],
+            "alpha grid"
+        );
+        for id in [1, 2, 4, 5] {
+            assert!(
+                !props(id).contains(b"irot"),
+                "tile {id} must not carry irot"
+            );
+        }
     }
 }
