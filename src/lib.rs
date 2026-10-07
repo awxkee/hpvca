@@ -38,6 +38,7 @@ mod dct;
 mod deblock;
 mod error;
 mod fmt;
+mod gain_map;
 mod hevc;
 mod hevc_transform;
 mod ibc;
@@ -60,6 +61,7 @@ use crate::math::FastRound;
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
+pub use gain_map::{GainMap, GainMapPixels, IsoGainMap, apple_decode, apple_encode};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
 
@@ -181,6 +183,8 @@ pub struct EncodeConfig {
     /// [`lossless`](Self::lossless); see
     /// [`with_lossless_ycbcr`](EncodeConfig::with_lossless_ycbcr).
     pub lossless_ycbcr: bool,
+    /// HDR gain map written next to the primary image. See [`GainMap`].
+    pub gain_map: Option<GainMap>,
 }
 
 impl Default for EncodeConfig {
@@ -199,6 +203,7 @@ impl Default for EncodeConfig {
             implicit_rdpcm: false,
             persistent_rice: true,
             lossless_ycbcr: false,
+            gain_map: None,
         }
     }
 }
@@ -290,6 +295,14 @@ impl EncodeConfig {
         self
     }
 
+    /// Attach an HDR gain map. It is written both as an Apple HDR gain map
+    /// auxiliary image and (unless [`GainMap::with_iso`] is off) as an
+    /// ISO 21496-1 `tmap` item, the way iPhone HEICs carry it.
+    pub fn with_gain_map(mut self, gain_map: GainMap) -> Self {
+        self.gain_map = Some(gain_map);
+        self
+    }
+
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = metadata;
         self
@@ -321,6 +334,9 @@ impl EncodeConfig {
 
     fn validate(&self) -> Result<(), EncodeError> {
         validate_quality(self.quality)?;
+        if let Some(gain_map) = &self.gain_map {
+            gain_map.validate()?;
+        }
         Ok(())
     }
 }
@@ -855,11 +871,7 @@ fn encode_rgba_with_alpha_wide(
         &alpha_stream,
         width,
         height,
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -960,11 +972,7 @@ fn encode_gray_alpha_wide(
         &alpha_stream,
         width,
         height,
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1025,11 +1033,7 @@ pub fn encode_yuv_with_alpha(
         &alpha_stream,
         yuv.display_w,
         yuv.display_h,
-        isobmff::ImageMeta {
-            bit_depth: yuv.bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(yuv.bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1058,12 +1062,22 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         &nalu_stream,
         yuv.display_w,
         yuv.display_h,
-        isobmff::ImageMeta {
-            bit_depth: yuv.bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(yuv.bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
+}
+
+/// Container metadata for the primary image, plus its coded gain map if any.
+fn image_meta<'a>(
+    bit_depth: BitDepth,
+    cfg: &'a EncodeConfig,
+    gain_map: &'a Option<gain_map::EncodedGainMap>,
+) -> isobmff::ImageMeta<'a> {
+    isobmff::ImageMeta {
+        bit_depth,
+        color_meta: &cfg.color,
+        metadata: &cfg.metadata,
+        gain_map: gain_map.as_ref(),
+    }
 }
 
 /// Construct a monochrome [`Yuv`] from a pre-built luma plane.
@@ -1384,11 +1398,7 @@ fn encode_rgb_tiled(
             full_w: width,
             full_h: height,
         },
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, &cfg, &gain_map::encode_gain_map(&cfg)?),
     )
 }
 
@@ -1458,11 +1468,7 @@ fn encode_gray_tiled(
             full_w: width,
             full_h: height,
         },
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1598,11 +1604,7 @@ fn encode_yuv_alpha_tiled(
             full_w: yuv.display_w,
             full_h: yuv.display_h,
         },
-        isobmff::ImageMeta {
-            bit_depth: yuv.bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(yuv.bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1698,11 +1700,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             full_w: yuv.display_w,
             full_h: yuv.display_h,
         },
-        isobmff::ImageMeta {
-            bit_depth: yuv.bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(yuv.bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1827,11 +1825,7 @@ fn encode_rgba_alpha_tiled(
             full_w: width,
             full_h: height,
         },
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
@@ -1949,11 +1943,7 @@ fn encode_gray_alpha_tiled(
             full_w: width,
             full_h: height,
         },
-        isobmff::ImageMeta {
-            bit_depth,
-            color_meta: &cfg.color,
-            metadata: &cfg.metadata,
-        },
+        image_meta(bit_depth, cfg, &gain_map::encode_gain_map(cfg)?),
     )
 }
 
