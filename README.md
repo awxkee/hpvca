@@ -22,6 +22,27 @@ fn main() {
 }
 ```
 
+## HDR gain maps
+
+Attach a gain map to make the HEIC display as HDR on capable screens while
+staying a plain SDR image everywhere else. It is written the way iPhone HEICs
+carry it: an Apple `hdrgainmap` auxiliary image with its `HDRGainMap` XMP, plus
+an ISO 21496-1 `tmap` item that references the same gain map image.
+
+```rust
+use hpvca::{EncodeConfig, GainMap};
+
+// `ratios[i]`: HDR / SDR linear luminance at gain map pixel `i`
+// (any resolution; Apple uses half the primary's).
+let gain_map = GainMap::from_ratios(&ratios, width / 2, height / 2)?.with_quality(80);
+let heic = hpvca::encode_rgb(&rgb, width, height, &EncodeConfig::new().with_gain_map(gain_map))?;
+```
+
+`GainMap::gray8(samples, w, h, headroom)` takes samples already in Apple's
+encoding, e.g. a gain map decoded from an iPhone photo; see
+[`app/src/bin/gainmap.rs`](app/src/bin/gainmap.rs). `with_iso(false)` writes
+only the Apple form.
+
 ## License
 
 This project is licensed under either of

@@ -26,7 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod gain_map;
+
 use crate::{error::EncodeError, hevc::NaluStream};
+use gain_map::{GainMapBoxes, IlocLayout};
 
 /// Output-side image metadata common to every `wrap_hevc_*` entry point: the
 /// sample bit depth plus the color and image-metadata blocks written into the
@@ -36,6 +39,8 @@ pub(crate) struct ImageMeta<'a> {
     pub(crate) bit_depth: crate::fmt::BitDepth,
     pub(crate) color_meta: &'a crate::color::ColorMetadata,
     pub(crate) metadata: &'a crate::metadata::Metadata,
+    /// Coded HDR gain map, written as extra items next to the primary.
+    pub(crate) gain_map: Option<&'a crate::gain_map::EncodedGainMap>,
 }
 
 /// Geometry of a HEIF tile grid: the `cols`×`rows` tile layout, the common
@@ -146,7 +151,7 @@ fn write_secondary_colr(f: &mut Vec<u8>, color: &crate::color::ColorMetadata) {
 /// Write ftyp from the actual coded profile. RExt streams use `heix`; Main,
 /// Main10 and Main Still Picture use `heic`. Reading this from hvcC also covers
 /// 8/10-bit 4:2:0 lossless streams, which become RExt when implicit RDPCM is used.
-fn write_ftyp(f: &mut Vec<u8>, rext: bool) {
+fn write_ftyp(f: &mut Vec<u8>, rext: bool, gain_map: Option<&GainMapBoxes<'_>>) {
     let brand: &[u8; 4] = if rext { b"heix" } else { b"heic" };
     let s = f.len();
     write_box(f, b"ftyp");
@@ -155,7 +160,20 @@ fn write_ftyp(f: &mut Vec<u8>, rext: bool) {
     f.extend_from_slice(brand); // compatible: same as major
     f.extend_from_slice(b"mif1");
     f.extend_from_slice(b"miaf");
+    for extra in gain_map.map(|g| g.extra_brands(rext)).unwrap_or_default() {
+        f.extend_from_slice(extra);
+    }
     patch(f, s);
+}
+
+/// `ipma` associations of the rotation/mirror properties (essential, in
+/// application order); `0` means the property is absent.
+fn orientation_assoc(irot_idx: u8, imir_idx: u8) -> Vec<u8> {
+    [irot_idx, imir_idx]
+        .into_iter()
+        .filter(|&i| i != 0)
+        .map(|i| 0x80 | i)
+        .collect()
 }
 
 #[inline]
@@ -192,6 +210,7 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         bit_depth,
         color_meta,
         metadata,
+        ..
     } = img;
     let color_sample = color.to_length_prefixed_slices();
     let alpha_sample = alpha.to_length_prefixed_slices();
@@ -208,11 +227,13 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         p.extend_from_slice(e);
         p
     });
-    let item_count: u16 = if exif_payload.is_some() { 3 } else { 2 };
+    let base_items: u16 = if exif_payload.is_some() { 3 } else { 2 };
+    let mut gain = GainMapBoxes::new(img.gain_map, base_items + 1)?;
+    let item_count = base_items + gain.as_ref().map_or(0, |g| g.item_count());
 
     let mut f: Vec<u8> = Vec::new();
 
-    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc));
+    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc), gain.as_ref());
 
     let meta_start = f.len();
     write_fullbox(&mut f, b"meta", 0, 0);
@@ -250,6 +271,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         if let Some(p) = &exif_payload {
             exif_offset_patch_pos = write_iloc_item(&mut f, 3, p.len() as u32);
         }
+        if let Some(g) = gain.as_mut() {
+            g.write_iloc(&mut f, IlocLayout::V0);
+        }
         patch(&mut f, s);
     }
 
@@ -259,7 +283,7 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         w16(&mut f, item_count);
         for (id, kind) in [(1u16, b"hvc1"), (2, b"hvc1"), (3, b"Exif")]
             .into_iter()
-            .take(item_count as usize)
+            .take(base_items as usize)
         {
             let si = f.len();
             write_fullbox(&mut f, b"infe", 2, 0);
@@ -268,6 +292,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             f.extend_from_slice(kind);
             f.push(0);
             patch(&mut f, si);
+        }
+        if let Some(g) = &gain {
+            g.write_iinf(&mut f);
         }
         patch(&mut f, s);
     }
@@ -291,6 +318,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             w16(&mut f, 1);
             w16(&mut f, 1);
             patch(&mut f, sr);
+        }
+        if let Some(g) = &gain {
+            g.write_iref(&mut f, 1);
         }
         patch(&mut f, s);
     }
@@ -396,6 +426,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
                 clli_idx = next_prop;
                 next_prop += 1;
             }
+            if let Some(g) = gain.as_mut() {
+                g.write_ipco(&mut f, &mut next_prop, &img, (width, height));
+            }
             let _ = next_prop;
             patch(&mut f, si);
         }
@@ -403,7 +436,7 @@ pub(crate) fn wrap_hevc_image_with_alpha(
         {
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
-            w32(&mut f, 2);
+            w32(&mut f, 2 + gain.as_ref().map_or(0, |g| g.ipma_count()));
             // Descriptive properties precede transformative ones, which apply
             // in listed order: crop, then rotate, then mirror.
             let mut transforms: Vec<u8> = Vec::new();
@@ -432,10 +465,16 @@ pub(crate) fn wrap_hevc_image_with_alpha(
             w16(&mut f, 2);
             f.push(aa.len() as u8);
             f.extend_from_slice(&aa);
+            if let Some(g) = &gain {
+                g.write_ipma(&mut f, &orientation_assoc(irot_idx, imir_idx));
+            }
             patch(&mut f, si);
         }
 
         patch(&mut f, s);
+    }
+    if let Some(g) = &gain {
+        g.write_grpl(&mut f, 1);
     }
 
     patch(&mut f, meta_start);
@@ -449,6 +488,9 @@ pub(crate) fn wrap_hevc_image_with_alpha(
     let exif_abs = f.len() as u32;
     if let Some(p) = &exif_payload {
         f.extend_from_slice(p);
+    }
+    if let Some(g) = &gain {
+        g.write_data(&mut f);
     }
     patch(&mut f, mdat_start);
 
@@ -472,14 +514,19 @@ pub(crate) fn wrap_hevc_image(
         bit_depth,
         color_meta,
         metadata,
+        ..
     } = img;
     let hevc_sample = stream.to_length_prefixed_slices();
     let hvcc_data = build_hvcc(stream, bit_depth.bits())?;
     let decoded = decoded_dims(stream, width, height);
+    let has_exif = metadata.exif.is_some();
+    let base_items: u16 = if has_exif { 2 } else { 1 };
+    let mut gain = GainMapBoxes::new(img.gain_map, base_items + 1)?;
+    let item_count = base_items + gain.as_ref().map_or(0, |g| g.item_count());
 
     let mut f: Vec<u8> = Vec::new();
 
-    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data));
+    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data), gain.as_ref());
 
     let meta_start = f.len();
     write_fullbox(&mut f, b"meta", 0, 0);
@@ -503,7 +550,6 @@ pub(crate) fn wrap_hevc_image(
         patch(&mut f, s);
     }
 
-    let has_exif = metadata.exif.is_some();
     let exif_payload: Vec<u8> = metadata
         .exif
         .as_ref()
@@ -522,10 +568,13 @@ pub(crate) fn wrap_hevc_image(
         write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x40); // base_offset_size=4, index_size=0
-        w16(&mut f, if has_exif { 2 } else { 1 });
+        w16(&mut f, item_count);
         iloc_offset_patch_pos = write_iloc_item(&mut f, 1, hevc_sample.len() as u32);
         if has_exif {
             iloc_exif_patch_pos = write_iloc_item(&mut f, 2, exif_payload.len() as u32);
+        }
+        if let Some(g) = gain.as_mut() {
+            g.write_iloc(&mut f, IlocLayout::V0);
         }
         patch(&mut f, s);
     }
@@ -533,7 +582,7 @@ pub(crate) fn wrap_hevc_image(
     {
         let s = f.len();
         write_fullbox(&mut f, b"iinf", 0, 0);
-        w16(&mut f, if has_exif { 2 } else { 1 });
+        w16(&mut f, item_count);
         {
             let si = f.len();
             write_fullbox(&mut f, b"infe", 2, 0);
@@ -552,19 +601,25 @@ pub(crate) fn wrap_hevc_image(
             f.push(0);
             patch(&mut f, si);
         }
+        if let Some(g) = &gain {
+            g.write_iinf(&mut f);
+        }
         patch(&mut f, s);
     }
 
-    if has_exif {
+    if has_exif || gain.is_some() {
         let s = f.len();
         write_fullbox(&mut f, b"iref", 0, 0);
-        {
+        if has_exif {
             let si = f.len();
             write_box(&mut f, b"cdsc");
             w16(&mut f, 2);
             w16(&mut f, 1);
             w16(&mut f, 1);
             patch(&mut f, si);
+        }
+        if let Some(g) = &gain {
+            g.write_iref(&mut f, 1);
         }
         patch(&mut f, s);
     }
@@ -649,6 +704,9 @@ pub(crate) fn wrap_hevc_image(
                 clli_idx = next_prop;
                 next_prop += 1;
             }
+            if let Some(g) = gain.as_mut() {
+                g.write_ipco(&mut f, &mut next_prop, &img, (width, height));
+            }
             let _ = next_prop;
             extra_props = (irot_idx, imir_idx, clli_idx, colr2_idx, clap_idx);
             patch(&mut f, si);
@@ -677,14 +735,20 @@ pub(crate) fn wrap_hevc_image(
             }
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
-            w32(&mut f, 1);
+            w32(&mut f, 1 + gain.as_ref().map_or(0, |g| g.ipma_count()));
             w16(&mut f, 1);
             f.push(assoc.len() as u8);
             f.extend_from_slice(&assoc);
+            if let Some(g) = &gain {
+                g.write_ipma(&mut f, &orientation_assoc(irot_idx, imir_idx));
+            }
             patch(&mut f, si);
         }
 
         patch(&mut f, s);
+    }
+    if let Some(g) = &gain {
+        g.write_grpl(&mut f, 1);
     }
 
     patch(&mut f, meta_start);
@@ -696,6 +760,9 @@ pub(crate) fn wrap_hevc_image(
     let exif_abs = f.len() as u32;
     if has_exif {
         f.extend_from_slice(&exif_payload);
+    }
+    if let Some(g) = &gain {
+        g.write_data(&mut f);
     }
     patch(&mut f, mdat_start);
 
@@ -860,6 +927,7 @@ pub(crate) fn wrap_hevc_grid(
         bit_depth,
         color_meta,
         metadata,
+        ..
     } = img;
     assert_eq!(
         tiles.len(),
@@ -910,10 +978,13 @@ pub(crate) fn wrap_hevc_grid(
         })
         .unwrap_or_default();
 
+    let mut gain = GainMapBoxes::new(img.gain_map, exif_id + u16::from(has_exif))?;
+    let gain_items = gain.as_ref().map_or(0, |g| g.item_count());
+
     let mut f: Vec<u8> = Vec::new();
 
     // ── ftyp ─────────────────────────────────────────────────────────────────
-    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data));
+    write_ftyp(&mut f, hvcc_uses_rext(&hvcc_data), gain.as_ref());
 
     // ── meta ─────────────────────────────────────────────────────────────────
     let meta_start = f.len();
@@ -950,7 +1021,7 @@ pub(crate) fn wrap_hevc_grid(
         write_fullbox(&mut f, b"iloc", 1, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
-        let total_items = n_tiles + 1 + if has_exif { 1 } else { 0 };
+        let total_items = n_tiles + 1 + if has_exif { 1 } else { 0 } + gain_items;
         w16(&mut f, total_items);
         // Tile items: construction_method=0 (file offset into mdat)
         for i in 0..n_tiles {
@@ -979,6 +1050,9 @@ pub(crate) fn wrap_hevc_grid(
             w32(&mut f, 0);
             w32(&mut f, exif_payload.len() as u32);
         }
+        if let Some(g) = gain.as_mut() {
+            g.write_iloc(&mut f, IlocLayout::V1);
+        }
         patch(&mut f, s);
     }
 
@@ -986,7 +1060,7 @@ pub(crate) fn wrap_hevc_grid(
     {
         let s = f.len();
         write_fullbox(&mut f, b"iinf", 0, 0);
-        let entry_count = n_tiles + 1 + if has_exif { 1 } else { 0 };
+        let entry_count = n_tiles + 1 + if has_exif { 1 } else { 0 } + gain_items;
         w16(&mut f, entry_count);
         for i in 0..n_tiles {
             // Tile items referenced only via dimg MUST be hidden (HEIF spec §9.3.1.2)
@@ -1022,6 +1096,9 @@ pub(crate) fn wrap_hevc_grid(
             f.push(0);
             patch(&mut f, si);
         }
+        if let Some(g) = &gain {
+            g.write_iinf(&mut f);
+        }
         patch(&mut f, s);
     }
 
@@ -1047,6 +1124,9 @@ pub(crate) fn wrap_hevc_grid(
             w16(&mut f, 1);
             w16(&mut f, grid_id);
             patch(&mut f, sr);
+        }
+        if let Some(g) = &gain {
+            g.write_iref(&mut f, grid_id);
         }
         patch(&mut f, s);
     }
@@ -1137,6 +1217,9 @@ pub(crate) fn wrap_hevc_grid(
                 clli_idx = next;
                 next += 1;
             }
+            if let Some(g) = gain.as_mut() {
+                g.write_ipco(&mut f, &mut next, &img, (full_w, full_h));
+            }
             let _ = next;
             patch(&mut f, si);
         }
@@ -1146,7 +1229,10 @@ pub(crate) fn wrap_hevc_grid(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             let entry_count = n_tiles + 1; // tiles + grid (EXIF has no ipma entry)
-            w32(&mut f, entry_count as u32);
+            w32(
+                &mut f,
+                entry_count as u32 + gain.as_ref().map_or(0, |g| g.ipma_count()),
+            );
 
             // Tile items: hvcC(1,essential) + ispe_tile(2,essential) + colr(4,essential)
             // Apple's encoder marks colr essential on each tile so VideoToolbox can
@@ -1177,11 +1263,17 @@ pub(crate) fn wrap_hevc_grid(
             }
             f.push(ga.len() as u8);
             f.extend_from_slice(&ga);
+            if let Some(g) = &gain {
+                g.write_ipma(&mut f, &orientation_assoc(irot_idx, imir_idx));
+            }
 
             patch(&mut f, si);
         }
 
         patch(&mut f, s);
+    }
+    if let Some(g) = &gain {
+        g.write_grpl(&mut f, grid_id);
     }
 
     // ── idat — grid descriptor stored inline (construction_method=1) ──────────
@@ -1208,6 +1300,9 @@ pub(crate) fn wrap_hevc_grid(
     let exif_abs = f.len() as u32;
     if has_exif {
         f.extend_from_slice(&exif_payload);
+    }
+    if let Some(g) = &gain {
+        g.write_data(&mut f);
     }
     patch(&mut f, mdat_start);
 
@@ -1252,6 +1347,7 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
         bit_depth,
         color_meta,
         metadata,
+        ..
     } = img;
     assert_eq!(color_tiles.len(), (cols * rows) as usize);
     assert_eq!(alpha_tiles.len(), (cols * rows) as usize);
@@ -1305,10 +1401,13 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
         })
         .unwrap_or_default();
 
+    let mut gain = GainMapBoxes::new(img.gain_map, exif_id + u16::from(has_exif))?;
+    let gain_items = gain.as_ref().map_or(0, |g| g.item_count());
+
     let mut f: Vec<u8> = Vec::new();
 
     // ── ftyp ─────────────────────────────────────────────────────────────────
-    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc));
+    write_ftyp(&mut f, hvcc_uses_rext(&color_hvcc), gain.as_ref());
 
     // ── meta ─────────────────────────────────────────────────────────────────
     let meta_start = f.len();
@@ -1342,7 +1441,7 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
         write_fullbox(&mut f, b"iloc", 1, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
-        let total = 2 * n + 2 + if has_exif { 1 } else { 0 };
+        let total = 2 * n + 2 + if has_exif { 1 } else { 0 } + gain_items;
         w16(&mut f, total);
 
         // Color tiles (cm=0, mdat)
@@ -1392,6 +1491,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             w32(&mut f, 0);
             w32(&mut f, exif_payload.len() as u32);
         }
+        if let Some(g) = gain.as_mut() {
+            g.write_iloc(&mut f, IlocLayout::V1);
+        }
         patch(&mut f, s);
     }
 
@@ -1399,7 +1501,7 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
     {
         let s = f.len();
         write_fullbox(&mut f, b"iinf", 0, 0);
-        let count = 2 * n + 2 + if has_exif { 1 } else { 0 };
+        let count = 2 * n + 2 + if has_exif { 1 } else { 0 } + gain_items;
         w16(&mut f, count);
 
         // Hidden color tiles
@@ -1463,6 +1565,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             f.push(0);
             patch(&mut f, si);
         }
+        if let Some(g) = &gain {
+            g.write_iinf(&mut f);
+        }
         patch(&mut f, s);
     }
 
@@ -1508,6 +1613,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             w16(&mut f, 1);
             w16(&mut f, color_grid_id);
             patch(&mut f, sr);
+        }
+        if let Some(g) = &gain {
+            g.write_iref(&mut f, color_grid_id);
         }
         patch(&mut f, s);
     }
@@ -1615,6 +1723,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
                 clli_idx = next;
                 next += 1;
             }
+            if let Some(g) = gain.as_mut() {
+                g.write_ipco(&mut f, &mut next, &img, (full_w, full_h));
+            }
             let _ = next;
             patch(&mut f, si);
         }
@@ -1622,7 +1733,10 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             let entry_count = 2 * n + 2; // color tiles + color grid + alpha tiles + alpha grid
-            w32(&mut f, entry_count as u32);
+            w32(
+                &mut f,
+                entry_count as u32 + gain.as_ref().map_or(0, |g| g.ipma_count()),
+            );
 
             // Color tiles: hvcC(1*) ispe_tile(2*) colr(4*)
             for i in 1..=n {
@@ -1670,10 +1784,16 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
             w16(&mut f, alpha_grid_id);
             f.push(aa.len() as u8);
             f.extend_from_slice(&aa);
+            if let Some(g) = &gain {
+                g.write_ipma(&mut f, &orientation_assoc(irot_idx, imir_idx));
+            }
 
             patch(&mut f, si);
         }
         patch(&mut f, s);
+    }
+    if let Some(g) = &gain {
+        g.write_grpl(&mut f, color_grid_id);
     }
 
     // idat — both grid descriptors inline (color at 0, alpha at alpha_grid_offset)
@@ -1703,6 +1823,9 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
     let exif_abs = f.len() as u32;
     if has_exif {
         f.extend_from_slice(&exif_payload);
+    }
+    if let Some(g) = &gain {
+        g.write_data(&mut f);
     }
     patch(&mut f, mdat_start);
 
@@ -1784,6 +1907,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1801,6 +1925,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1821,6 +1946,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Ten,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1840,6 +1966,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1856,6 +1983,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1877,6 +2005,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1900,6 +2029,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1934,6 +2064,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -1960,6 +2091,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &crate::metadata::Metadata::default(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -2078,6 +2210,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata,
+                gain_map: None,
             },
         )
         .unwrap()
@@ -2159,6 +2292,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &rotated_metadata(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -2188,6 +2322,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &rotated_metadata(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -2211,6 +2346,7 @@ mod tests {
                 bit_depth: crate::fmt::BitDepth::Eight,
                 color_meta: &crate::color::ColorMetadata::default(),
                 metadata: &rotated_metadata(),
+                gain_map: None,
             },
         )
         .unwrap();
@@ -2230,6 +2366,165 @@ mod tests {
                 !props(id).contains(b"irot"),
                 "tile {id} must not carry irot"
             );
+        }
+    }
+
+    /// Item types (in `iinf` order), references and `iloc` extents of a file.
+    struct ItemGraph {
+        types: Vec<(u16, [u8; 4], bool)>,
+        refs: Vec<([u8; 4], u16, Vec<u16>)>,
+        extents: Vec<(u16, u32, u32)>,
+    }
+
+    fn item_graph(b: &[u8]) -> ItemGraph {
+        let (ms, me) = child(b, 0, b.len(), b"meta");
+        let ms = ms + 4; // FullBox header
+        let (is, ie) = child(b, ms, me, b"iinf");
+        let types = boxes(b, is + 6, ie)
+            .iter()
+            .map(|&(_, s, _)| {
+                let hidden = b[s + 3] & 1 == 1;
+                (rd16(b, s + 4), b[s + 8..s + 12].try_into().unwrap(), hidden)
+            })
+            .collect();
+        let (rs, re) = child(b, ms, me, b"iref");
+        let refs = boxes(b, rs + 4, re)
+            .iter()
+            .map(|&(cc, s, _)| {
+                let n = rd16(b, s + 2) as usize;
+                (
+                    cc,
+                    rd16(b, s),
+                    (0..n).map(|i| rd16(b, s + 4 + 2 * i)).collect(),
+                )
+            })
+            .collect();
+        let (ls, _) = child(b, ms, me, b"iloc");
+        let version = b[ls];
+        let base_size = (b[ls + 5] >> 4) as usize;
+        let mut pos = ls + 8;
+        let mut extents = Vec::new();
+        for _ in 0..rd16(b, ls + 6) {
+            let id = rd16(b, pos);
+            pos += 2;
+            let method = if version == 1 {
+                pos += 2;
+                rd16(b, pos - 2)
+            } else {
+                0
+            };
+            pos += 2 + base_size + 2; // data_reference_index, base_offset, extent_count
+            if method == 0 {
+                extents.push((id, rd32(b, pos), rd32(b, pos + 4)));
+            }
+            pos += 8;
+        }
+        ItemGraph {
+            types,
+            refs,
+            extents,
+        }
+    }
+
+    fn test_gain_map(tmap: bool) -> crate::gain_map::EncodedGainMap {
+        crate::gain_map::EncodedGainMap {
+            stream: make_stream(
+                crate::fmt::ChromaFormat::Monochrome,
+                crate::fmt::BitDepth::Eight,
+            ),
+            width: 8,
+            height: 8,
+            bit_depth: crate::fmt::BitDepth::Eight,
+            cicp: crate::color::Cicp::unspecified(),
+            xmp: b"<x:xmpmeta>HDRGainMap</x:xmpmeta>".to_vec(),
+            tmap: tmap.then(|| vec![0, 0, 0, 0, 0, 0x40, 0xAB]),
+            alternate_color: None,
+        }
+    }
+
+    /// Check the Apple aux image + XMP + ISO tmap layout against `primary`.
+    fn assert_gain_map_items(b: &[u8], primary: u16, first: u16, tmap: bool) {
+        let g = item_graph(b);
+        let (image, xmp, tm) = (first, first + 1, first + 2);
+        let kind = |id: u16| g.types.iter().find(|t| t.0 == id).map(|t| (&t.1, t.2));
+        assert_eq!(kind(image), Some((b"hvc1", true)));
+        assert_eq!(kind(xmp), Some((b"mime", true)));
+        assert!(
+            b.array_windows::<20>()
+                .any(|w| w == b"application/rdf+xml\0")
+        );
+        let has_ref = |cc: &[u8; 4], from: u16, to: &[u16]| {
+            g.refs
+                .iter()
+                .any(|r| &r.0 == cc && r.1 == from && r.2 == to)
+        };
+        assert!(has_ref(b"auxl", image, &[primary]));
+        assert!(has_ref(b"cdsc", xmp, &[image]));
+        assert!(
+            b.array_windows::<40>()
+                .any(|w| w == b"urn:com:apple:photo:2020:aux:hdrgainmap\0")
+        );
+        let data = |id: u16| {
+            let &(_, off, len) = g.extents.iter().find(|e| e.0 == id).unwrap();
+            &b[off as usize..(off + len) as usize]
+        };
+        assert_eq!(data(xmp), b"<x:xmpmeta>HDRGainMap</x:xmpmeta>");
+        let ftyp_end = rd32(b, 0) as usize;
+        assert_eq!(
+            b[8..ftyp_end].array_windows::<4>().any(|w| w == b"tmap"),
+            tmap
+        );
+        if tmap {
+            assert_eq!(kind(tm), Some((b"tmap", false)));
+            assert!(has_ref(b"dimg", tm, &[primary, image]));
+            assert_eq!(data(tm), &[0, 0, 0, 0, 0, 0x40, 0xAB]);
+            let (ms, me) = child(b, 0, b.len(), b"meta");
+            let (gs, ge) = child(b, ms + 4, me, b"grpl");
+            let (as_, _) = child(b, gs, ge, b"altr");
+            // group_id, 2 entities: the tmap first, the primary as fallback.
+            assert_eq!(rd32(b, as_ + 8), 2);
+            assert_eq!(rd32(b, as_ + 12), tm as u32);
+            assert_eq!(rd32(b, as_ + 16), primary as u32);
+        } else {
+            assert!(kind(tm).is_none());
+        }
+    }
+
+    #[test]
+    fn gain_map_items_single_and_grid() {
+        let color = crate::color::ColorMetadata::default();
+        let metadata = crate::metadata::Metadata::default().with_exif(vec![0x4d, 0x4d, 0, 42]);
+        for tmap in [true, false] {
+            let gm = test_gain_map(tmap);
+            let img = ImageMeta {
+                bit_depth: crate::fmt::BitDepth::Eight,
+                color_meta: &color,
+                metadata: &metadata,
+                gain_map: Some(&gm),
+            };
+            // Single item: 1 = image, 2 = EXIF, gain map from 3.
+            let b = wrap_hevc_image(&make_test_stream(), 16, 16, img).unwrap();
+            assert_gain_map_items(&b, 1, 3, tmap);
+            // Alpha: 1 = color, 2 = alpha, 3 = EXIF, gain map from 4.
+            let b =
+                wrap_hevc_image_with_alpha(&make_test_stream(), &make_test_stream(), 16, 16, img)
+                    .unwrap();
+            assert_gain_map_items(&b, 1, 4, tmap);
+            // 2×1 grid: tiles 1–2, grid 3, EXIF 4, gain map from 5.
+            let dims = GridDims {
+                cols: 2,
+                rows: 1,
+                tile_w: 16,
+                tile_h: 16,
+                full_w: 32,
+                full_h: 16,
+            };
+            let tiles = [make_test_stream(), make_test_stream()];
+            let b = wrap_hevc_grid(&tiles, dims, img).unwrap();
+            assert_gain_map_items(&b, 3, 5, tmap);
+            // Grid + alpha: tiles 1–2, grid 3, alpha tiles 4–5, alpha grid 6, EXIF 7.
+            let b = wrap_hevc_grid_with_alpha(&tiles, &tiles, dims, img).unwrap();
+            assert_gain_map_items(&b, 3, 8, tmap);
         }
     }
 }

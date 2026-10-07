@@ -32,13 +32,21 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum EncodeError {
-    InvalidDimensions { width: u32, height: u32 },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
     InvalidInput,
     DctError(String),
     BitstreamError(String),
     IsobmffError(String),
     Io(std::io::Error),
-    DimensionTooLarge { width: usize, height: usize },
+    DimensionTooLarge {
+        width: usize,
+        height: usize,
+    },
+    /// The attached gain map or its metadata is invalid.
+    GainMap(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -60,6 +68,7 @@ impl fmt::Display for EncodeError {
                 "image dimensions {width}×{height} exceed the maximum ({})",
                 MAX_DIM
             ),
+            EncodeError::GainMap(msg) => write!(f, "Gain map error: {msg}"),
         }
     }
 }
