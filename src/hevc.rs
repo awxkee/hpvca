@@ -2643,32 +2643,23 @@ fn encode_luma_mode_rem<W: CabacWriter>(enc: &mut W, mode: u8, mpm: &[u8; 3]) {
     }
 }
 
+/// Decision distortion of an `n×n` block: the perceptually weighted squared
+/// error of [`crate::cost::weighted_sse`], the one measure every RD decision
+/// of the lossy path compares.
 #[inline]
 fn block_sse(orig: &[u16], rec: &[u16], n: usize) -> f32 {
-    orig[..n * n]
-        .iter()
-        .zip(&rec[..n * n])
-        .map(|(&a, &b)| {
-            let d = a as i64 - b as i64;
-            d * d
-        })
-        .sum::<i64>() as f32
+    crate::cost::weighted_sse(n, n, |r, c| {
+        i32::from(orig[r * n + c]) - i32::from(rec[r * n + c])
+    })
 }
 
-/// SSE between a contiguous `n×n` original block and an `n×n` region of a strided
-/// reconstruction plane at (row, col).
+/// Distortion between a contiguous `n×n` original block and an `n×n` region of
+/// a strided reconstruction plane at (row, col); see [`block_sse`].
 #[inline]
 fn sse_plane(orig: &[u16], plane: &[u16], row: usize, col: usize, stride: usize, n: usize) -> f32 {
-    let mut acc = 0i64;
-    for r in 0..n {
-        let orig_row = &orig[r * n..r * n + n];
-        let base = (row + r) * stride + col;
-        for (&a, &b) in orig_row.iter().zip(&plane[base..base + n]) {
-            let d = a as i64 - b as i64;
-            acc += d * d;
-        }
-    }
-    acc as f32
+    crate::cost::weighted_sse(n, n, |r, c| {
+        i32::from(orig[r * n + c]) - i32::from(plane[(row + r) * stride + col + c])
+    })
 }
 
 /// HEVC RExt implicit residual-DPCM direction for an intra prediction mode.
@@ -4095,11 +4086,45 @@ fn cu_region_sse(tree: &CuTreeState<'_>, row: usize, col: usize, size: usize) ->
     )
 }
 
-/// Reconstruction SSE of one square luma region plus its co-located chroma,
-/// measured against the source with edge clamping. All RD comparisons in this
-/// encoder (CU split, palette vs intra) use this one definition of distortion.
+/// Decision distortion (see [`block_sse`]) of one square luma region plus its
+/// co-located chroma, measured against the source with edge clamping. CU-split
+/// decisions compare this.
 #[allow(clippy::too_many_arguments)]
 fn region_sse(
+    yuv: &Yuv,
+    rec_y: &[u16],
+    rec_cb: &[u16],
+    rec_cr: &[u16],
+    s: PlaneStrides,
+    row: usize,
+    col: usize,
+    size: usize,
+) -> f32 {
+    let mut sse = crate::cost::weighted_sse(size, size, |r, c| {
+        let sy = (row + r).min(s.src_yh - 1);
+        let sx = (col + c).min(s.src_yw - 1);
+        i32::from(yuv.y[sy * s.src_yw + sx]) - i32::from(rec_y[(row + r) * s.w + col + c])
+    });
+    if !rec_cb.is_empty() {
+        let (cw_s, ch_s) = (size / s.sub_w, size / s.sub_h);
+        let (cr0, cc0) = (row / s.sub_h, col / s.sub_w);
+        for (rec_plane, src_plane) in [(rec_cb, &yuv.cb), (rec_cr, &yuv.cr)] {
+            sse += crate::cost::weighted_sse(ch_s, cw_s, |r, c| {
+                let sy = (cr0 + r).min(s.src_ch - 1);
+                let sx = (cc0 + c).min(s.src_cw - 1);
+                i32::from(src_plane[sy * s.src_cw + sx])
+                    - i32::from(rec_plane[(cr0 + r) * s.cw + cc0 + c])
+            });
+        }
+    }
+    sse
+}
+
+/// Plain reconstruction SSE of one square luma region plus its co-located
+/// chroma. The screen-content tools (palette, IntraBC) price their candidates
+/// in plain SSE, so the intra CU they compete with is measured the same way.
+#[allow(clippy::too_many_arguments)]
+fn region_sse_plain(
     yuv: &Yuv,
     rec_y: &[u16],
     rec_cb: &[u16],
@@ -7327,9 +7352,6 @@ fn encode_cu_nxn<W: CabacWriter>(
                     scan_idx,
                     lambda,
                 };
-                // Candidates are compared on plain pixel SSE, so rank them
-                // with plain-SSE RDOQ; the winner is re-quantized perceptually.
-                scratch.rdoq.perceptual = false;
                 crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                     &tb,
                     1,
@@ -7337,7 +7359,6 @@ fn encode_cu_nxn<W: CabacWriter>(
                     &mut scratch.levels,
                     &mut scratch.rdoq,
                 );
-                scratch.rdoq.perceptual = true;
             } else {
                 crate::hevc_transform::quantize_with_sign_hiding_into(
                     &scratch.coeff,
@@ -8476,18 +8497,14 @@ fn encode_cu<W: CabacWriter>(
                     scan_idx,
                     lambda,
                 };
-                // Candidates are compared on plain pixel SSE, so rank them
-                // with plain-SSE RDOQ (−0.7% BD-rate on both perceptual
-                // metrics vs weighted); the winner is re-quantized
-                // perceptually.
-                scratch.rdoq.perceptual = false;
+                // Perceptual RDOQ, matching the weighted decision distortion
+                // (with plain-SSE decisions this had to be plain RDOQ).
                 crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
                     &tb,
                     &trial_ctx,
                     &mut scratch.levels,
                     &mut scratch.rdoq,
                 );
-                scratch.rdoq.perceptual = true;
             } else {
                 crate::hevc_transform::quantize_with_sign_hiding_into(
                     &scratch.coeff,
@@ -10133,7 +10150,7 @@ fn code_cu_with_screen_content<W: CabacWriter>(
         aq,
         scratch,
     );
-    let intra_cost = region_sse(
+    let intra_cost = region_sse_plain(
         yuv, rec.y, rec.cb, rec.cr, strides, geo.lu_row, geo.lu_col, par.lu,
     ) + par.lambda * (enc.coded_bits() - bits_before);
 
