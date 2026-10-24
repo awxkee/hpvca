@@ -749,7 +749,7 @@ pub(crate) fn assign_indices(
     out.escape_present = escapes != 0;
     out.transpose = transpose;
 
-    // Unweighted, matching `cu_region_sse`: the palette J is compared directly
+    // Unweighted, matching `region_sse_plain`: the palette J is compared directly
     // against the intra CU's J, so both must measure distortion the same way.
     let mut sse = 0.0f64;
     for comp in 0..cfg.num_comps {
