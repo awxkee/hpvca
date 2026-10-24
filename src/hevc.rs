@@ -5231,10 +5231,32 @@ struct Cu32Search {
     leaf_32: NodeState,
     entry_16: NodeState,
     leaf_16: NodeState,
+    entry_qg: NodeState,
+    best_qg: NodeState,
     leaf_32_bins: CabacTracer,
     split_32_bins: CabacTracer,
     leaf_16_bins: CabacTracer,
     split_16_bins: CabacTracer,
+    best_bins: CabacTracer,
+}
+
+/// [`search_cu32`]'s QP probe direction: a quantization group whose
+/// target-QP coding takes more than this many bits tries QP+1, a cheaper one
+/// QP−1. A one-split decision tree fitted on the exact cost of every 32×32
+/// group at target−2..=target+2 (12 images, q40–92, 4:2:0); its one probe
+/// recovers ~60% of the cost reduction of trying all five QPs.
+const QP_PROBE_BITS: f32 = 1720.0;
+
+/// The coded node a [`search_cu32_at`] settled on: its contexts, distortion
+/// and rate. Its bins are in `Cu32Search::split_32_bins` or `leaf_32_bins`,
+/// as `split` says, and its reconstruction and maps are in place.
+struct NodeResult {
+    ctx: ContextSet,
+    ictx: IntraModeContexts,
+    dist: f32,
+    bits: f32,
+    split: bool,
+    plan: Cu32Plan,
 }
 
 /// Memoized CU-quadtree search for one 32×32 node: the same {32} vs
@@ -5249,6 +5271,15 @@ struct Cu32Search {
 /// Against [`rdo_cu32_plan`] + [`commit_cu32_plan`] (cheap estimator trials,
 /// then a full re-search of the winner): −0.56% ssimulacra2 / −0.52% CVVDP
 /// BD-rate at 0.86× encode time in Fast, −0.44 / −0.45 at 0.81× in Slow.
+///
+/// Each node is one quantization group. After the search at AQ's target QP,
+/// one probe re-codes the winning partition at target ± 1 (direction from
+/// [`QP_PROBE_BITS`]) and keeps the cheaper coding: −1.0% ssimulacra2 /
+/// −1.0% CVVDP at 1.24× time in Fast, −1.2 / −1.25 at 1.33× in Slow. A full
+/// re-search at the probed QP would add only ~0.3–0.6% at 1.5–1.8× more
+/// time, and searching all of target ± 2 −2.8% at 4.4×: the gain needs real
+/// encodes (it is not predictable from source statistics) and grows roughly
+/// with their number.
 fn search_cu32(
     cab: &mut CabacEncoder,
     ctx: &mut ContextSet,
@@ -5257,31 +5288,89 @@ fn search_cu32(
     row: usize,
     col: usize,
 ) {
-    const Z: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
     let mut s = std::mem::take(&mut tree.scratch.cu_search);
     tree.start_qg(row, col, 32);
+    s.entry_qg.save(tree, row, col, 32);
+    let node = search_cu32_at(&mut s, ctx, ictx, tree, row, col, None);
+    let (mut ctx_won, mut ictx_won) = (node.ctx, node.ictx);
+    let won = if node.split {
+        &mut s.split_32_bins
+    } else {
+        &mut s.leaf_32_bins
+    };
+    std::mem::swap(&mut s.best_bins, won);
+    // QP probe. The group's AQ λ prices both codings: AQ decides how much the
+    // region matters, the probe only picks its quantizer. A group that coded
+    // no residual (so no cu_qp_delta) gains nothing from another QP.
+    if tree.aq.enabled && tree.aq.coded {
+        let lambda = tree.lambda;
+        let cost = node.dist + lambda * node.bits;
+        let qp = i16::from(tree.qp) + if node.bits > QP_PROBE_BITS { 1 } else { -1 };
+        if (0..=51).contains(&qp) {
+            s.best_qg.save(tree, row, col, 32);
+            s.entry_qg.restore(tree, row, col, 32);
+            tree.qp = qp as u8;
+            tree.aq.target = qp as u8;
+            let probe = search_cu32_at(&mut s, ctx, ictx, tree, row, col, Some(node.plan));
+            if probe.dist + lambda * probe.bits < cost {
+                let won = if probe.split {
+                    &mut s.split_32_bins
+                } else {
+                    &mut s.leaf_32_bins
+                };
+                std::mem::swap(&mut s.best_bins, won);
+                (ctx_won, ictx_won) = (probe.ctx, probe.ictx);
+            } else {
+                s.best_qg.restore(tree, row, col, 32);
+            }
+        }
+    }
+    cab.replay(&s.best_bins.trace);
+    (*ctx, *ictx) = (ctx_won, ictx_won);
+    tree.end_qg(32);
+    tree.scratch.cu_search = s;
+}
+
+/// One [`search_cu32`] decision at the tree's current QP and λ, leaving the
+/// winner's reconstruction and maps in place.
+fn search_cu32_at(
+    s: &mut Cu32Search,
+    ctx: &ContextSet,
+    ictx: &IntraModeContexts,
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+    forced: Option<Cu32Plan>,
+) -> NodeResult {
+    const Z: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
     let lambda = tree.lambda;
     let flag_32 = split_cu_context(tree.cu_depth, row, col, 1, tree.cu_stride);
     s.entry_32.save(tree, row, col, 32);
 
     // One 32×32 CU.
     let (mut ctx_leaf, mut ictx_leaf) = (ctx.clone(), ictx.clone());
+    let skip_leaf = forced.is_some_and(|p| p.split_32);
+    let skip_split = forced.is_some_and(|p| !p.split_32);
+    let (mut dist_leaf, mut cost_leaf) = (f32::INFINITY, f32::INFINITY);
     s.leaf_32_bins.clear();
-    s.leaf_32_bins
-        .encode_bin(0, &mut ctx_leaf.split_cu_flag[flag_32]);
-    encode_cu_leaf(
-        &mut s.leaf_32_bins,
-        &mut ctx_leaf,
-        &mut ictx_leaf,
-        tree,
-        row,
-        col,
-        32,
-        1,
-    );
-    let cost_leaf = cu_region_sse(tree, row, col, 32) + lambda * s.leaf_32_bins.bits();
-    s.leaf_32.save(tree, row, col, 32);
-    s.entry_32.restore(tree, row, col, 32);
+    if !skip_leaf {
+        s.leaf_32_bins
+            .encode_bin(0, &mut ctx_leaf.split_cu_flag[flag_32]);
+        encode_cu_leaf(
+            &mut s.leaf_32_bins,
+            &mut ctx_leaf,
+            &mut ictx_leaf,
+            tree,
+            row,
+            col,
+            32,
+            1,
+        );
+        dist_leaf = cu_region_sse(tree, row, col, 32);
+        cost_leaf = dist_leaf + lambda * s.leaf_32_bins.bits();
+        s.leaf_32.save(tree, row, col, 32);
+        s.entry_32.restore(tree, row, col, 32);
+    }
 
     // Four 16×16 nodes; each settles before the next one is searched.
     let (mut ctx_split, mut ictx_split) = (ctx.clone(), ictx.clone());
@@ -5289,8 +5378,15 @@ fn search_cu32(
     s.split_32_bins
         .encode_bin(1, &mut ctx_split.split_cu_flag[flag_32]);
     let mut dist_split = 0.0;
-    let mut split_wins = true;
-    for (dy, dx) in Z {
+    let mut split_wins = !skip_split;
+    let mut plan = Cu32Plan {
+        split_32: true,
+        split_16: [false; 4],
+    };
+    for (index, (dy, dx)) in Z.into_iter().enumerate() {
+        if skip_split {
+            break;
+        }
         // Every remaining node only adds cost.
         if dist_split + lambda * s.split_32_bins.bits() >= cost_leaf {
             split_wins = false;
@@ -5301,32 +5397,40 @@ fn search_cu32(
         let flag_16 = split_cu_context(tree.cu_depth, r, c, 2, tree.cu_stride);
         s.entry_16.save(tree, r, c, 16);
 
+        let only_8 = forced.is_some_and(|p| p.split_16[index]);
+        let only_16 = forced.is_some_and(|p| !p.split_16[index]);
         let (mut ctx_16, mut ictx_16) = (ctx_split.clone(), ictx_split.clone());
+        let (mut dist_16, mut cost_16) = (f32::INFINITY, f32::INFINITY);
         s.leaf_16_bins.clear();
-        s.leaf_16_bins
-            .encode_bin(0, &mut ctx_16.split_cu_flag[flag_16]);
-        encode_cu_leaf(
-            &mut s.leaf_16_bins,
-            &mut ctx_16,
-            &mut ictx_16,
-            tree,
-            r,
-            c,
-            16,
-            2,
-        );
-        let dist_16 = cu_region_sse(tree, r, c, 16);
-        let cost_16 = dist_16 + lambda * s.leaf_16_bins.bits();
-        s.leaf_16.save(tree, r, c, 16);
-        s.entry_16.restore(tree, r, c, 16);
+        if !only_8 {
+            s.leaf_16_bins
+                .encode_bin(0, &mut ctx_16.split_cu_flag[flag_16]);
+            encode_cu_leaf(
+                &mut s.leaf_16_bins,
+                &mut ctx_16,
+                &mut ictx_16,
+                tree,
+                r,
+                c,
+                16,
+                2,
+            );
+            dist_16 = cu_region_sse(tree, r, c, 16);
+            cost_16 = dist_16 + lambda * s.leaf_16_bins.bits();
+            s.leaf_16.save(tree, r, c, 16);
+            s.entry_16.restore(tree, r, c, 16);
+        }
 
         let (mut ctx_8, mut ictx_8) = (ctx_split.clone(), ictx_split.clone());
         s.split_16_bins.clear();
         s.split_16_bins
             .encode_bin(1, &mut ctx_8.split_cu_flag[flag_16]);
         let mut dist_8 = 0.0;
-        let mut eights_win = true;
+        let mut eights_win = !only_16;
         for (ey, ex) in Z {
+            if only_16 {
+                break;
+            }
             if dist_8 + lambda * s.split_16_bins.bits() >= cost_16 {
                 eights_win = false;
                 break;
@@ -5345,6 +5449,7 @@ fn search_cu32(
             dist_8 += cu_region_sse(tree, r8, c8, 8);
         }
         if eights_win && dist_8 + lambda * s.split_16_bins.bits() < cost_16 {
+            plan.split_16[index] = true;
             (ctx_split, ictx_split) = (ctx_8, ictx_8);
             s.split_32_bins.append(&s.split_16_bins);
             dist_split += dist_8;
@@ -5358,15 +5463,25 @@ fn search_cu32(
     }
 
     if split_wins && dist_split + lambda * s.split_32_bins.bits() < cost_leaf {
-        cab.replay(&s.split_32_bins.trace);
-        (*ctx, *ictx) = (ctx_split, ictx_split);
+        NodeResult {
+            ctx: ctx_split,
+            ictx: ictx_split,
+            dist: dist_split,
+            bits: s.split_32_bins.bits(),
+            split: true,
+            plan,
+        }
     } else {
         s.leaf_32.restore(tree, row, col, 32);
-        cab.replay(&s.leaf_32_bins.trace);
-        (*ctx, *ictx) = (ctx_leaf, ictx_leaf);
+        NodeResult {
+            ctx: ctx_leaf,
+            ictx: ictx_leaf,
+            dist: dist_leaf,
+            bits: s.leaf_32_bins.bits(),
+            split: false,
+            plan: Cu32Plan::default(),
+        }
     }
-    tree.end_qg(32);
-    tree.scratch.cu_search = s;
 }
 
 #[inline]
