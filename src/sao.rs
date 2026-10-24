@@ -93,6 +93,7 @@ fn analyze_ctu(
     stride: usize,
     width: usize,
     height: usize,
+    coded_height: usize,
     x0: usize,
     y0: usize,
     bit_depth: u8,
@@ -163,14 +164,16 @@ fn analyze_ctu(
                 let ya = y as i32 + dy;
                 let xb = x as i32 - dx;
                 let yb = y as i32 - dy;
+                // Neighbor availability is the decoder's: the coded picture
+                // (stride × coded_height), not the visible crop.
                 if xa < 0
                     || ya < 0
                     || xb < 0
                     || yb < 0
-                    || xa as usize >= width
-                    || xb as usize >= width
-                    || ya as usize >= height
-                    || yb as usize >= height
+                    || xa as usize >= stride
+                    || xb as usize >= stride
+                    || ya as usize >= coded_height
+                    || yb as usize >= coded_height
                 {
                     continue;
                 }
@@ -222,6 +225,9 @@ fn analyze_ctu(
     best
 }
 
+/// Per-CTU luma SAO parameters. Statistics come from the visible
+/// `width × height` samples only; the coded picture (`stride × coded_height`)
+/// bounds edge-offset neighbours, exactly as the decoder classifies them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analyze_luma(
     original: &[u16],
@@ -229,6 +235,7 @@ pub(crate) fn analyze_luma(
     stride: usize,
     width: usize,
     height: usize,
+    coded_height: usize,
     bit_depth: u8,
     lambda: f32,
 ) -> Vec<SaoParam> {
@@ -243,6 +250,7 @@ pub(crate) fn analyze_luma(
                 stride,
                 width,
                 height,
+                coded_height,
                 rx * 64,
                 ry * 64,
                 bit_depth,
@@ -398,7 +406,7 @@ mod tests {
     fn band_search_finds_quantization_bias() {
         let original = vec![100u16; 64 * 64];
         let rec = vec![96u16; 64 * 64];
-        let p = analyze_luma(&original, &rec, 64, 64, 64, 8, 1.0);
+        let p = analyze_luma(&original, &rec, 64, 64, 64, 64, 8, 1.0);
         assert_eq!(p[0].type_idx, 1);
         assert!(p[0].offsets.contains(&4));
         let mut filtered = rec;
