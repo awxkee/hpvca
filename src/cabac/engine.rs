@@ -176,7 +176,13 @@ impl CtxModel {
 }
 
 pub(crate) trait CabacWriter {
+    /// The sink writes the picture: it alone may advance slice-persistent
+    /// state outside the context set (the palette predictor).
     const COMMIT: bool = false;
+    /// The sink codes a CU that may end up in the bitstream, so the CU gets
+    /// the complete search (TU-split alternative, full chroma RD) rather than
+    /// the reduced one that only has to rank a CU-split trial.
+    const FULL_SEARCH: bool = Self::COMMIT;
 
     /// Everything needed to undo a stretch of coding on this sink.
     type Snapshot: Copy;
@@ -232,6 +238,73 @@ impl CabacWriter for CabacEstimator {
     #[inline]
     fn rollback(&mut self, snapshot: f32) {
         self.bits = snapshot;
+    }
+
+    #[inline]
+    fn coded_bits(&self) -> f32 {
+        self.bits
+    }
+}
+
+/// Fractional-bit sink that also records every bin in [`bin_trace`] form, so
+/// a fully searched CU-tree candidate can be priced first and, if it wins,
+/// emitted later by [`CabacEncoder::replay`] without searching it again.
+#[derive(Clone, Default)]
+pub(crate) struct CabacTracer {
+    bits: f32,
+    pub(crate) trace: Vec<u16>,
+}
+
+impl CabacTracer {
+    #[inline]
+    pub(crate) fn bits(&self) -> f32 {
+        self.bits
+    }
+
+    /// Empty the sink, keeping the trace allocation.
+    pub(crate) fn clear(&mut self) {
+        self.bits = 0.0;
+        self.trace.clear();
+    }
+
+    /// Append another sink's bins, as if they had been coded here.
+    pub(crate) fn append(&mut self, other: &CabacTracer) {
+        self.bits += other.bits;
+        self.trace.extend_from_slice(&other.trace);
+    }
+}
+
+impl CabacWriter for CabacTracer {
+    const FULL_SEARCH: bool = true;
+    type Snapshot = (f32, usize);
+
+    #[inline]
+    fn encode_bin(&mut self, bin_val: u8, ctx: &mut CtxModel) {
+        self.trace.push(
+            bin_trace::REGULAR
+                | (u16::from(ctx.p_state_idx) << 2)
+                | (u16::from(ctx.val_mps) << 8)
+                | (u16::from(bin_val) << 9),
+        );
+        self.bits += ctx.estimate_and_update(bin_val);
+    }
+
+    #[inline]
+    fn encode_bypass(&mut self, bin_val: u8) {
+        self.trace
+            .push(bin_trace::BYPASS | (u16::from(bin_val) << 2));
+        self.bits += 1.0;
+    }
+
+    #[inline]
+    fn snapshot(&self) -> (f32, usize) {
+        (self.bits, self.trace.len())
+    }
+
+    #[inline]
+    fn rollback(&mut self, snapshot: (f32, usize)) {
+        self.bits = snapshot.0;
+        self.trace.truncate(snapshot.1);
     }
 
     #[inline]
@@ -351,6 +424,24 @@ impl CabacEncoder {
             val_mps,
         };
         self.encode_bin(bin_val, &mut model);
+    }
+
+    /// Code the regular and bypass bins a [`CabacTracer`] recorded. Each
+    /// regular bin carries its own probability state, so no context model is
+    /// read or written: the caller adopts the tracer's final contexts.
+    pub(crate) fn replay(&mut self, trace: &[u16]) {
+        for &record in trace {
+            let payload = record >> 2;
+            match record & 3 {
+                bin_trace::REGULAR => self.encode_bin_with_state(
+                    ((payload >> 7) & 1) as u8,
+                    (payload & 63) as u8,
+                    ((payload >> 6) & 1) as u8,
+                ),
+                bin_trace::BYPASS => self.encode_bypass(payload as u8),
+                _ => unreachable!("a CU trace holds only regular and bypass bins"),
+            }
+        }
     }
 
     pub(crate) fn new() -> Self {

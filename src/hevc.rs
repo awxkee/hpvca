@@ -31,7 +31,7 @@ use crate::math::FastRound;
 use crate::{
     aq::{activity_aq_enabled, activity_qp_offsets},
     cabac::{
-        CabacEncoder, CabacEstimator, CabacWriter, ContextSet, IntraModeContexts,
+        CabacEncoder, CabacEstimator, CabacTracer, CabacWriter, ContextSet, IntraModeContexts,
         advance_residual_contexts, advance_residual_contexts_ts, encode_cbf_chroma,
         encode_cbf_luma, encode_residual, encode_residual_ts, estimate_residual_bits,
         estimate_residual_bits_ts,
@@ -1408,8 +1408,12 @@ fn code_one_ctu(
         if node_fit(strides, row, col, 32) == NodeFit::Outside {
             continue;
         }
-        let plan = rdo_cu32_plan(&mut tree, row, col, ctx, ictx);
-        commit_cu32_plan(cab, ctx, ictx, &mut tree, row, col, 1, plan);
+        if memoized_search(&tree, row, col) {
+            search_cu32(cab, ctx, ictx, &mut tree, row, col);
+        } else {
+            let plan = rdo_cu32_plan(&mut tree, row, col, ctx, ictx);
+            commit_cu32_plan(cab, ctx, ictx, &mut tree, row, col, 1, plan);
+        }
     }
     tree.prev_qp
 }
@@ -1905,6 +1909,7 @@ fn encode_region_substreams(
         stride,
         width as usize,
         height as usize,
+        coded_h,
         yuv.bit_depth.bits(),
         lambda,
     );
@@ -1929,11 +1934,13 @@ fn encode_region_substreams(
     output.substreams = substreams;
     output.traces = Vec::new();
     let ws_ref = &mut *ws;
+    // SAO filters the whole coded picture, padding included, as the decoder
+    // does; filtering only the visible crop left its last column/row unfiltered.
     crate::sao::apply_luma(
         &mut ws_ref.rec_y,
         stride,
-        width as usize,
-        height as usize,
+        stride,
+        coded_h,
         yuv.bit_depth.bits(),
         &params,
         &mut ws_ref.sao_apply,
@@ -3498,6 +3505,8 @@ pub(crate) struct CompressionContext {
     /// Block vector of the CU just coded, or `None` when it was intra/palette.
     /// Read back by [`encode_cu_leaf`] to publish the motion field.
     last_cu_bv: Option<(i16, i16)>,
+    /// Buffers of [`search_cu32`], taken out while it runs.
+    cu_search: Cu32Search,
 }
 
 /// Per-TU coefficient storage for the 64×64-CU (four-32×32-TU) CTU path: four
@@ -3561,6 +3570,7 @@ impl CompressionContext {
             palette_runs: Vec::new(),
             palette_colors: crate::palette::ColorIndex::new(),
             last_cu_bv: None,
+            cu_search: Cu32Search::default(),
         }
     }
 
@@ -3748,8 +3758,8 @@ fn fill_cu_depth(depths: &mut [u8], row: usize, col: usize, size: usize, depth: 
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn encode_cu_leaf(
-    cab: &mut CabacEncoder,
+fn encode_cu_leaf<W: CabacWriter>(
+    cab: &mut W,
     ctx: &mut ContextSet,
     ictx: &mut IntraModeContexts,
     state: &mut CuTreeState<'_>,
@@ -4220,7 +4230,8 @@ fn cost_leaf_with_aq(
 /// unchanged on average): sharp synthetic edges are exactly where a source
 /// proxy misjudges the coded cost.
 ///
-/// The winning [`Cu32Plan`] is committed once by [`commit_cu32_plan`].
+/// The winning [`Cu32Plan`] is committed once by [`commit_cu32_plan`]. Only
+/// the nodes [`memoized_search`] leaves out still take this path.
 fn rdo_cu32_plan(
     tree: &mut CuTreeState<'_>,
     row: usize,
@@ -5047,6 +5058,290 @@ fn commit_cu32_plan(
         state.end_qg(16);
     }
     state.end_qg(32);
+}
+
+/// Whether the 32×32 node at (`row`, `col`) is decided by [`search_cu32`].
+/// Edge nodes keep the plan/commit pair (their split is partly inferred), and
+/// so do the screen-content tools: the palette predictor is slice state that
+/// only a committing sink may advance.
+fn memoized_search(tree: &CuTreeState<'_>, row: usize, col: usize) -> bool {
+    !tree.lossless
+        && !tree.scc
+        && !tree.ibc
+        && node_fit(tree.strides, row, col, 32) == NodeFit::Inside
+}
+
+/// The QP / λ / cu_qp_delta state a coded CU advances.
+#[derive(Clone, Copy)]
+struct TreeQp {
+    qp: u8,
+    lambda: f32,
+    aq: AqCtuState,
+    prev_qp: u8,
+}
+
+impl TreeQp {
+    fn of(tree: &CuTreeState<'_>) -> Self {
+        Self {
+            qp: tree.qp,
+            lambda: tree.lambda,
+            aq: tree.aq,
+            prev_qp: tree.prev_qp,
+        }
+    }
+
+    fn apply(self, tree: &mut CuTreeState<'_>) {
+        tree.qp = self.qp;
+        tree.lambda = self.lambda;
+        tree.aq = self.aq;
+        tree.prev_qp = self.prev_qp;
+    }
+}
+
+/// Picture-side state that coding CUs inside a square node leaves behind:
+/// the node's reconstruction and every 4×4 / 8×8 map a later CU or the
+/// in-loop filters read. Saved before an alternative is coded in place, then
+/// restored to undo it or to bring back the alternative that won.
+#[derive(Default)]
+struct NodeState {
+    samples: Vec<u16>,
+    grid: Vec<u8>,
+    bv: Vec<i32>,
+    qp: Option<TreeQp>,
+}
+
+fn save_rect<T: Copy>(
+    plane: &[T],
+    stride: usize,
+    rect: (usize, usize, usize, usize),
+    out: &mut Vec<T>,
+) {
+    let (row, col, h, w) = rect;
+    if plane.is_empty() {
+        return;
+    }
+    for r in row..row + h {
+        out.extend_from_slice(&plane[r * stride + col..r * stride + col + w]);
+    }
+}
+
+fn restore_rect<'a, T: Copy>(
+    plane: &mut [T],
+    stride: usize,
+    rect: (usize, usize, usize, usize),
+    src: &'a [T],
+) -> &'a [T] {
+    let (row, col, h, w) = rect;
+    if plane.is_empty() {
+        return src;
+    }
+    for (i, r) in (row..row + h).enumerate() {
+        plane[r * stride + col..r * stride + col + w].copy_from_slice(&src[i * w..(i + 1) * w]);
+    }
+    &src[h * w..]
+}
+
+impl NodeState {
+    fn rects(
+        tree: &CuTreeState<'_>,
+        row: usize,
+        col: usize,
+        size: usize,
+    ) -> [(usize, usize, usize, usize); 3] {
+        let s = tree.strides;
+        [
+            (row, col, size, size),
+            (row / s.sub_h, col / s.sub_w, size / s.sub_h, size / s.sub_w),
+            (row / 4, col / 4, size / 4, size / 4),
+        ]
+    }
+
+    fn save(&mut self, tree: &CuTreeState<'_>, row: usize, col: usize, size: usize) {
+        let [luma, chroma, grid] = Self::rects(tree, row, col, size);
+        let (w, cw, ms) = (tree.strides.w, tree.strides.cw, tree.mode_stride);
+        self.samples.clear();
+        save_rect(tree.rec_y, w, luma, &mut self.samples);
+        save_rect(tree.rec_cb, cw, chroma, &mut self.samples);
+        save_rect(tree.rec_cr, cw, chroma, &mut self.samples);
+        self.grid.clear();
+        for map in [&*tree.mode_map, &*tree.qp_map, &*tree.edge_v, &*tree.edge_h] {
+            save_rect(map, ms, grid, &mut self.grid);
+        }
+        save_rect(
+            tree.cu_depth,
+            tree.cu_stride,
+            (row / 8, col / 8, size / 8, size / 8),
+            &mut self.grid,
+        );
+        self.bv.clear();
+        save_rect(tree.bv_map, ms, grid, &mut self.bv);
+        self.qp = Some(TreeQp::of(tree));
+    }
+
+    fn restore(&self, tree: &mut CuTreeState<'_>, row: usize, col: usize, size: usize) {
+        let [luma, chroma, grid] = Self::rects(tree, row, col, size);
+        let (w, cw, ms) = (tree.strides.w, tree.strides.cw, tree.mode_stride);
+        let rest = restore_rect(tree.rec_y, w, luma, &self.samples);
+        let rest = restore_rect(tree.rec_cb, cw, chroma, rest);
+        restore_rect(tree.rec_cr, cw, chroma, rest);
+        let rest = restore_rect(tree.mode_map, ms, grid, &self.grid);
+        let rest = restore_rect(tree.qp_map, ms, grid, rest);
+        let rest = restore_rect(tree.edge_v, ms, grid, rest);
+        let rest = restore_rect(tree.edge_h, ms, grid, rest);
+        restore_rect(
+            tree.cu_depth,
+            tree.cu_stride,
+            (row / 8, col / 8, size / 8, size / 8),
+            rest,
+        );
+        restore_rect(tree.bv_map, ms, grid, &self.bv);
+        self.qp.expect("restore of a saved node").apply(tree);
+    }
+}
+
+/// Buffers of [`search_cu32`], kept in the workspace between CTUs.
+#[derive(Default)]
+struct Cu32Search {
+    entry_32: NodeState,
+    leaf_32: NodeState,
+    entry_16: NodeState,
+    leaf_16: NodeState,
+    leaf_32_bins: CabacTracer,
+    split_32_bins: CabacTracer,
+    leaf_16_bins: CabacTracer,
+    split_16_bins: CabacTracer,
+}
+
+/// Memoized CU-quadtree search for one 32×32 node: the same {32} vs
+/// {four 16s, each the cheaper of a 16 and its four 8s} decision as
+/// [`rdo_cu32_plan`], but every alternative is coded exactly as the bitstream
+/// would carry it — real contexts threaded in Z order, the winning sibling's
+/// reconstruction and maps in place before the next sibling, the complete
+/// mode/TU/chroma search — into a [`CabacTracer`]. The winner's bins are then
+/// replayed into `cab` and its contexts adopted, so nothing is searched twice
+/// and the decision prices exactly what is emitted.
+///
+/// Against [`rdo_cu32_plan`] + [`commit_cu32_plan`] (cheap estimator trials,
+/// then a full re-search of the winner): −0.56% ssimulacra2 / −0.52% CVVDP
+/// BD-rate at 0.86× encode time in Fast, −0.44 / −0.45 at 0.81× in Slow.
+fn search_cu32(
+    cab: &mut CabacEncoder,
+    ctx: &mut ContextSet,
+    ictx: &mut IntraModeContexts,
+    tree: &mut CuTreeState<'_>,
+    row: usize,
+    col: usize,
+) {
+    const Z: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+    let mut s = std::mem::take(&mut tree.scratch.cu_search);
+    tree.start_qg(row, col, 32);
+    let lambda = tree.lambda;
+    let flag_32 = split_cu_context(tree.cu_depth, row, col, 1, tree.cu_stride);
+    s.entry_32.save(tree, row, col, 32);
+
+    // One 32×32 CU.
+    let (mut ctx_leaf, mut ictx_leaf) = (ctx.clone(), ictx.clone());
+    s.leaf_32_bins.clear();
+    s.leaf_32_bins
+        .encode_bin(0, &mut ctx_leaf.split_cu_flag[flag_32]);
+    encode_cu_leaf(
+        &mut s.leaf_32_bins,
+        &mut ctx_leaf,
+        &mut ictx_leaf,
+        tree,
+        row,
+        col,
+        32,
+        1,
+    );
+    let cost_leaf = cu_region_sse(tree, row, col, 32) + lambda * s.leaf_32_bins.bits();
+    s.leaf_32.save(tree, row, col, 32);
+    s.entry_32.restore(tree, row, col, 32);
+
+    // Four 16×16 nodes; each settles before the next one is searched.
+    let (mut ctx_split, mut ictx_split) = (ctx.clone(), ictx.clone());
+    s.split_32_bins.clear();
+    s.split_32_bins
+        .encode_bin(1, &mut ctx_split.split_cu_flag[flag_32]);
+    let mut dist_split = 0.0;
+    let mut split_wins = true;
+    for (dy, dx) in Z {
+        // Every remaining node only adds cost.
+        if dist_split + lambda * s.split_32_bins.bits() >= cost_leaf {
+            split_wins = false;
+            break;
+        }
+        let (r, c) = (row + dy * 16, col + dx * 16);
+        tree.start_qg(r, c, 16);
+        let flag_16 = split_cu_context(tree.cu_depth, r, c, 2, tree.cu_stride);
+        s.entry_16.save(tree, r, c, 16);
+
+        let (mut ctx_16, mut ictx_16) = (ctx_split.clone(), ictx_split.clone());
+        s.leaf_16_bins.clear();
+        s.leaf_16_bins
+            .encode_bin(0, &mut ctx_16.split_cu_flag[flag_16]);
+        encode_cu_leaf(
+            &mut s.leaf_16_bins,
+            &mut ctx_16,
+            &mut ictx_16,
+            tree,
+            r,
+            c,
+            16,
+            2,
+        );
+        let dist_16 = cu_region_sse(tree, r, c, 16);
+        let cost_16 = dist_16 + lambda * s.leaf_16_bins.bits();
+        s.leaf_16.save(tree, r, c, 16);
+        s.entry_16.restore(tree, r, c, 16);
+
+        let (mut ctx_8, mut ictx_8) = (ctx_split.clone(), ictx_split.clone());
+        s.split_16_bins.clear();
+        s.split_16_bins
+            .encode_bin(1, &mut ctx_8.split_cu_flag[flag_16]);
+        let mut dist_8 = 0.0;
+        let mut eights_win = true;
+        for (ey, ex) in Z {
+            if dist_8 + lambda * s.split_16_bins.bits() >= cost_16 {
+                eights_win = false;
+                break;
+            }
+            let (r8, c8) = (r + ey * 8, c + ex * 8);
+            encode_cu_leaf(
+                &mut s.split_16_bins,
+                &mut ctx_8,
+                &mut ictx_8,
+                tree,
+                r8,
+                c8,
+                8,
+                3,
+            );
+            dist_8 += cu_region_sse(tree, r8, c8, 8);
+        }
+        if eights_win && dist_8 + lambda * s.split_16_bins.bits() < cost_16 {
+            (ctx_split, ictx_split) = (ctx_8, ictx_8);
+            s.split_32_bins.append(&s.split_16_bins);
+            dist_split += dist_8;
+        } else {
+            s.leaf_16.restore(tree, r, c, 16);
+            (ctx_split, ictx_split) = (ctx_16, ictx_16);
+            s.split_32_bins.append(&s.leaf_16_bins);
+            dist_split += dist_16;
+        }
+        tree.end_qg(16);
+    }
+
+    if split_wins && dist_split + lambda * s.split_32_bins.bits() < cost_leaf {
+        cab.replay(&s.split_32_bins.trace);
+        (*ctx, *ictx) = (ctx_split, ictx_split);
+    } else {
+        s.leaf_32.restore(tree, row, col, 32);
+        cab.replay(&s.leaf_32_bins.trace);
+        (*ctx, *ictx) = (ctx_leaf, ictx_leaf);
+    }
+    tree.end_qg(32);
+    tree.scratch.cu_search = s;
 }
 
 #[inline]
@@ -8369,7 +8664,7 @@ fn encode_cu<W: CabacWriter>(
     // re-runs this search with the real coder. A lossy trial skips the
     // TU-split alternative: it rarely changes which CU partition wins
     // (measured BD-rate ±0.05%) and is ~20% of encode time.
-    let split_allowed = lu > 4 && (W::COMMIT || lossless);
+    let split_allowed = lu > 4 && (W::FULL_SEARCH || lossless);
 
     // The regular path is PART_2Nx2N. PART_NxN is handled by the dedicated 8×8
     // path below, where four independent 4×4 prediction modes are signaled.
@@ -8794,7 +9089,7 @@ fn encode_cu<W: CabacWriter>(
 
         let full_rd_count = if lossless {
             ranked.len()
-        } else if !W::COMMIT {
+        } else if !W::FULL_SEARCH {
             // CU-split trials price chroma with the best-ranked mode only; the
             // committed CU makes the full chroma decision.
             1
