@@ -86,6 +86,67 @@ fn select_offset(
     best
 }
 
+/// One sample of `source` (a coded picture `stride` wide, `height` tall)
+/// after SAO with `param`, exactly as [`apply_luma`] filters it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn sao_sample(
+    param: SaoParam,
+    source: &[u16],
+    stride: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    bit_depth: u8,
+    max_value: i32,
+) -> u16 {
+    let width = stride;
+    let s = source[y * stride + x];
+    match param.type_idx {
+        1 => {
+            let rel = ((s >> (bit_depth - 5)) as u8).wrapping_sub(param.band_pos);
+            if rel < 4 {
+                (i32::from(s) + i32::from(param.offsets[rel as usize])).clamp(0, max_value) as u16
+            } else {
+                s
+            }
+        }
+        2 => {
+            let (dx, dy): (i32, i32) = match param.eo_class {
+                0 => (1, 0),
+                1 => (0, 1),
+                2 => (1, 1),
+                _ => (1, -1),
+            };
+            let (xa, ya, xb, yb) = (x as i32 + dx, y as i32 + dy, x as i32 - dx, y as i32 - dy);
+            if xa < 0
+                || ya < 0
+                || xb < 0
+                || yb < 0
+                || xa as usize >= width
+                || xb as usize >= width
+                || ya as usize >= height
+                || yb as usize >= height
+            {
+                return s;
+            }
+            let sign = |p: u16, q: u16| (p > q) as i32 - (p < q) as i32;
+            let edge = sign(s, source[ya as usize * stride + xa as usize])
+                + sign(s, source[yb as usize * stride + xb as usize])
+                + 2;
+            let class = match edge {
+                0 => 0,
+                1 => 1,
+                3 => 2,
+                4 => 3,
+                _ => return s,
+            };
+            (i32::from(s) + i32::from(param.offsets[class])).clamp(0, max_value) as u16
+        }
+        _ => s,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn analyze_ctu(
     original: &[u16],
@@ -119,6 +180,7 @@ fn analyze_ctu(
     // type prefix contributes roughly one extra bit for enabled SAO.
     let mut best_cost = 0.0f64;
     let mut best = SaoParam::default();
+    let mut best_bits = 0u32;
     for band in 0..=28usize {
         let mut offsets = [0i8; 4];
         let mut delta = 0i64;
@@ -140,6 +202,7 @@ fn analyze_ctu(
         let cost = delta as f64 + f64::from(lambda) * f64::from(bits);
         if cost < best_cost {
             best_cost = cost;
+            best_bits = bits;
             best = SaoParam {
                 type_idx: 1,
                 offsets,
@@ -214,6 +277,7 @@ fn analyze_ctu(
         let cost = delta as f64 + f64::from(lambda) * f64::from(bits);
         if cost < best_cost {
             best_cost = cost;
+            best_bits = bits;
             best = SaoParam {
                 type_idx: 2,
                 offsets,
@@ -222,7 +286,33 @@ fn analyze_ctu(
             };
         }
     }
-    best
+    if best.type_idx == 0 {
+        return best;
+    }
+    // The offsets above are chosen in plain SSE, but every other decision of
+    // this encoder measures the perceptually weighted error, which discounts
+    // the high-frequency corrections SAO mostly makes. Keep the parameters
+    // only if they also lower the weighted J of the CTU (its coded area, as
+    // the decoder filters it): −0.22% ssimulacra2 / −0.13% CVVDP BD-rate,
+    // every image better, no measurable time. Re-choosing among the per-type
+    // winners by weighted J measured the same.
+    let (x1, y1) = ((x0 + 64).min(stride), (y0 + 64).min(coded_height));
+    let (h, w) = (y1 - y0, x1 - x0);
+    let max_value = ((1u32 << bit_depth) - 1) as i32;
+    let off = crate::cost::weighted_sse(h, w, |r, c| {
+        let idx = (y0 + r) * stride + x0 + c;
+        i32::from(original[idx]) - i32::from(rec[idx])
+    });
+    let on = crate::cost::weighted_sse(h, w, |r, c| {
+        let (y, x) = (y0 + r, x0 + c);
+        let filtered = sao_sample(best, rec, stride, coded_height, x, y, bit_depth, max_value);
+        i32::from(original[y * stride + x]) - i32::from(filtered)
+    });
+    if f64::from(on) + f64::from(lambda) * f64::from(best_bits) < f64::from(off) {
+        best
+    } else {
+        SaoParam::default()
+    }
 }
 
 /// Per-CTU luma SAO parameters. Statistics come from the visible
