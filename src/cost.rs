@@ -138,6 +138,97 @@ fn satd_scalar_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
     total
 }
 
+/// Weights of [`weighted_sse`] on a 4×4 DCT of the error: DC error is dearer,
+/// high-frequency error (k + l ≥ 3) cheaper — the RDOQ notion of perceptual
+/// distortion (`RDOQ_DC_WEIGHT` / `RDOQ_HF_START`), applied to decisions.
+///
+/// Every RD decision (luma/chroma mode, TU split, PART_NxN, CU split) used to
+/// compare plain pixel SSE while RDOQ weighted the same error by frequency;
+/// measuring decisions this way is −2.3% ssimulacra2 / −1.7% CVVDP BD-rate
+/// (Fast; Slow −3.2 / −2.4), every image better on both. The 4×4 tile puts
+/// the high-frequency edge at the same absolute frequency as RDOQ's band in
+/// any TB size and keeps NxN and 2Nx2N comparable. A uniform weight (≡ a λ
+/// change) recovers almost none of it. HF 0.2 here beats RDOQ's own 0.4
+/// (−2.32 vs −2.07 ss2); 0.1 or 0.0 are no better.
+pub(crate) static DISTORTION_WEIGHTS: [[f32; 4]; 4] = {
+    const DC: f32 = 1.8;
+    const HF: f32 = 0.2;
+    [
+        [DC, 1.0, 1.0, HF],
+        [1.0, 1.0, HF, HF],
+        [1.0, HF, HF, HF],
+        [HF, HF, HF, HF],
+    ]
+};
+
+/// Orthonormal 4-point DCT-II basis, `DCT4[k][i]`.
+pub(crate) static DCT4: [[f32; 4]; 4] = {
+    // cos(π(2i+1)k/8) for k = 1..3, precomputed.
+    const A: f32 = 0.5;
+    const B: f32 = 0.653_281_5; // √(1/2)·cos(π/8)
+    const C: f32 = 0.270_598_05; // √(1/2)·cos(3π/8)
+    [[A, A, A, A], [B, C, -C, -B], [A, -A, -A, A], [C, -B, B, -C]]
+};
+
+/// Perceptual squared error of an `h × w` region (both multiples of 4) whose
+/// sample errors `err(r, c)` are given: each 4×4 tile's error goes through an
+/// orthonormal DCT and its coefficients are weighted by
+/// [`DISTORTION_WEIGHTS`]. With all weights 1 this equals the plain SSE
+/// (Parseval).
+/// SIMD implementations reassociate sums and use FMA when available, so costs
+/// can differ slightly between CPU architectures and feature configurations.
+#[inline]
+pub(crate) fn weighted_sse(h: usize, w: usize, err: impl Fn(usize, usize) -> i32) -> f32 {
+    debug_assert!(h.is_multiple_of(4) && w.is_multiple_of(4));
+    // Keep the closure monomorphised so strided/clamped sample reads can inline
+    // into the SIMD loops. Feature detection is cached by the standard library
+    // and performed once per region, rather than once per 4×4 tile.
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::weighted_sse_neon(h, w, err) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return unsafe { crate::avx::weighted_sse_avx2_fma(h, w, err) };
+        }
+        weighted_sse_scalar(h, w, err)
+    }
+}
+
+#[inline]
+#[cfg_attr(all(target_arch = "aarch64", feature = "neon"), allow(dead_code))]
+pub(crate) fn weighted_sse_scalar(h: usize, w: usize, err: impl Fn(usize, usize) -> i32) -> f32 {
+    debug_assert!(h.is_multiple_of(4) && w.is_multiple_of(4));
+    let mut total = 0.0f32;
+    for r0 in (0..h).step_by(4) {
+        for c0 in (0..w).step_by(4) {
+            let mut e = [[0.0f32; 4]; 4];
+            for (i, row) in e.iter_mut().enumerate() {
+                for (j, v) in row.iter_mut().enumerate() {
+                    *v = err(r0 + i, c0 + j) as f32;
+                }
+            }
+            // Columns: t = DCT4 · e.
+            let mut t = [[0.0f32; 4]; 4];
+            for k in 0..4 {
+                for j in 0..4 {
+                    t[k][j] = (0..4).map(|i| DCT4[k][i] * e[i][j]).sum();
+                }
+            }
+            // Rows: coefficient (k, l) = Σ_j t[k][j]·DCT4[l][j].
+            for k in 0..4 {
+                for l in 0..4 {
+                    let c: f32 = (0..4).map(|j| t[k][j] * DCT4[l][j]).sum();
+                    total += DISTORTION_WEIGHTS[k][l] * c * c;
+                }
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,72 +257,128 @@ mod tests {
             );
         }
     }
-}
 
-/// Weights of [`weighted_sse`] on a 4×4 DCT of the error: DC error is dearer,
-/// high-frequency error (k + l ≥ 3) cheaper — the RDOQ notion of perceptual
-/// distortion (`RDOQ_DC_WEIGHT` / `RDOQ_HF_START`), applied to decisions.
-///
-/// Every RD decision (luma/chroma mode, TU split, PART_NxN, CU split) used to
-/// compare plain pixel SSE while RDOQ weighted the same error by frequency;
-/// measuring decisions this way is −2.3% ssimulacra2 / −1.7% CVVDP BD-rate
-/// (Fast; Slow −3.2 / −2.4), every image better on both. The 4×4 tile puts
-/// the high-frequency edge at the same absolute frequency as RDOQ's band in
-/// any TB size and keeps NxN and 2Nx2N comparable. A uniform weight (≡ a λ
-/// change) recovers almost none of it. HF 0.2 here beats RDOQ's own 0.4
-/// (−2.32 vs −2.07 ss2); 0.1 or 0.0 are no better.
-static DISTORTION_WEIGHTS: [[f32; 4]; 4] = {
-    const DC: f32 = 1.8;
-    const HF: f32 = 0.2;
-    [
-        [DC, 1.0, 1.0, HF],
-        [1.0, 1.0, HF, HF],
-        [1.0, HF, HF, HF],
-        [HF, HF, HF, HF],
-    ]
-};
-
-/// Orthonormal 4-point DCT-II basis, `DCT4[k][i]`.
-const DCT4: [[f32; 4]; 4] = {
-    // cos(π(2i+1)k/8) for k = 1..3, precomputed.
-    const A: f32 = 0.5;
-    const B: f32 = 0.653_281_5; // √(1/2)·cos(π/8)
-    const C: f32 = 0.270_598_05; // √(1/2)·cos(3π/8)
-    [[A, A, A, A], [B, C, -C, -B], [A, -A, -A, A], [C, -B, B, -C]]
-};
-
-/// Perceptual squared error of an `h × w` region (both multiples of 4) whose
-/// sample errors `err(r, c)` are given: each 4×4 tile's error goes through an
-/// orthonormal DCT and its coefficients are weighted by
-/// [`DISTORTION_WEIGHTS`]. With all weights 1 this equals the plain SSE
-/// (Parseval).
-#[inline]
-pub(crate) fn weighted_sse(h: usize, w: usize, err: impl Fn(usize, usize) -> i32) -> f32 {
-    debug_assert!(h.is_multiple_of(4) && w.is_multiple_of(4));
-    let mut total = 0.0f32;
-    for r0 in (0..h).step_by(4) {
-        for c0 in (0..w).step_by(4) {
-            let mut e = [[0.0f32; 4]; 4];
-            for (i, row) in e.iter_mut().enumerate() {
-                for (j, v) in row.iter_mut().enumerate() {
-                    *v = err(r0 + i, c0 + j) as f32;
-                }
-            }
-            // Columns: t = DCT4 · e.
-            let mut t = [[0.0f32; 4]; 4];
-            for k in 0..4 {
-                for j in 0..4 {
-                    t[k][j] = (0..4).map(|i| DCT4[k][i] * e[i][j]).sum();
-                }
-            }
-            // Rows: coefficient (k, l) = Σ_j t[k][j]·DCT4[l][j].
-            for k in 0..4 {
-                for l in 0..4 {
-                    let c: f32 = (0..4).map(|j| t[k][j] * DCT4[l][j]).sum();
-                    total += DISTORTION_WEIGHTS[k][l] * c * c;
+    fn weighted_sse_reference(h: usize, w: usize, err: impl Fn(usize, usize) -> i32) -> f64 {
+        let mut total = 0.0;
+        for r0 in (0..h).step_by(4) {
+            for c0 in (0..w).step_by(4) {
+                let e: [[f64; 4]; 4] = std::array::from_fn(|i| {
+                    std::array::from_fn(|j| f64::from(err(r0 + i, c0 + j)))
+                });
+                let t: [[f64; 4]; 4] = std::array::from_fn(|k| {
+                    std::array::from_fn(|j| (0..4).map(|i| f64::from(DCT4[k][i]) * e[i][j]).sum())
+                });
+                for k in 0..4 {
+                    for l in 0..4 {
+                        let c: f64 = (0..4).map(|j| t[k][j] * f64::from(DCT4[l][j])).sum();
+                        total += f64::from(DISTORTION_WEIGHTS[k][l]) * c * c;
+                    }
                 }
             }
         }
+        total
     }
-    total
+
+    fn assert_weighted_sse_close(actual: f32, expected: f64) {
+        // Allow rounding from FMA and reassociated sums across thousands of
+        // coefficients, while keeping relative error below 0.001%.
+        let tolerance = expected.abs() * 1e-5 + 1e-5;
+        assert!(
+            actual.is_finite()
+                && actual >= 0.0
+                && (f64::from(actual) - expected).abs() <= tolerance,
+            "weighted SSE {actual} differs from reference {expected} by more than {tolerance}",
+        );
+    }
+
+    fn check_weighted_sse(h: usize, w: usize, err: impl Fn(usize, usize) -> i32 + Copy) {
+        let expected = weighted_sse_reference(h, w, err);
+        assert_weighted_sse_close(weighted_sse_scalar(h, w, err), expected);
+        assert_weighted_sse_close(weighted_sse(h, w, err), expected);
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        assert_weighted_sse_close(
+            unsafe { crate::neon::weighted_sse_neon(h, w, err) },
+            expected,
+        );
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            assert_weighted_sse_close(
+                unsafe { crate::avx::weighted_sse_avx2_fma(h, w, err) },
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_sse_known_dc_difference() {
+        // Constant error 8 has just one nonzero coefficient: DC = 4 * 8.
+        assert_weighted_sse_close(weighted_sse(4, 4, |_, _| 8), 1.8 * 32.0 * 32.0);
+        assert_eq!(weighted_sse(8, 12, |_, _| 0), 0.0);
+    }
+
+    #[test]
+    fn weighted_sse_matches_reference() {
+        for (h, w) in [
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+            (8, 16),
+            (16, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (12, 20),
+            (20, 12),
+        ] {
+            let mut errors = vec![0i32; h * w];
+            for seed in 0..32u32 {
+                let mut state = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                let mask = (1 << [8, 10, 12, 16][seed as usize % 4]) - 1;
+                for (i, error) in errors.iter_mut().enumerate() {
+                    state = state.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                    let orig = ((state >> 8) & mask) as i32;
+                    state = state.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                    let pred = ((state >> 8) & mask) as i32;
+                    *error = match seed {
+                        0 => 65535,
+                        1 => -65535,
+                        2 => {
+                            if i % 2 == 0 {
+                                4095
+                            } else {
+                                -4095
+                            }
+                        }
+                        3 => {
+                            if i == w + 1 {
+                                4095
+                            } else {
+                                0
+                            }
+                        }
+                        _ => orig - pred,
+                    };
+                }
+                check_weighted_sse(h, w, |r, c| errors[r * w + c]);
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_sse_strided_and_clamped_reads() {
+        let orig: Vec<u16> = (0..11 * 13).map(|i| (i * 67 % 4096) as u16).collect();
+        let rec: Vec<u16> = (0..19 * 23).map(|i| (i * 29 % 4096) as u16).collect();
+        check_weighted_sse(12, 20, |r, c| {
+            i32::from(orig[(r + 3).min(10) * 13 + (c + 5).min(12)])
+                - i32::from(rec[(r + 2) * 23 + c + 1])
+        });
+    }
+
+    #[test]
+    fn weighted_sse_empty_regions_do_not_read_samples() {
+        for (h, w) in [(0, 0), (0, 8), (8, 0)] {
+            check_weighted_sse(h, w, |_, _| panic!("empty region read"));
+        }
+    }
 }
