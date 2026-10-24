@@ -28,11 +28,9 @@
  */
 
 use hpvca::{
-    BitDepth, ChromaFormat, Cicp, EncodeConfig, MatrixCoefficients, ParallelismStrategy, Primaries,
-    Speed, TransferFunction,
+    ChromaFormat, Cicp, EncodeConfig, MatrixCoefficients, ParallelismStrategy, Primaries, Speed,
+    TransferFunction,
 };
-use hpvcd::ImageBuffer;
-use image::imageops::FilterType;
 use std::fs;
 use std::time::Instant;
 

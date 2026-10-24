@@ -62,6 +62,8 @@ pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunc
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use gain_map::{GainMap, GainMapPixels, IsoGainMap, apple_decode, apple_encode};
+#[doc(hidden)]
+pub use hevc_transform::{SbhRepairStats, sbh_repair_stats_take};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
 
@@ -103,6 +105,15 @@ impl Speed {
     /// Whether the reconstructed intra shortlist is RDOQ'd inside the RD loop.
     pub(crate) fn rdoq_in_loop(self) -> bool {
         matches!(self, Speed::Slow)
+    }
+
+    /// Whether RDOQ's sign-data-hiding parity repair is chosen by
+    /// rate-distortion cost rather than by quantisation error alone. Measured
+    /// −0.8% BD-rate (ssimulacra2) at ~1.1–1.25× CPU in Fast; null in Slow,
+    /// where the repair runs on every in-loop RDOQ call, so Slow keeps the
+    /// plain repair.
+    pub(crate) fn rd_sign_hiding(self) -> bool {
+        matches!(self, Speed::Fast)
     }
 }
 
