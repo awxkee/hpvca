@@ -57,6 +57,36 @@ pub(crate) fn encode_cbf_chroma<W: CabacWriter>(
     enc.encode_bin(flag as u8, &mut ctx.cbf_chroma[idx]);
 }
 
+/// Encode `cross_comp_pred(x0, y0, c)` (RExt §7.3.8.12): `res_scale` is
+/// ResScaleVal ∈ {0, ±1, ±2, ±4, ±8} for Cb (`c = 0`) or Cr (`c = 1`).
+/// `log2_res_scale_abs_plus1` is context-coded truncated unary with cMax 4
+/// (ctxInc = 4·c + binIdx), then `res_scale_sign_flag` (ctxInc = c) when
+/// the scale is nonzero.
+pub(crate) fn encode_cross_comp_pred<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    c: usize,
+    res_scale: i8,
+) {
+    debug_assert!(c < 2);
+    debug_assert!(matches!(res_scale.unsigned_abs(), 0 | 1 | 2 | 4 | 8));
+    let magnitude = res_scale.unsigned_abs();
+    let log2_abs_plus1 = if magnitude == 0 {
+        0
+    } else {
+        magnitude.trailing_zeros() as usize + 1
+    };
+    for bin in 0..log2_abs_plus1 {
+        enc.encode_bin(1, &mut ctx.log2_res_scale_abs_plus1[4 * c + bin]);
+    }
+    if log2_abs_plus1 < 4 {
+        enc.encode_bin(0, &mut ctx.log2_res_scale_abs_plus1[4 * c + log2_abs_plus1]);
+    }
+    if magnitude != 0 {
+        enc.encode_bin(u8::from(res_scale < 0), &mut ctx.res_scale_sign_flag[c]);
+    }
+}
+
 /// Encode a coefficient block using HEVC CABAC residual_coding() syntax.
 ///
 /// `coeffs`  — coefficients in HEVC sub-block-major diagonal scan order
@@ -761,6 +791,41 @@ fn encode_coeff_remaining<W: CabacWriter>(enc: &mut W, value: u32, rice_k: u32) 
 mod tests {
     use super::*;
     use crate::cabac::{CabacEncoder, ContextSet};
+
+    #[test]
+    fn cross_comp_pred_binarization() {
+        // log2_res_scale_abs_plus1: truncated unary, cMax 4; then the sign.
+        let cases: [(i8, &[u8]); 9] = [
+            (0, &[0]),
+            (1, &[1, 0, 0]),
+            (-1, &[1, 0, 1]),
+            (2, &[1, 1, 0, 0]),
+            (-2, &[1, 1, 0, 1]),
+            (4, &[1, 1, 1, 0, 0]),
+            (-4, &[1, 1, 1, 0, 1]),
+            (8, &[1, 1, 1, 1, 0]),
+            (-8, &[1, 1, 1, 1, 1]),
+        ];
+        for (scale, bins) in cases {
+            for c in 0..2 {
+                let mut ctx = ContextSet::init_islice(30);
+                let untouched = ctx.log2_res_scale_abs_plus1[4 * (1 - c)..4 * (1 - c) + 4]
+                    .iter()
+                    .map(|m| m.estimated_bits(0))
+                    .collect::<Vec<_>>();
+                let mut sink = crate::cabac::CabacTracer::default();
+                encode_cross_comp_pred(&mut sink, &mut ctx, c, scale);
+                let coded: Vec<u8> = sink.trace.iter().map(|&r| ((r >> 9) & 1) as u8).collect();
+                assert_eq!(coded, bins, "scale {scale} c {c}");
+                // Only component c's contexts are used.
+                let after = ctx.log2_res_scale_abs_plus1[4 * (1 - c)..4 * (1 - c) + 4]
+                    .iter()
+                    .map(|m| m.estimated_bits(0))
+                    .collect::<Vec<_>>();
+                assert_eq!(after, untouched);
+            }
+        }
+    }
 
     fn make_coeffs(vals: &[(usize, i16)], len: usize) -> Vec<i16> {
         let mut c = vec![0i16; len];

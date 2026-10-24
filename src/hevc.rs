@@ -33,8 +33,8 @@ use crate::{
     cabac::{
         CabacEncoder, CabacEstimator, CabacTracer, CabacWriter, ContextSet, IntraModeContexts,
         advance_residual_contexts, advance_residual_contexts_ts, encode_cbf_chroma,
-        encode_cbf_luma, encode_residual, encode_residual_ts, estimate_residual_bits,
-        estimate_residual_bits_ts,
+        encode_cbf_luma, encode_cross_comp_pred, encode_residual, encode_residual_ts,
+        estimate_residual_bits, estimate_residual_bits_ts,
     },
     dct,
     error::EncodeError,
@@ -570,7 +570,7 @@ fn write_vui(bw: &mut BitWriter, color: Option<&crate::color::Cicp>) {
 
 #[cfg(test)]
 pub(crate) fn build_pps(qp: u8, lossless: bool, wpp: bool) -> Nalu {
-    build_pps_tiled(qp, lossless, wpp, 1, 1, 0, false, false)
+    build_pps_tiled(qp, lossless, wpp, 1, 1, 0, false, PictureTools::default())
 }
 
 /// PPS with an optional uniform tile grid. `tile_cols`/`tile_rows` == 1 means no
@@ -584,7 +584,7 @@ pub(crate) fn build_pps_tiled(
     tile_rows: usize,
     cqo: i8,
     ibc: bool,
-    transform_skip: bool,
+    tools: PictureTools,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 34);
@@ -602,7 +602,7 @@ pub(crate) fn build_pps_tiled(
     bw.write_ue(0); // num_ref_idx_l1_default_active_minus1
     bw.write_se(qp as i32 - 26); // init_qp_minus26: carry the full slice QP here
     bw.write_bit(false); // constrained_intra_pred_flag
-    bw.write_bit(transform_skip); // transform_skip_enabled_flag
+    bw.write_bit(tools.transform_skip); // transform_skip_enabled_flag
 
     // Activity AQ uses one quantization group per 64x64 CTU.  A CTU-level QG
     // keeps the syntax and QP predictor cheap while still allowing the encoder
@@ -656,13 +656,26 @@ pub(crate) fn build_pps_tiled(
     bw.write_bit(false); // slice_segment_header_extension_present_flag
     // pps_scc_extension carries pps_curr_pic_ref_enabled_flag, which is what
     // actually places the current picture in RefPicList0 for IntraBC.
-    bw.write_bit(ibc); // pps_extension_present_flag
-    if ibc {
-        bw.write_bit(false); // pps_range_extension_flag
+    // pps_range_extension carries cross_component_prediction_enabled_flag.
+    let range_ext = tools.cross_component;
+    bw.write_bit(ibc || range_ext); // pps_extension_present_flag
+    if ibc || range_ext {
+        bw.write_bit(range_ext); // pps_range_extension_flag
         bw.write_bit(false); // pps_multilayer_extension_flag
         bw.write_bit(false); // pps_3d_extension_flag
-        bw.write_bit(true); // pps_scc_extension_flag
+        bw.write_bit(ibc); // pps_scc_extension_flag
         bw.write_bits(0, 4); // pps_extension_4bits
+    }
+    if range_ext {
+        if tools.transform_skip {
+            bw.write_ue(0); // log2_max_transform_skip_block_size_minus2: 4×4
+        }
+        bw.write_bit(tools.cross_component); // cross_component_prediction_enabled_flag
+        bw.write_bit(false); // chroma_qp_offset_list_enabled_flag
+        bw.write_ue(0); // log2_sao_offset_scale_luma
+        bw.write_ue(0); // log2_sao_offset_scale_chroma
+    }
+    if ibc {
         bw.write_bit(true); // pps_curr_pic_ref_enabled_flag
         bw.write_bit(false); // residual_adaptive_color_transform_enabled_flag
         bw.write_bit(false); // pps_palette_predictor_initializers_present_flag
@@ -801,17 +814,11 @@ pub(crate) fn encode_intra_opts(
     );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
-    let transform_skip = transform_skip_enabled(qp_val, lossless) && screen_like(yuv);
-    let pps = build_pps_tiled(
-        qp_val,
-        lossless,
-        wpp,
-        tile_cols,
-        tile_rows,
-        cqo,
-        ibc,
-        transform_skip,
-    );
+    let tools = PictureTools {
+        transform_skip: transform_skip_enabled(qp_val, lossless) && screen_like(yuv),
+        cross_component: cross_component_enabled(yuv.chroma, lossless, scc, ibc),
+    };
+    let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo, ibc, tools);
     // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
     // background workers plus the calling thread give `threads`-way concurrency; the
     // pool (and its threads) is dropped when this function returns.
@@ -838,7 +845,7 @@ pub(crate) fn encode_intra_opts(
         ibc,
         implicit_rdpcm,
         persistent_rice,
-        transform_skip,
+        tools,
     )?;
     Ok(NaluStream {
         nalus: vec![vps, sps, pps, idr],
@@ -854,7 +861,7 @@ fn init_context_set(
     implicit_rdpcm: bool,
     requested_rice: bool,
     ibc: bool,
-    transform_skip: bool,
+    tools: PictureTools,
 ) -> ContextSet {
     let persistent_rice =
         persistent_rice_enabled(yuv.chroma, yuv.bit_depth, implicit_rdpcm, requested_rice);
@@ -863,8 +870,140 @@ fn init_context_set(
     } else {
         ContextSet::init_islice_ext(qp, persistent_rice)
     };
-    ctx.transform_skip_enabled = transform_skip;
+    ctx.transform_skip_enabled = tools.transform_skip;
+    ctx.cross_component = tools.cross_component;
     ctx
+}
+
+/// Cross-component prediction scale (ResScaleVal ∈ {0, ±1, ±2, ±4, ±8},
+/// predictor `(ResScaleVal · rY) >> 3`) for a chroma residual `chroma` given
+/// the co-located reconstructed luma residual `luma` (equal bit depths): the
+/// value minimizing the remaining residual energy.
+fn cross_component_scale(chroma: &[i32], luma: &[i32]) -> i8 {
+    let energy = |scale: i32| -> i64 {
+        chroma
+            .iter()
+            .zip(luma)
+            .map(|(&c, &y)| {
+                let d = i64::from(c - ((scale * y) >> 3));
+                d * d
+            })
+            .sum()
+    };
+    let mut best = (energy(0), 0i8);
+    for scale in [1i8, 2, 4, 8, -1, -2, -4, -8] {
+        let e = energy(i32::from(scale));
+        if e < best.0 {
+            best = (e, scale);
+        }
+    }
+    best.1
+}
+
+/// Working buffers and parameters for [`predict_cross_component`].
+struct CcpTb<'a> {
+    fwd: crate::hevc_transform::FwdTransformFn,
+    n: usize,
+    chroma_qp: u8,
+    bit_depth: u8,
+    scan: &'a [(usize, usize)],
+    lambda: f32,
+    component: usize,
+}
+
+/// Cross-component prediction of one chroma TB: pick the scale for the
+/// chroma residual `residual` from the co-located reconstructed luma
+/// residual `luma`, and if it is nonzero subtract the prediction from
+/// `residual` in place. The minimum-energy scale is kept only when the
+/// quantized-TB proxy J (distortion + λ·(fitted rate + the scale's syntax
+/// bits in `ctx`)) beats no prediction. `tmp`, `coeff` and `transform_tmp`
+/// are scratch.
+#[allow(clippy::too_many_arguments)]
+fn predict_cross_component(
+    tb: CcpTb<'_>,
+    residual: &mut [i32],
+    luma: &[i32],
+    ctx: &ContextSet,
+    tmp: &mut [i32],
+    coeff: &mut [i32],
+    transform_tmp: &mut [i32],
+) -> i8 {
+    let len = tb.n * tb.n;
+    let scale = cross_component_scale(&residual[..len], &luma[..len]);
+    if scale == 0 {
+        return 0;
+    }
+    let mut cost = [0.0f32; 2];
+    for (slot, trial) in [scale, 0].into_iter().enumerate() {
+        for ((dst, &r), &y) in tmp[..len]
+            .iter_mut()
+            .zip(&residual[..len])
+            .zip(&luma[..len])
+        {
+            *dst = r - ((i32::from(trial) * y) >> 3);
+        }
+        crate::hevc_transform::run_fwd_transform(
+            tb.fwd,
+            &tmp[..len],
+            tb.n,
+            tb.bit_depth,
+            coeff,
+            transform_tmp,
+            false,
+        );
+        let stats = crate::hevc_transform::quantized_tb_stats(
+            coeff,
+            tb.n,
+            tb.chroma_qp,
+            tb.bit_depth,
+            tb.scan,
+        );
+        let mut est = CabacEstimator::default();
+        let mut syntax_ctx = ctx.clone();
+        encode_cross_comp_pred(&mut est, &mut syntax_ctx, tb.component, trial);
+        cost[slot] = stats.distortion + tb.lambda * (luma_rate_proxy(&stats, tb.n) + est.bits());
+    }
+    if cost[0] >= cost[1] {
+        return 0;
+    }
+    for (r, &y) in residual[..len].iter_mut().zip(&luma[..len]) {
+        *r -= (i32::from(scale) * y) >> 3;
+    }
+    scale
+}
+
+/// Add a chroma TB's cross-component prediction back to its reconstructed
+/// residual (the decoder's §8.6.6 residual modification).
+fn add_cross_component(inverse: &mut [i32], luma: &[i32], scale: i8) {
+    if scale == 0 {
+        return;
+    }
+    for (r, &y) in inverse.iter_mut().zip(luma) {
+        *r += (i32::from(scale) * y) >> 3;
+    }
+}
+
+/// Picture-level coding tools, resolved once per picture: the PPS bits and
+/// every residual coder of the picture must agree on them.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PictureTools {
+    /// `transform_skip_enabled_flag` (see [`transform_skip_enabled`]).
+    pub(crate) transform_skip: bool,
+    /// `cross_component_prediction_enabled_flag` (see
+    /// [`cross_component_enabled`]).
+    pub(crate) cross_component: bool,
+}
+
+/// Whether the picture enables cross-component prediction (RExt §7.4.3.3.2):
+/// only defined for ChromaArrayType 3. Lossy, non-screen-content 4:4:4 only —
+/// the lossless, palette and IntraBC paths do not model it.
+fn cross_component_enabled(
+    chroma: crate::fmt::ChromaFormat,
+    lossless: bool,
+    scc: bool,
+    ibc: bool,
+) -> bool {
+    matches!(chroma, crate::fmt::ChromaFormat::Yuv444) && !lossless && !scc && !ibc
 }
 
 /// Highest picture QP (PPS `init_qp`) at which 4×4 transform skip is enabled
@@ -1011,7 +1150,7 @@ fn encode_wpp_parallel(
     rdoq_in_loop: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
-    transform_skip: bool,
+    tools: PictureTools,
     ibc_hash: Option<&crate::ibc::HashTable>,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u16>>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1079,7 +1218,7 @@ fn encode_wpp_parallel(
         scratch.rdoq_in_loop = rdoq_in_loop;
         scratch.implicit_rdpcm = implicit_rdpcm;
         scratch.persistent_rice = persistent_rice;
-        scratch.transform_skip = transform_skip;
+        scratch.tools = tools;
         loop {
             let r = next_row.fetch_add(1, Ordering::Relaxed);
             if r >= ctus_y {
@@ -1096,14 +1235,7 @@ fn encode_wpp_parallel(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(
-                        qp,
-                        yuv,
-                        implicit_rdpcm,
-                        persistent_rice,
-                        ibc,
-                        transform_skip,
-                    ),
+                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc, tools),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1516,7 +1648,7 @@ fn encode_region_pass(
     // agree on this; it was resolved once per encode and stored on the scratch.
     let implicit_rdpcm = scratch.implicit_rdpcm;
     let persistent_rice = scratch.persistent_rice;
-    let transform_skip = scratch.transform_skip;
+    let tools = scratch.tools;
     // IntraBC searches by source-block hash. Screen content repeats at
     // arbitrary distances, so a windowed motion search would miss nearly all of
     // it; hashing the source once per region turns the search into a lookup
@@ -1545,14 +1677,7 @@ fn encode_region_pass(
     let mut traces: Vec<Vec<u16>> = Vec::new();
     let substreams = if !wpp {
         let mut cab = CabacEncoder::with_trace(trace);
-        let mut ctx = init_context_set(
-            qp,
-            yuv,
-            implicit_rdpcm,
-            persistent_rice,
-            ibc,
-            transform_skip,
-        );
+        let mut ctx = init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc, tools);
         let mut ictx = init_intra_contexts(qp, ibc);
         // The palette predictor is reset at the start of every slice segment
         // (and therefore every tile) alongside the context variables.
@@ -1648,7 +1773,7 @@ fn encode_region_pass(
             scratch.rdoq_in_loop,
             scratch.implicit_rdpcm,
             scratch.persistent_rice,
-            scratch.transform_skip,
+            scratch.tools,
             ibc_hash,
         );
         traces = row_traces;
@@ -1667,14 +1792,7 @@ fn encode_region_pass(
                 let mut pred = crate::palette::PalettePredictor::default();
                 pred.reset(palette_comps);
                 (
-                    init_context_set(
-                        qp,
-                        yuv,
-                        implicit_rdpcm,
-                        persistent_rice,
-                        ibc,
-                        transform_skip,
-                    ),
+                    init_context_set(qp, yuv, implicit_rdpcm, persistent_rice, ibc, tools),
                     init_intra_contexts(qp, ibc),
                     pred,
                 )
@@ -1819,13 +1937,13 @@ fn encode_region_substreams(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
-    transform_skip: bool,
+    tools: PictureTools,
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
     ws.cc.implicit_rdpcm = implicit_rdpcm;
     ws.cc.persistent_rice = persistent_rice;
-    ws.cc.transform_skip = transform_skip;
+    ws.cc.tools = tools;
     // AQ analysis is source-only and identical for the SAO analysis/commit
     // passes. Compute it once here and share the compact per-QG offset table —
     // unless the caller supplies one sliced from the full picture this region
@@ -1924,7 +2042,7 @@ fn encode_region_substreams(
             ws.cc.implicit_rdpcm,
             ws.cc.persistent_rice,
             ibc,
-            ws.cc.transform_skip,
+            ws.cc.tools,
         ),
         yuv.bit_depth.bits(),
     );
@@ -2104,7 +2222,7 @@ fn build_idr_slice(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
-    transform_skip: bool,
+    tools: PictureTools,
 ) -> Result<Nalu, EncodeError> {
     let ParallelPlan {
         wpp,
@@ -2191,7 +2309,7 @@ fn build_idr_slice(
             ibc,
             implicit_rdpcm,
             persistent_rice,
-            transform_skip,
+            tools,
         );
         let substreams = output.substreams;
         if wpp {
@@ -2287,7 +2405,7 @@ fn build_idr_slice(
                             ibc,
                             implicit_rdpcm,
                             persistent_rice,
-                            transform_skip,
+                            tools,
                         );
                         // SAFETY: each task writes a distinct tile-output slot.
                         unsafe {
@@ -3330,6 +3448,10 @@ struct ChromaEvalOpts {
     estimate_rate: bool,
     winner_rdoq: bool,
     cost_limit: f32,
+    /// Offset of this TU's reconstructed luma residual in
+    /// `ccp_child_luma_res` when its DM chroma may use cross-component
+    /// prediction (4:4:4, coded luma, the picture enables the tool).
+    ccp_luma: Option<usize>,
 }
 
 /// Stride/position geometry for the PART_NxN intra CU coder.
@@ -3399,6 +3521,12 @@ struct TuTreeScratch {
     /// transform_skip_flag of each 4×4 luma child (always false for larger TBs).
     y_ts: [bool; 4],
     chroma_scan_idx: [u8; 8],
+    /// Whether each child TU's chroma uses the DM mode — with a coded luma
+    /// residual, the condition for `cross_comp_pred()` in a 4:4:4 picture
+    /// that enables cross-component prediction.
+    chroma_dm: [bool; 4],
+    /// Each child TU's ResScaleVal for Cb and Cr (0 = no prediction).
+    ccp_scale: [[i8; 2]; 4],
     split: [bool; 85],
     node_y_nz: [bool; 85],
     node_y_scan_idx: [u8; 85],
@@ -3421,6 +3549,8 @@ impl TuTreeScratch {
             y_scan_idx: [0; 4],
             y_ts: [false; 4],
             chroma_scan_idx: [0; 8],
+            chroma_dm: [false; 4],
+            ccp_scale: [[0; 2]; 4],
             split: [false; 85],
             node_y_nz: [false; 85],
             node_y_scan_idx: [0; 85],
@@ -3482,8 +3612,18 @@ pub(crate) struct CompressionContext {
     /// The SPS bit and the residual coder's `StatCoeff` state must agree, so
     /// both derive from [`persistent_rice_enabled`] with this value.
     persistent_rice: bool,
-    /// PPS `transform_skip_enabled_flag` (see [`transform_skip_enabled`]).
-    transform_skip: bool,
+    /// Picture-level coding tools the PPS enables (see [`PictureTools`]).
+    tools: PictureTools,
+    /// ResScaleVal for Cb and Cr of the unsplit TU of the CU being coded.
+    unsplit_ccp_scale: [i8; 2],
+    /// Reconstructed luma residual of the unsplit TU, the cross-component
+    /// predictor of its chroma residuals.
+    ccp_luma_res: Box<[i32]>,
+    /// The same for the four child TUs of a split TU or PART_NxN, packed by
+    /// child index.
+    ccp_child_luma_res: Box<[i32]>,
+    /// Cb/Cr scales the last [`evaluate_chroma_mode`] call coded with.
+    eval_ccp_scale: [i8; 2],
     /// Slice/tile/WPP-row persistent palette predictor (SCC §9.3.2.3). It lives
     /// in the workspace rather than the context set because RD trials must read
     /// it without paying for a clone; only a committing sink updates it.
@@ -3555,7 +3695,11 @@ impl CompressionContext {
             rdoq_in_loop: false,
             implicit_rdpcm: false,
             persistent_rice: true,
-            transform_skip: false,
+            tools: PictureTools::default(),
+            unsplit_ccp_scale: [0; 2],
+            ccp_luma_res: vec![0; 1024].into_boxed_slice(),
+            ccp_child_luma_res: vec![0; 1024].into_boxed_slice(),
+            eval_ccp_scale: [0; 2],
             palette_pred: crate::palette::PalettePredictor::default(),
             palette_cand: crate::palette::PaletteCu::new(),
             palette_runs: Vec::new(),
@@ -6381,6 +6525,10 @@ fn commit_split_luma(
                     true,
                 );
             }
+            if residual_ctx.cross_component {
+                scratch.ccp_child_luma_res[index * child_len..(index + 1) * child_len]
+                    .copy_from_slice(&scratch.inverse[..child_len]);
+            }
             for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
                 .chunks_exact(child)
                 .zip(scratch.pred[..child_len].chunks_exact(child))
@@ -6406,12 +6554,14 @@ fn split_chroma_is_shared(parent_luma: usize, chroma: crate::fmt::ChromaFormat) 
     child_luma / chroma.sub_w() < 4 || child_luma / chroma.sub_h() < 4
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_split_chroma(
     scratch: &mut CompressionContext,
     planes: ChromaPlanes<'_>,
     geom: ChromaSplitGeom,
     coding: ChromaCoding,
     mode: u8,
+    chroma_dm: bool,
     ctx_after_luma: &ContextSet,
     lossless: bool,
 ) {
@@ -6456,6 +6606,9 @@ fn commit_split_chroma(
     let ch_row = lu_row / sub_h;
     let ch_col = lu_col / sub_w;
     let mut residual_ctx = ctx_after_luma.clone();
+    // Cross-component prediction of each child's chroma from its own
+    // reconstructed luma residual (4:4:4, DM chroma, coded luma).
+    let ccp = is_444 && !lossless && chroma_dm && ctx_after_luma.cross_component;
 
     // HEVC predicts each chroma transform block from its own reconstructed
     // neighbors, exactly like luma. Walk every child TB in decode order and
@@ -6568,6 +6721,29 @@ fn commit_split_chroma(
                         &mut scratch.levels,
                     );
                 } else {
+                    let luma_offset = child_index * child_len;
+                    let ccp_scale = if ccp && scratch.tu_tree.y_nz[child_index] {
+                        predict_cross_component(
+                            CcpTb {
+                                fwd: scratch.fwd_transform,
+                                n: child_side,
+                                chroma_qp,
+                                bit_depth,
+                                scan,
+                                lambda,
+                                component,
+                            },
+                            &mut scratch.residual,
+                            &scratch.ccp_child_luma_res[luma_offset..luma_offset + child_len],
+                            &residual_ctx,
+                            &mut scratch.dequant,
+                            &mut scratch.coeff,
+                            &mut scratch.transform_tmp,
+                        )
+                    } else {
+                        0
+                    };
+                    scratch.tu_tree.ccp_scale[child_index][component] = ccp_scale;
                     crate::hevc_transform::run_fwd_transform(
                         scratch.fwd_transform,
                         &scratch.residual[..child_len],
@@ -6671,6 +6847,12 @@ fn commit_split_chroma(
                         &mut scratch.transform_tmp,
                         false,
                     );
+                    let luma_offset = child_index * child_len;
+                    add_cross_component(
+                        &mut scratch.inverse[..child_len],
+                        &scratch.ccp_child_luma_res[luma_offset..luma_offset + child_len],
+                        scratch.tu_tree.ccp_scale[child_index][component],
+                    );
                     for (r, (inv_row, pred_row)) in scratch.inverse[..child_len]
                         .chunks_exact(child_side)
                         .zip(scratch.pred[..child_len].chunks_exact(child_side))
@@ -6706,7 +6888,10 @@ fn evaluate_chroma_mode(
         estimate_rate,
         winner_rdoq,
         cost_limit,
+        ccp_luma,
     } = opts;
+    let ccp_luma = ccp_luma.filter(|_| candidate.syntax_idx == CHROMA_DM_SYNTAX_IDX);
+    scratch.eval_ccp_scale = [0; 2];
     let ChromaPlanes {
         src_cb,
         src_cr,
@@ -6836,6 +7021,25 @@ fn evaluate_chroma_mode(
                 side,
                 &mut scratch.residual,
             );
+            if let Some(offset) = ccp_luma {
+                scratch.eval_ccp_scale[component] = predict_cross_component(
+                    CcpTb {
+                        fwd: scratch.fwd_transform,
+                        n: side,
+                        chroma_qp,
+                        bit_depth,
+                        scan,
+                        lambda,
+                        component,
+                    },
+                    &mut scratch.residual,
+                    &scratch.ccp_child_luma_res[offset..offset + block_len],
+                    &rdoq_ctx,
+                    &mut scratch.dequant,
+                    &mut scratch.coeff,
+                    &mut scratch.transform_tmp,
+                );
+            }
             crate::hevc_transform::run_fwd_transform(
                 scratch.fwd_transform,
                 &scratch.residual[..block_len],
@@ -6916,6 +7120,13 @@ fn evaluate_chroma_mode(
                 &mut scratch.transform_tmp,
                 false,
             );
+            if let Some(offset) = ccp_luma {
+                add_cross_component(
+                    &mut scratch.inverse[..block_len],
+                    &scratch.ccp_child_luma_res[offset..offset + block_len],
+                    scratch.eval_ccp_scale[component],
+                );
+            }
             intra::reconstruct_into(
                 &scratch.pred[..block_len],
                 &scratch.inverse[..block_len],
@@ -6954,6 +7165,15 @@ fn evaluate_chroma_mode(
     for tb in &scratch.chroma_tbs[..stacked] {
         rate += trial_ctx.cbf_chroma[trafo_depth.min(4)].estimate_and_update(tb.cr_nz as u8);
     }
+    let ccp_bits = |trial_ctx: &mut ContextSet, c: usize| -> f32 {
+        if ccp_luma.is_none() {
+            return 0.0;
+        }
+        let mut est = CabacEstimator::default();
+        encode_cross_comp_pred(&mut est, trial_ctx, c, scratch.eval_ccp_scale[c]);
+        est.bits()
+    };
+    rate += ccp_bits(&mut trial_ctx, 0);
     for tb in &scratch.chroma_tbs[..stacked] {
         if tb.cb_nz {
             rate += estimate_residual_bits(
@@ -6966,6 +7186,7 @@ fn evaluate_chroma_mode(
             );
         }
     }
+    rate += ccp_bits(&mut trial_ctx, 1);
     for tb in &scratch.chroma_tbs[..stacked] {
         if tb.cr_nz {
             rate += estimate_residual_bits(
@@ -7045,6 +7266,9 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
         .into_iter()
         .enumerate()
     {
+        let ccp_luma = (residual_ctx_after_luma.cross_component
+            && scratch.tu_tree.y_nz[child_index])
+            .then_some(child_index * LEN);
         let row = lu_row + dy * SIDE;
         let col = lu_col + dx * SIDE;
         extract_block_dyn_into(
@@ -7131,6 +7355,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
                         estimate_rate: true,
                         winner_rdoq: false,
                         cost_limit: best_cost,
+                        ccp_luma,
                     },
                     scratch,
                     ChromaPlanes {
@@ -7173,6 +7398,7 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
                 estimate_rate: false,
                 winner_rdoq: true,
                 cost_limit: f32::MAX,
+                ccp_luma,
             },
             scratch,
             ChromaPlanes {
@@ -7215,6 +7441,8 @@ fn encode_nxn_chroma_444<W: CabacWriter>(
         scratch.tu_tree.cr_nz[child_index] = cr_nz;
         let scan_idx = dct::scan_idx_for(best.pred_mode, 2, false, true);
         scratch.tu_tree.chroma_scan_idx[child_index] = scan_idx;
+        scratch.tu_tree.chroma_dm[child_index] = best.syntax_idx == CHROMA_DM_SYNTAX_IDX;
+        scratch.tu_tree.ccp_scale[child_index] = scratch.eval_ccp_scale;
         encode_chroma_mode(enc, ictx, best.syntax_idx);
 
         let _ = residual_ctx.cbf_chroma[1].estimate_and_update(cb_nz as u8);
@@ -7635,6 +7863,10 @@ fn encode_cu_nxn<W: CabacWriter>(
                 true,
             );
         }
+        if rdoq_ctx.cross_component {
+            scratch.ccp_child_luma_res[pu_index * PU_LEN..(pu_index + 1) * PU_LEN]
+                .copy_from_slice(&scratch.inverse[..PU_LEN]);
+        }
         intra::reconstruct_into(
             &scratch.best_pred[..PU_LEN],
             &scratch.inverse[..PU_LEN],
@@ -7788,6 +8020,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                         estimate_rate: true,
                         winner_rdoq: false,
                         cost_limit: best_cost,
+                        ccp_luma: None,
                     },
                     scratch,
                     ChromaPlanes {
@@ -7831,6 +8064,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 estimate_rate: false,
                 winner_rdoq: true,
                 cost_limit: f32::MAX,
+                ccp_luma: None,
             },
             scratch,
             ChromaPlanes {
@@ -8041,6 +8275,10 @@ fn encode_split_transform_tree<W: CabacWriter>(
         let side = child / chroma.sub_w();
         let len = side * side;
         let log2_side = side.trailing_zeros();
+        let cross_comp = ctx.cross_component && y_nz && scratch.tu_tree.chroma_dm[child_index];
+        if cross_comp {
+            encode_cross_comp_pred(enc, ctx, 0, scratch.tu_tree.ccp_scale[child_index][0]);
+        }
         for stack_index in 0..stacked {
             let index = child_index * stacked + stack_index;
             if scratch.tu_tree.cb_nz[index] {
@@ -8055,6 +8293,9 @@ fn encode_split_transform_tree<W: CabacWriter>(
                     sign_data_hiding,
                 );
             }
+        }
+        if cross_comp {
+            encode_cross_comp_pred(enc, ctx, 1, scratch.tu_tree.ccp_scale[child_index][1]);
         }
         for stack_index in 0..stacked {
             let index = child_index * stacked + stack_index;
@@ -8871,6 +9112,9 @@ fn encode_cu<W: CabacWriter>(
             &mut scratch.transform_tmp,
             false,
         );
+        if ctx.cross_component {
+            scratch.ccp_luma_res[..num_luma].copy_from_slice(&scratch.inverse[..num_luma]);
+        }
     }
     intra::reconstruct_into(
         &scratch.best_pred[..num_luma],
@@ -9012,6 +9256,7 @@ fn encode_cu<W: CabacWriter>(
     let n_ch = ctb * ctb;
 
     let mut chroma_tb_scan_idx = 0u8;
+    let mut chroma_is_dm = false;
     let shared_chroma = matches!(tu_layout, TuLayout::Split)
         && !chroma.is_monochrome()
         && split_chroma_is_shared(lu, chroma);
@@ -9277,6 +9522,13 @@ fn encode_cu<W: CabacWriter>(
             }
         }
 
+        // Cross-component prediction of the unsplit TU's chroma residuals
+        // from its reconstructed luma residual (4:4:4, DM chroma, coded luma).
+        let ccp_unsplit = is_444
+            && !lossless
+            && residual_ctx_after_luma.cross_component
+            && y_nz
+            && matches!(tu_layout, TuLayout::Unsplit);
         let mut evaluate_chroma = |candidate: ChromaModeCandidate,
                                    estimate_rate: bool,
                                    winner_rdoq: bool,
@@ -9372,6 +9624,29 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.levels,
                         );
                     } else {
+                        let ccp_scale =
+                            if ccp_unsplit && candidate.syntax_idx == CHROMA_DM_SYNTAX_IDX {
+                                predict_cross_component(
+                                    CcpTb {
+                                        fwd: scratch.fwd_transform,
+                                        n: ctb,
+                                        chroma_qp,
+                                        bit_depth: bit_depth.bits(),
+                                        scan,
+                                        lambda: chroma_lambda,
+                                        component,
+                                    },
+                                    &mut scratch.residual,
+                                    &scratch.ccp_luma_res,
+                                    &residual_ctx_after_luma,
+                                    &mut scratch.dequant,
+                                    &mut scratch.coeff,
+                                    &mut scratch.transform_tmp,
+                                )
+                            } else {
+                                0
+                            };
+                        scratch.unsplit_ccp_scale[component] = ccp_scale;
                         crate::hevc_transform::run_fwd_transform(
                             scratch.fwd_transform,
                             &scratch.residual[..n_ch],
@@ -9451,6 +9726,11 @@ fn encode_cu<W: CabacWriter>(
                             &mut scratch.transform_tmp,
                             false,
                         );
+                        add_cross_component(
+                            &mut scratch.inverse[..n_ch],
+                            &scratch.ccp_luma_res[..n_ch],
+                            scratch.unsplit_ccp_scale[component],
+                        );
                         intra::reconstruct_into(
                             &scratch.pred[..n_ch],
                             &scratch.inverse[..n_ch],
@@ -9490,6 +9770,15 @@ fn encode_cu<W: CabacWriter>(
             }
             // cbf_luma is candidate-independent and uses a separate context,
             // so omitting it preserves ordering and avoids a constant cost.
+            let ccp_coded = ccp_unsplit && candidate.syntax_idx == CHROMA_DM_SYNTAX_IDX;
+            let ccp_bits = |trial_ctx: &mut ContextSet, c: usize| {
+                let mut est = CabacEstimator::default();
+                encode_cross_comp_pred(&mut est, trial_ctx, c, scratch.unsplit_ccp_scale[c]);
+                est.bits()
+            };
+            if ccp_coded {
+                rate += ccp_bits(&mut trial_ctx, 0);
+            }
             for tb in &scratch.chroma_tbs[..n_chroma_tb] {
                 if tb.cb_nz {
                     rate += estimate_residual_bits(
@@ -9501,6 +9790,9 @@ fn encode_cu<W: CabacWriter>(
                         !lossless,
                     );
                 }
+            }
+            if ccp_coded {
+                rate += ccp_bits(&mut trial_ctx, 1);
             }
             for tb in &scratch.chroma_tbs[..n_chroma_tb] {
                 if tb.cr_nz {
@@ -9599,11 +9891,13 @@ fn encode_cu<W: CabacWriter>(
                     lambda: chroma_lambda,
                 },
                 best_chroma.pred_mode,
+                best_chroma.syntax_idx == CHROMA_DM_SYNTAX_IDX,
                 &residual_ctx_after_luma,
                 lossless,
             );
         }
         encode_chroma_mode(enc, ictx, best_chroma.syntax_idx);
+        chroma_is_dm = best_chroma.syntax_idx == CHROMA_DM_SYNTAX_IDX;
     }
 
     match tu_layout {
@@ -9637,6 +9931,10 @@ fn encode_cu<W: CabacWriter>(
                     !lossless,
                 );
             }
+            let cross_comp = ctx.cross_component && y_nz && chroma_is_dm;
+            if cross_comp {
+                encode_cross_comp_pred(enc, ctx, 0, scratch.unsplit_ccp_scale[0]);
+            }
             for t in &scratch.chroma_tbs[..n_chroma_tb] {
                 if t.cb_nz {
                     encode_residual(
@@ -9649,6 +9947,9 @@ fn encode_cu<W: CabacWriter>(
                         !lossless,
                     );
                 }
+            }
+            if cross_comp {
+                encode_cross_comp_pred(enc, ctx, 1, scratch.unsplit_ccp_scale[1]);
             }
             for t in &scratch.chroma_tbs[..n_chroma_tb] {
                 if t.cr_nz {
@@ -9664,17 +9965,20 @@ fn encode_cu<W: CabacWriter>(
                 }
             }
         }
-        TuLayout::Split => encode_split_transform_tree(
-            enc,
-            ctx,
-            scratch,
-            lu,
-            chroma,
-            false,
-            shared_chroma,
-            !lossless,
-            aq,
-        ),
+        TuLayout::Split => {
+            scratch.tu_tree.chroma_dm = [chroma_is_dm; 4];
+            encode_split_transform_tree(
+                enc,
+                ctx,
+                scratch,
+                lu,
+                chroma,
+                false,
+                shared_chroma,
+                !lossless,
+                aq,
+            )
+        }
         TuLayout::Recursive => encode_lossless_transform_tree(enc, ctx, scratch, lu, chroma),
     }
 }
@@ -10803,7 +11107,7 @@ mod tests {
             false,
             false,
             true,
-            false,
+            PictureTools::default(),
         );
         let sse = |rec: &[u16]| -> u64 {
             y.iter()
@@ -10865,7 +11169,7 @@ mod tests {
             false,
             false,
             true,
-            false,
+            PictureTools::default(),
         );
         assert_eq!(output.cb.len(), w * h);
         assert_eq!(output.cr.len(), w * h);

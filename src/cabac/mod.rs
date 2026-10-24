@@ -35,6 +35,6 @@ pub(crate) use contexts::{ContextSet, IntraModeContexts};
 pub(crate) use engine::{CabacEncoder, CabacEstimator, CabacTracer, CabacWriter, bin_trace};
 pub(crate) use residual::{
     MAX_PERSISTENT_RICE, advance_residual_contexts, advance_residual_contexts_ts,
-    encode_cbf_chroma, encode_cbf_luma, encode_residual, encode_residual_ts,
-    estimate_residual_bits, estimate_residual_bits_ts,
+    encode_cbf_chroma, encode_cbf_luma, encode_cross_comp_pred, encode_residual,
+    encode_residual_ts, estimate_residual_bits, estimate_residual_bits_ts,
 };

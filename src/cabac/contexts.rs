@@ -88,6 +88,16 @@ pub(crate) struct ContextSet {
     /// TB of a non-bypass CU carries a transform_skip_flag (§7.3.8.11).
     pub(crate) transform_skip_enabled: bool,
 
+    /// Cross-component prediction (RExt): `log2_res_scale_abs_plus1`
+    /// (ctxInc = 4·c + binIdx) and `res_scale_sign_flag` (ctxInc = c), c = 0
+    /// for Cb and 1 for Cr; initValue 154 in every init type.
+    pub(crate) log2_res_scale_abs_plus1: [CtxModel; 8],
+    pub(crate) res_scale_sign_flag: [CtxModel; 2],
+    /// Whether the PPS sets `cross_component_prediction_enabled_flag`. When
+    /// set, every transform unit with a coded luma residual whose CU uses the
+    /// DM chroma mode carries `cross_comp_pred()` for Cb and for Cr.
+    pub(crate) cross_component: bool,
+
     // cu_transquant_bypass_flag (1 ctx). initValue 154 for all init types
     // (HEVC Table 9-43). Used only when the PPS enables transquant bypass
     // (lossless coding).
@@ -205,6 +215,9 @@ impl ContextSet {
             persistent_rice: false,
             transform_skip_flag: arr([139, 139], qp),
             transform_skip_enabled: false,
+            log2_res_scale_abs_plus1: arr([154; 8], qp),
+            res_scale_sign_flag: arr([154; 2], qp),
+            cross_component: false,
 
             cu_transquant_bypass_flag: c(154, qp),
 
@@ -262,6 +275,9 @@ impl ContextSet {
             persistent_rice,
             transform_skip_flag: arr([139, 139], qp),
             transform_skip_enabled: false,
+            log2_res_scale_abs_plus1: arr([154; 8], qp),
+            res_scale_sign_flag: arr([154; 2], qp),
+            cross_component: false,
             cu_transquant_bypass_flag: c(154, qp),
 
             part_mode: arr([154, 139, 154, 154], qp),
