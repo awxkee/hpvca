@@ -30,7 +30,9 @@
 mod dequant;
 mod satd;
 mod transform;
+mod weighted_sse;
 
 pub(crate) use dequant::dequantize_avx2;
 pub(crate) use satd::satd_avx2;
 pub(crate) use transform::{fwd_transform_avx2, inv_transform_avx2};
+pub(crate) use weighted_sse::weighted_sse_avx2_fma;

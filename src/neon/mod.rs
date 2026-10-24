@@ -30,7 +30,9 @@
 mod dequant;
 mod satd;
 mod transform;
+mod weighted_sse;
 
 pub(crate) use dequant::dequantize_neon;
 pub(crate) use satd::satd_neon;
 pub(crate) use transform::{fwd_transform_neon, inv_transform_neon};
+pub(crate) use weighted_sse::weighted_sse_neon;
