@@ -1148,6 +1148,7 @@ fn encode_wpp_parallel(
     sao_enabled: bool,
     trace: bool,
     rdoq_in_loop: bool,
+    rd_sign_hiding: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
     tools: PictureTools,
@@ -1216,6 +1217,7 @@ fn encode_wpp_parallel(
         let mut lease = crate::coder_scratch::lease();
         let scratch = &mut lease.cc;
         scratch.rdoq_in_loop = rdoq_in_loop;
+        scratch.rdoq.rd_sign_hiding = rd_sign_hiding;
         scratch.implicit_rdpcm = implicit_rdpcm;
         scratch.persistent_rice = persistent_rice;
         scratch.tools = tools;
@@ -1771,6 +1773,7 @@ fn encode_region_pass(
             sao_enabled,
             trace,
             scratch.rdoq_in_loop,
+            scratch.rdoq.rd_sign_hiding,
             scratch.implicit_rdpcm,
             scratch.persistent_rice,
             scratch.tools,
@@ -1941,6 +1944,7 @@ fn encode_region_substreams(
 ) -> RegionOutput {
     let mut ws = crate::coder_scratch::lease();
     ws.cc.rdoq_in_loop = effort.rdoq_in_loop();
+    ws.cc.rdoq.rd_sign_hiding = effort.rd_sign_hiding();
     ws.cc.implicit_rdpcm = implicit_rdpcm;
     ws.cc.persistent_rice = persistent_rice;
     ws.cc.tools = tools;

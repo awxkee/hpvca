@@ -31,7 +31,7 @@
 
 use crate::cabac::residual::sig_coeff_ctx;
 use crate::cabac::{ContextSet, MAX_PERSISTENT_RICE};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 4×4 HEVC transform matrix.
 pub(crate) static T4: [[i32; 4]; 4] = [
@@ -133,6 +133,10 @@ pub(crate) struct RdoqScratch {
     /// Cleared while ranking mode candidates, whose RD comparison measures
     /// plain pixel SSE; only the committed coefficients are weighted.
     pub(crate) perceptual: bool,
+    /// Whether the sign-data-hiding parity repair is RD-priced
+    /// (`rd_sign_hiding_repair`) instead of error-only (`Speed::rd_sign_hiding`).
+    /// `HPVCA_SBH_RD` overrides it in both directions for experiments.
+    pub(crate) rd_sign_hiding: bool,
     cost_coeff: [f32; MAX_TB],
     cost_coeff0: [f32; MAX_TB],
     cost_sig: [f32; MAX_TB],
@@ -156,6 +160,7 @@ impl RdoqScratch {
     pub(crate) fn new() -> Self {
         Self {
             perceptual: true,
+            rd_sign_hiding: false,
             cost_coeff: [0.0; MAX_TB],
             cost_coeff0: [0.0; MAX_TB],
             cost_sig: [0.0; MAX_TB],
@@ -746,8 +751,10 @@ fn rdoq_with_sign_hiding_into(
     let round = 1i64 << (q_bits - 1);
     let distortion = RdoqDistortion::new(n, qp, bit_depth);
 
+    let rd_sign_hiding = scratch.rd_sign_hiding;
     let RdoqScratch {
         perceptual: _,
+        rd_sign_hiding: _,
         cost_coeff,
         cost_coeff0,
         cost_sig,
@@ -1039,7 +1046,43 @@ fn rdoq_with_sign_hiding_into(
             levels[pos] = -levels[pos];
         }
     }
+    let stat = sbh_stat_enabled();
+    let rd_mode = sbh_rd_mode(rd_sign_hiding);
+    let rd = rd_mode != 0;
+    if !stat && !rd {
+        apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
+        return;
+    }
+    let p = FrozenTbCost {
+        is_luma,
+        cbf_depth,
+        dc_weight,
+        hf_weight,
+        hf_start,
+    };
+    let pre = *levels;
+    if rd {
+        let p_repair = if rd_mode == 2 {
+            FrozenTbCost {
+                dc_weight: 1.0,
+                hf_weight: 1.0,
+                ..p
+            }
+        } else {
+            p
+        };
+        rd_sign_hiding_repair(tb, levels, ctx, &p_repair);
+    }
+    // Safety net: a no-op once every eligible group's parity holds.
+    let mid = *levels;
     apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
+    if rd && stat && mid[..n * n] != levels[..n * n] {
+        sbh_stats().net_fired += 1;
+    }
+    if stat {
+        let untruncated = best_last_p1 == initial_last + 1;
+        sbh_stat_record(tb, &pre, levels, ctx, &p, untruncated.then_some(best_cost));
+    }
 }
 
 /// Winner-only RDOQ for a committed luma mode.
@@ -2065,4 +2108,766 @@ pub(crate) fn quantized_tb_stats(
     let gain_log2 = 15 - bit_depth as i32 - log2n as i32;
     stats.distortion = coeff_sse * 1.028 * (-2.0 * gain_log2 as f32).exp2();
     stats
+}
+
+// ---------------------------------------------------------------------------
+// Measurement: cost of the post-hoc sign-hiding repair.
+//
+// Enabled with `HPVCA_SBH_STAT=1`. Prices the RDOQ winner under the frozen
+// context model (the same estimator RDOQ optimizes against) immediately before
+// and after `apply_sign_hiding_to_levels`, and accumulates the difference in
+// λ-normalized bits. The "before" cost credits the hidden sign bit as if parity
+// were already satisfied, so the accumulated delta is an upper bound on what a
+// parity-aware joint optimizer could recover relative to the current pipeline.
+// ---------------------------------------------------------------------------
+
+// A mutex rather than 64-bit atomics: those are missing on 32-bit targets such
+// as powerpc, and the lock is only taken when `HPVCA_SBH_STAT` is set.
+static SBH_STATS: Mutex<SbhRepairStats> = Mutex::new(SbhRepairStats::ZERO);
+static SBH_STAT_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn sbh_stats() -> MutexGuard<'static, SbhRepairStats> {
+    SBH_STATS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sbh_stat_enabled() -> bool {
+    *SBH_STAT_ENABLED.get_or_init(|| std::env::var("HPVCA_SBH_STAT").is_ok())
+}
+
+/// Accumulated sign-hiding repair statistics (see [`sbh_repair_stats_take`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SbhRepairStats {
+    /// Lossy TBs that reached the repair step with at least one level.
+    pub tbs: u64,
+    /// TBs whose levels were changed by the repair.
+    pub tbs_repaired: u64,
+    /// Coefficient groups eligible for sign hiding before repair.
+    pub groups_eligible: u64,
+    /// Eligible groups whose parity disagreed with the hidden sign.
+    pub groups_violating: u64,
+    /// Estimated λ-normalized cost (bits) of all winners before repair.
+    pub pre_bits: f64,
+    /// Same after repair.
+    pub post_bits: f64,
+    /// Sum of positive per-TB deltas (repair made the TB worse), bits.
+    pub delta_pos_bits: f64,
+    /// Sum of negative per-TB deltas (repair happened to improve), bits.
+    pub delta_neg_bits: f64,
+    /// Distortion part of the delta, λ-normalized bits.
+    pub delta_dist_bits: f64,
+    /// Rate part of the delta, bits.
+    pub delta_rate_bits: f64,
+    /// Frozen-model rate (bits, sign hiding credited) of all winners before repair.
+    pub pre_rate_bits: f64,
+    /// Untruncated TBs where the evaluator was compared against RDOQ's own cost.
+    pub checked: u64,
+    /// Of those, TBs where the two disagreed by more than 0.01 bits.
+    pub mismatch: u64,
+    /// Largest disagreement seen, bits.
+    pub mismatch_max_bits: f64,
+    /// TBs where the HDQ safety net still changed a level after the RD repair.
+    pub net_fired: u64,
+    /// Winning RD-repair candidate classes: 0 nz toward real value, 1 nz away,
+    /// 2 zero inside span, 3 zero above last, 4 zero below first.
+    pub class: [u64; 5],
+}
+
+impl SbhRepairStats {
+    const ZERO: Self = Self {
+        tbs: 0,
+        tbs_repaired: 0,
+        groups_eligible: 0,
+        groups_violating: 0,
+        pre_bits: 0.0,
+        post_bits: 0.0,
+        delta_pos_bits: 0.0,
+        delta_neg_bits: 0.0,
+        delta_dist_bits: 0.0,
+        delta_rate_bits: 0.0,
+        pre_rate_bits: 0.0,
+        checked: 0,
+        mismatch: 0,
+        mismatch_max_bits: 0.0,
+        net_fired: 0,
+        class: [0; 5],
+    };
+}
+
+/// Take and reset the accumulated repair statistics.
+pub fn sbh_repair_stats_take() -> SbhRepairStats {
+    std::mem::replace(&mut *sbh_stats(), SbhRepairStats::ZERO)
+}
+
+#[derive(Clone, Copy)]
+struct FrozenTbCost {
+    is_luma: bool,
+    cbf_depth: usize,
+    dc_weight: f32,
+    hf_weight: f32,
+    hf_start: usize,
+}
+
+/// Weighted distortion of one coefficient group under the RDOQ model.
+fn group_dist(tb: &RdoqTb<'_>, levels: &[i16; MAX_TB], p: &FrozenTbCost, group: usize) -> f32 {
+    let n = tb.n;
+    let distortion = RdoqDistortion::new(n, tb.qp, tb.bit_depth);
+    let mut dist = 0.0f32;
+    for &(row, col) in &tb.scan[group * 16..group * 16 + 16] {
+        let pos = row * n + col;
+        let w = if pos == 0 {
+            p.dc_weight
+        } else if row + col >= p.hf_start {
+            p.hf_weight
+        } else {
+            1.0
+        };
+        let level = levels[pos].unsigned_abs() as u32;
+        dist += distortion.coefficient_cost((tb.coeff[pos] as i64).abs(), level) * w;
+    }
+    dist
+}
+
+/// Rate of one coded-or-not coefficient group under the frozen context model:
+/// coded_sub_block_flag (where coded), significance flags, level bins and one
+/// sign bit per non-zero level, minus the hidden sign when `hide_signs` and the
+/// group is eligible. Returns the greater1 context carry for the next group.
+#[allow(clippy::too_many_arguments)]
+fn price_group(
+    tb: &RdoqTb<'_>,
+    levels: &[i16; MAX_TB],
+    ctx: &ContextSet,
+    p: &FrozenTbCost,
+    group: usize,
+    last_group: usize,
+    last: usize,
+    prev_csbf: u8,
+    carry_c1_in: i32,
+    hide_signs: bool,
+    sig_bits: Option<&[[f32; 2]; 16]>,
+) -> (f32, i32) {
+    const GROUP_SIZE: usize = 16;
+    const C1_FLAGS: u32 = 8;
+    let RdoqTb {
+        n, scan, scan_idx, ..
+    } = *tb;
+    let is_luma = p.is_luma;
+    let log2_size = n.trailing_zeros();
+    let group_start = group * GROUP_SIZE;
+    let has_nz = (0..GROUP_SIZE).any(|k| {
+        let (row, col) = scan[group_start + k];
+        levels[row * n + col] != 0
+    });
+    let mut bits = 0.0f32;
+    if group != last_group && group != 0 {
+        let cg_ctx = if is_luma {
+            (prev_csbf != 0) as usize
+        } else {
+            2 + (prev_csbf != 0) as usize
+        };
+        bits += ctx.coded_sub_block_flag[cg_ctx].estimated_bits(has_nz as u8);
+    }
+    let mut ctx_set = if group == 0 || !is_luma {
+        0usize
+    } else {
+        2usize
+    };
+    if carry_c1_in == 0 {
+        ctx_set += 1;
+    }
+    let mut c1 = 1i32;
+    if !has_nz {
+        return (bits, c1);
+    }
+    let mut c1_idx = 0u32;
+    let mut c2_idx = 0u32;
+    let mut rice = if ctx.persistent_rice {
+        u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+    } else {
+        0
+    };
+    let nnz_above_pos0 = (1..GROUP_SIZE).any(|k| {
+        let (row, col) = scan[group_start + k];
+        levels[row * n + col] != 0
+    });
+    let infer_pos0 = group != last_group && group != 0 && !nnz_above_pos0;
+    let mut first_nz_k = GROUP_SIZE;
+    let mut last_nz_k = 0usize;
+
+    for k in (0..GROUP_SIZE).rev() {
+        let scan_pos = group_start + k;
+        if scan_pos > last {
+            continue;
+        }
+        let (row, col) = scan[scan_pos];
+        let pos = row * n + col;
+        let level = levels[pos].unsigned_abs() as u32;
+        let is_last = scan_pos == last;
+        if !is_last && !(k == 0 && infer_pos0) {
+            bits += match sig_bits {
+                Some(t) => t[k][(level != 0) as usize],
+                None => {
+                    let sig_ctx = sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
+                        .min(ctx.sig_coeff_flag.len() - 1);
+                    ctx.sig_coeff_flag[sig_ctx].estimated_bits((level != 0) as u8)
+                }
+            };
+        }
+        if level == 0 {
+            continue;
+        }
+        first_nz_k = k;
+        last_nz_k = last_nz_k.max(k);
+        bits += rdoq_level_bits(level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx);
+        let base_level = if c1_idx < C1_FLAGS {
+            2 + (c2_idx == 0) as u32
+        } else {
+            1
+        };
+        if level >= base_level && level > (3 << rice) {
+            rice = (rice + 1).min(if ctx.persistent_rice {
+                MAX_PERSISTENT_RICE
+            } else {
+                4
+            });
+        }
+        c1_idx += 1;
+        if level > 1 {
+            c1 = 0;
+            c2_idx += 1;
+        } else if (1..3).contains(&c1) {
+            c1 += 1;
+        }
+    }
+    if hide_signs && last_nz_k - first_nz_k >= 4 {
+        bits -= 1.0;
+    }
+    (bits, c1)
+}
+
+/// `prev_csbf` (right | below << 1) for every group up to `last_group`.
+fn group_csbf_neighbors(
+    tb: &RdoqTb<'_>,
+    levels: &[i16; MAX_TB],
+    last_group: usize,
+    prev_csbf: &mut [u8; 64],
+) {
+    let n = tb.n;
+    let sb_side = n / 4;
+    let sb_scan = crate::dct::sb_scan_for(n.trailing_zeros(), tb.scan_idx);
+    let mut group_flags = [0u8; 64];
+    for (group, &(sbx, sby)) in sb_scan.iter().enumerate().take(last_group + 1) {
+        let nz = (0..16).any(|k| {
+            let (row, col) = tb.scan[group * 16 + k];
+            levels[row * n + col] != 0
+        });
+        group_flags[sbx + sby * sb_side] = nz as u8;
+    }
+    for group in 0..=last_group {
+        let (sbx, sby) = sb_scan[group];
+        let grid = sbx + sby * sb_side;
+        let right = sbx + 1 < sb_side && group_flags[grid + 1] != 0;
+        let below = sby + 1 < sb_side && group_flags[grid + sb_side] != 0;
+        prev_csbf[group] = right as u8 | ((below as u8) << 1);
+    }
+}
+
+/// Price a complete level set under the frozen context model RDOQ uses.
+/// Returns `(distortion, bits)`; `bits` includes cbf, last position, coded
+/// sub-block flags, significance, levels and one sign bit per non-zero level,
+/// minus one for every group eligible for sign hiding when `hide_signs`.
+fn frozen_tb_cost(
+    tb: &RdoqTb<'_>,
+    levels: &[i16; MAX_TB],
+    ctx: &ContextSet,
+    p: &FrozenTbCost,
+    hide_signs: bool,
+) -> (f32, f32) {
+    const GROUP_SIZE: usize = 16;
+    let RdoqTb {
+        n, scan, scan_idx, ..
+    } = *tb;
+    let is_luma = p.is_luma;
+    let num_coeffs = n * n;
+    let log2_size = n.trailing_zeros();
+    let num_groups = num_coeffs / GROUP_SIZE;
+
+    let mut dist = 0.0f32;
+    for group in 0..num_groups {
+        dist += group_dist(tb, levels, p, group);
+    }
+    let last_scan_pos = (0..num_coeffs).rev().find(|&sp| {
+        let (row, col) = scan[sp];
+        levels[row * n + col] != 0
+    });
+    let cbf = if is_luma {
+        ctx.cbf_luma[if p.cbf_depth == 0 { 1 } else { 0 }]
+    } else {
+        ctx.cbf_chroma[p.cbf_depth.min(4)]
+    };
+    let Some(last) = last_scan_pos else {
+        return (dist, cbf.estimated_bits(0));
+    };
+    let mut bits = cbf.estimated_bits(1);
+    {
+        let (row, col) = scan[last];
+        bits += last_sig_bits(ctx, col, row, log2_size, scan_idx, is_luma);
+    }
+    let last_group = last / GROUP_SIZE;
+    let mut prev_csbf = [0u8; 64];
+    group_csbf_neighbors(tb, levels, last_group, &mut prev_csbf);
+    let mut carry_c1 = 1i32;
+    for group in (0..=last_group).rev() {
+        let (b, carry) = price_group(
+            tb,
+            levels,
+            ctx,
+            p,
+            group,
+            last_group,
+            last,
+            prev_csbf[group],
+            carry_c1,
+            hide_signs,
+            None,
+        );
+        bits += b;
+        carry_c1 = carry;
+    }
+    (dist, bits)
+}
+
+static SBH_RD_MODE: OnceLock<Option<u8>> = OnceLock::new();
+
+/// `HPVCA_SBH_RD` override: unset = the tier's choice (`RdoqScratch::rd_sign_hiding`),
+/// 0 = HDQ repair, 1 = RD repair with RDOQ's weighted distortion, 2 = RD repair
+/// with plain SSE distortion.
+fn sbh_rd_env() -> Option<u8> {
+    *SBH_RD_MODE.get_or_init(|| {
+        std::env::var("HPVCA_SBH_RD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Effective repair mode for a TB: 0 = HDQ, 1 = RD weighted, 2 = RD plain SSE.
+fn sbh_rd_mode(tier_rd: bool) -> u8 {
+    sbh_rd_env().unwrap_or(tier_rd as u8)
+}
+
+static SBH_RD_TOP_M: OnceLock<usize> = OnceLock::new();
+
+/// `HPVCA_SBH_RD_TOPM`: candidates fully priced per group after proxy
+/// ranking; 0 prices every legal candidate. Measured (8 images, Fast 4:2:0,
+/// ssimulacra2 BD-rate vs the HDQ repair): exhaustive −0.81%, 8 −0.75%,
+/// 4 −0.83%, all within noise, so 4 is the default.
+fn sbh_rd_top_m() -> usize {
+    *SBH_RD_TOP_M.get_or_init(|| {
+        std::env::var("HPVCA_SBH_RD_TOPM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// Rate-distortion aware sign-data-hiding repair.
+///
+/// For every coefficient group whose parity disagrees with the sign to hide,
+/// try each single ±1 level change in the group — including changes that zero
+/// the first or last coefficient, move the hidden sign to another coefficient,
+/// or shrink the group below the eligibility span — and keep the legal change
+/// with the lowest cost under the frozen context model. Only this group and
+/// the next lower group (through the greater1 context carry) and the last
+/// position can change cost, so those are the only parts repriced.
+fn rd_sign_hiding_repair(
+    tb: &RdoqTb<'_>,
+    levels: &mut [i16; MAX_TB],
+    ctx: &ContextSet,
+    p: &FrozenTbCost,
+) {
+    const GROUP_SIZE: usize = 16;
+    let RdoqTb {
+        coeff,
+        n,
+        scan,
+        scan_idx,
+        ..
+    } = *tb;
+    let lambda = tb.lambda * rdoq_lambda_scale();
+    let log2_size = n.trailing_zeros();
+    let num_coeffs = n * n;
+    let q_bits = 14 + tb.qp as i64 / 6 + (15 - tb.bit_depth as i64 - log2_size as i64);
+    let q_scale = QUANT_SCALE[(tb.qp % 6) as usize];
+    let idx = |sp: usize| {
+        let (row, col) = scan[sp];
+        row * n + col
+    };
+    let Some(mut last) = (0..num_coeffs).rev().find(|&sp| levels[idx(sp)] != 0) else {
+        return;
+    };
+    let last_group = last / GROUP_SIZE;
+    let mut prev_csbf = [0u8; 64];
+    group_csbf_neighbors(tb, levels, last_group, &mut prev_csbf);
+
+    // Entering greater1 carry per group from the pre-repair levels; groups are
+    // processed high to low and the carry is refreshed after each repair.
+    // The exit carry of a group is 0 exactly when it holds a level above 1
+    // (c1 drops to 0 and never recovers within the group); an empty group
+    // resets it to 1.
+    let mut carry_in = [1i32; 64];
+    let mut carry = 1i32;
+    for group in (0..=last_group).rev() {
+        carry_in[group] = carry;
+        let gs = group * GROUP_SIZE;
+        carry = (!(0..GROUP_SIZE).any(|k| levels[idx(gs + k)].unsigned_abs() > 1)) as i32;
+    }
+
+    for group in (0..=last_group).rev() {
+        let gs = group * GROUP_SIZE;
+        let span = |levels: &[i16; MAX_TB]| -> Option<(usize, usize)> {
+            let first = (0..GROUP_SIZE).find(|&k| levels[idx(gs + k)] != 0)?;
+            let last = (0..GROUP_SIZE).rev().find(|&k| levels[idx(gs + k)] != 0)?;
+            Some((first, last))
+        };
+        let parity_ok = |levels: &[i16; MAX_TB], first: usize, last: usize| -> bool {
+            let sum: i32 = (first..=last).map(|k| levels[idx(gs + k)] as i32).sum();
+            (levels[idx(gs + first)] < 0) as i32 == (sum & 1)
+        };
+        let Some((first_k, last_k)) = span(levels) else {
+            continue;
+        };
+        if last_k - first_k < 4 || parity_ok(levels, first_k, last_k) {
+            continue;
+        }
+        // The next lower group's cost depends on this group only through
+        // whether the greater1 carry is zero. Only a candidate that flips the
+        // carry class pays the difference, priced lazily once per group.
+        let lower_coded =
+            group > 0 && (0..GROUP_SIZE).any(|k| levels[idx(gs - GROUP_SIZE + k)] != 0);
+        let base_carry_zero = group > 0 && carry_in[group - 1] == 0;
+        let mut lower_delta: Option<f32> = None;
+        let mut lower_bits_delta = |levels: &[i16; MAX_TB], carry_out: i32| -> f32 {
+            if !lower_coded || (carry_out == 0) == base_carry_zero {
+                return 0.0;
+            }
+            *lower_delta.get_or_insert_with(|| {
+                let price = |carry: i32| {
+                    price_group(
+                        tb,
+                        levels,
+                        ctx,
+                        p,
+                        group - 1,
+                        last_group,
+                        last,
+                        prev_csbf[group - 1],
+                        carry,
+                        true,
+                        None,
+                    )
+                    .0
+                };
+                let (new_carry, old_carry) = if base_carry_zero { (1, 0) } else { (0, 1) };
+                price(new_carry) - price(old_carry)
+            })
+        };
+        let search_top = if group == last_group {
+            last_k
+        } else {
+            GROUP_SIZE - 1
+        };
+        let mut sig_bits = [[0f32; 2]; GROUP_SIZE];
+        for (k, sb) in sig_bits.iter_mut().enumerate() {
+            let (row, col) = scan[gs + k];
+            let c = sig_coeff_ctx(col, row, prev_csbf[group], log2_size, scan_idx, p.is_luma)
+                .min(ctx.sig_coeff_flag.len() - 1);
+            *sb = [
+                ctx.sig_coeff_flag[c].estimated_bits(0),
+                ctx.sig_coeff_flag[c].estimated_bits(1),
+            ];
+        }
+
+        // Per-position base state: weighted distortion, and the level-coding
+        // state entering each position, so one candidate can be priced
+        // approximately in O(1) (own significance and level bins only).
+        let distortion = RdoqDistortion::new(n, tb.qp, tb.bit_depth);
+        let mut weight = [1f32; GROUP_SIZE];
+        let mut dist_k = [0f32; GROUP_SIZE];
+        let mut lv = [0i16; GROUP_SIZE];
+        for k in 0..GROUP_SIZE {
+            let (row, col) = scan[gs + k];
+            let pos = row * n + col;
+            weight[k] = if pos == 0 {
+                p.dc_weight
+            } else if row + col >= p.hf_start {
+                p.hf_weight
+            } else {
+                1.0
+            };
+            lv[k] = levels[pos];
+            dist_k[k] = distortion
+                .coefficient_cost((coeff[pos] as i64).abs(), lv[k].unsigned_abs() as u32)
+                * weight[k];
+        }
+        let base_sum: i32 = lv.iter().map(|&l| l as i32).sum();
+        let mut ctx_set = if group == 0 || !p.is_luma {
+            0usize
+        } else {
+            2usize
+        };
+        if carry_in[group] == 0 {
+            ctx_set += 1;
+        }
+        let rice0 = if ctx.persistent_rice {
+            u32::from(ctx.stat_coeff[usize::from(!p.is_luma) * 2] / 4)
+        } else {
+            0
+        };
+        // (c1, c1_idx, c2_idx, rice) entering position k.
+        let mut state_in = [(1i32, 0u32, 0u32, rice0); GROUP_SIZE];
+        {
+            let (mut c1, mut c1_idx, mut c2_idx, mut rice) = (1i32, 0u32, 0u32, rice0);
+            for k in (0..GROUP_SIZE).rev() {
+                state_in[k] = (c1, c1_idx, c2_idx, rice);
+                let level = lv[k].unsigned_abs() as u32;
+                if level == 0 {
+                    continue;
+                }
+                let base_level = if c1_idx < 8 {
+                    2 + (c2_idx == 0) as u32
+                } else {
+                    1
+                };
+                if level >= base_level && level > (3 << rice) {
+                    rice = (rice + 1).min(if ctx.persistent_rice {
+                        MAX_PERSISTENT_RICE
+                    } else {
+                        4
+                    });
+                }
+                c1_idx += 1;
+                if level > 1 {
+                    c1 = 0;
+                    c2_idx += 1;
+                } else if (1..3).contains(&c1) {
+                    c1 += 1;
+                }
+            }
+        }
+        let own_bits = |k: usize, level: i16| -> f32 {
+            let level = level.unsigned_abs() as u32;
+            let coded_sig = !(group == last_group && k == last_k)
+                && !(k == 0
+                    && group != last_group
+                    && group != 0
+                    && (1..GROUP_SIZE).all(|j| lv[j] == 0));
+            let mut b = if coded_sig {
+                sig_bits[k][(level != 0) as usize]
+            } else {
+                0.0
+            };
+            if level != 0 {
+                let (c1, c1_idx, c2_idx, rice) = state_in[k];
+                b += rdoq_level_bits(level, ctx_set, c1, c1_idx, c2_idx, rice, p.is_luma, ctx);
+            }
+            b
+        };
+
+        // Enumerate legal single ±1 changes with a proxy cost.
+        let mut cands: [(f32, u8, i16, u8); 2 * GROUP_SIZE] = [(0.0, 0, 0, 0); 2 * GROUP_SIZE];
+        let mut ncand = 0usize;
+        for k in 0..=search_top {
+            let pos = idx(gs + k);
+            let old = lv[k];
+            for dir in [1i32, -1] {
+                let new = if old == 0 {
+                    if dir < 0 {
+                        continue;
+                    }
+                    if coeff[pos] < 0 { -1 } else { 1 }
+                } else {
+                    let m = old.unsigned_abs() as i32 + dir;
+                    if m > i16::MAX as i32 {
+                        continue;
+                    }
+                    if old < 0 { -m as i16 } else { m as i16 }
+                };
+                // Span and parity after the change.
+                let (f, l) = if old == 0 {
+                    (first_k.min(k), last_k.max(k))
+                } else if new == 0 && (k == first_k || k == last_k) {
+                    let f = (0..GROUP_SIZE).find(|&j| j != k && lv[j] != 0);
+                    let l = (0..GROUP_SIZE).rev().find(|&j| j != k && lv[j] != 0);
+                    match (f, l) {
+                        (Some(f), Some(l)) => (f, l),
+                        _ => continue,
+                    }
+                } else {
+                    (first_k, last_k)
+                };
+                let sum = base_sum + (new as i32 - old as i32);
+                let first_level = if f == k { new } else { lv[f] };
+                let legal = l - f < 4 || ((first_level < 0) as i32 == (sum & 1));
+                if !legal {
+                    continue;
+                }
+                let dd = distortion
+                    .coefficient_cost((coeff[pos] as i64).abs(), new.unsigned_abs() as u32)
+                    * weight[k]
+                    - dist_k[k];
+                let dr = own_bits(k, new) - own_bits(k, old);
+                let class = if old != 0 {
+                    let toward = ((coeff[pos] as i64).abs() * q_scale
+                        > (old.unsigned_abs() as i64) << q_bits)
+                        == (dir > 0);
+                    (!toward) as u8
+                } else if k > last_k {
+                    3
+                } else if k < first_k {
+                    4
+                } else {
+                    2
+                };
+                cands[ncand] = (dd + lambda * dr, k as u8, new, class);
+                ncand += 1;
+            }
+        }
+        let cands = &mut cands[..ncand];
+        let top_m = sbh_rd_top_m();
+        if top_m != 0 && cands.len() > top_m {
+            cands.select_nth_unstable_by(top_m - 1, |a, b| a.0.total_cmp(&b.0));
+        }
+        let n_full = if top_m == 0 {
+            cands.len()
+        } else {
+            cands.len().min(top_m)
+        };
+
+        // Full pricing of the shortlisted candidates under the group model.
+        let mut best_cost = f32::MAX;
+        let mut best = None;
+        for &(_, k, new, class) in cands[..n_full].iter() {
+            let k = k as usize;
+            let pos = idx(gs + k);
+            let old = levels[pos];
+            levels[pos] = new;
+            let new_last = if group == last_group {
+                gs + (0..GROUP_SIZE)
+                    .rev()
+                    .find(|&j| levels[idx(gs + j)] != 0)
+                    .unwrap()
+            } else {
+                last
+            };
+            let (bits_g, carry_out) = price_group(
+                tb,
+                levels,
+                ctx,
+                p,
+                group,
+                last_group,
+                new_last,
+                prev_csbf[group],
+                carry_in[group],
+                true,
+                Some(&sig_bits),
+            );
+            let mut bits = bits_g;
+            {
+                let (row, col) = scan[new_last];
+                bits += last_sig_bits(ctx, col, row, log2_size, scan_idx, p.is_luma);
+            }
+            bits += lower_bits_delta(levels, carry_out);
+            let cost = group_dist(tb, levels, p, group) + lambda * bits;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((pos, new, new_last, carry_out, class as usize));
+            }
+            levels[pos] = old;
+        }
+        if let Some((pos, new, new_last, carry_out, class)) = best {
+            if sbh_stat_enabled() {
+                sbh_stats().class[class] += 1;
+            }
+            levels[pos] = new;
+            last = new_last;
+            if group > 0 {
+                carry_in[group - 1] = carry_out;
+            }
+        }
+    }
+}
+
+/// Count sign-hiding-eligible groups and those whose parity would need repair.
+fn sbh_group_census(tb: &RdoqTb<'_>, levels: &[i16; MAX_TB]) -> (u64, u64) {
+    const GROUP_SIZE: usize = 16;
+    let n = tb.n;
+    let mut eligible = 0;
+    let mut violating = 0;
+    for group in 0..(n * n / GROUP_SIZE) {
+        let idx = |k: usize| {
+            let (row, col) = tb.scan[group * GROUP_SIZE + k];
+            row * n + col
+        };
+        let Some(first) = (0..GROUP_SIZE).find(|&k| levels[idx(k)] != 0) else {
+            continue;
+        };
+        let last = (0..GROUP_SIZE)
+            .rev()
+            .find(|&k| levels[idx(k)] != 0)
+            .unwrap();
+        if last - first < 4 {
+            continue;
+        }
+        eligible += 1;
+        let sum: i32 = (first..=last).map(|k| levels[idx(k)] as i32).sum();
+        let sign_bit = (levels[idx(first)] < 0) as i32;
+        if sign_bit != (sum & 1) {
+            violating += 1;
+        }
+    }
+    (eligible, violating)
+}
+
+fn sbh_stat_record(
+    tb: &RdoqTb<'_>,
+    pre: &[i16; MAX_TB],
+    post: &[i16; MAX_TB],
+    ctx: &ContextSet,
+    p: &FrozenTbCost,
+    rdoq_cost: Option<f32>,
+) {
+    let lambda = tb.lambda * rdoq_lambda_scale();
+    if let Some(rdoq_cost) = rdoq_cost {
+        let (d, r) = frozen_tb_cost(tb, pre, ctx, p, false);
+        let diff = ((d + lambda * r) - rdoq_cost) / lambda;
+        let mut s = sbh_stats();
+        s.checked += 1;
+        if diff.abs() > 0.01 {
+            s.mismatch += 1;
+            s.mismatch_max_bits = s.mismatch_max_bits.max(diff.abs() as f64);
+        }
+    }
+    let (d0, r0) = frozen_tb_cost(tb, pre, ctx, p, true);
+    let (d1, r1) = frozen_tb_cost(tb, post, ctx, p, true);
+    let pre_bits = d0 / lambda + r0;
+    let post_bits = d1 / lambda + r1;
+    let delta = post_bits - pre_bits;
+    let (eligible, violating) = sbh_group_census(tb, pre);
+    let nn = tb.n * tb.n;
+    let changed = pre[..nn] != post[..nn];
+    let mut s = sbh_stats();
+    s.tbs += 1;
+    s.tbs_repaired += changed as u64;
+    s.groups_eligible += eligible;
+    s.groups_violating += violating;
+    s.pre_bits += pre_bits as f64;
+    s.pre_rate_bits += r0 as f64;
+    s.post_bits += post_bits as f64;
+    if delta >= 0.0 {
+        s.delta_pos_bits += delta as f64;
+    } else {
+        s.delta_neg_bits += delta as f64;
+    }
+    s.delta_dist_bits += ((d1 - d0) / lambda) as f64;
+    s.delta_rate_bits += (r1 - r0) as f64;
 }
