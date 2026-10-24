@@ -192,7 +192,7 @@ static DISTORTION_WEIGHTS: [[f32; 4]; 4] = {
 };
 
 /// Orthonormal 4-point DCT-II basis, `DCT4[k][i]`.
-const DCT4: [[f32; 4]; 4] = {
+static DCT4: [[f32; 4]; 4] = {
     // cos(π(2i+1)k/8) for k = 1..3, precomputed.
     const A: f32 = 0.5;
     const B: f32 = 0.653_281_5; // √(1/2)·cos(π/8)
