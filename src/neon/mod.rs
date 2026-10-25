@@ -27,11 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod aq;
 mod dequant;
+mod math;
 mod satd;
 mod transform;
 mod weighted_sse;
 
+pub(crate) use aq::{block_log_variances_neon, ctu_qg_log_variances_neon};
 pub(crate) use dequant::dequantize_neon;
 pub(crate) use satd::satd_neon;
 pub(crate) use transform::{fwd_transform_neon, inv_transform_neon};
