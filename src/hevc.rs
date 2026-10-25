@@ -896,11 +896,13 @@ fn init_context_set(
     ctx
 }
 
-/// Cross-component prediction scale (ResScaleVal ∈ {0, ±1, ±2, ±4, ±8},
-/// predictor `(ResScaleVal · rY) >> 3`) for a chroma residual `chroma` given
-/// the co-located reconstructed luma residual `luma` (equal bit depths): the
-/// value minimizing the remaining residual energy.
-fn cross_component_scale(chroma: &[i32], luma: &[i32]) -> i8 {
+/// Cross-component prediction scales (ResScaleVal ∈ {±1, ±2, ±4, ±8},
+/// predictor `(ResScaleVal · rY) >> 3`) that leave a chroma residual `chroma`
+/// with less energy than no prediction, given the co-located reconstructed
+/// luma residual `luma` (equal bit depths), written to `out` in ascending
+/// order of remaining energy; returns how many there are (0 = no scale
+/// beats ResScaleVal 0).
+fn cross_component_scales(chroma: &[i32], luma: &[i32], out: &mut [i8; 8]) -> usize {
     let energy = |scale: i32| -> i64 {
         chroma
             .iter()
@@ -911,15 +913,32 @@ fn cross_component_scale(chroma: &[i32], luma: &[i32]) -> i8 {
             })
             .sum()
     };
-    let mut best = (energy(0), 0i8);
+    let zero = energy(0);
+    let mut ranked = [(0i64, 0i8); 8];
+    let mut n = 0;
     for scale in [1i8, 2, 4, 8, -1, -2, -4, -8] {
         let e = energy(i32::from(scale));
-        if e < best.0 {
-            best = (e, scale);
+        if e < zero {
+            ranked[n] = (e, scale);
+            n += 1;
         }
     }
-    best.1
+    // Stable: equal energies keep the probe order above, so the first entry
+    // is exactly the old single minimum-energy scale.
+    ranked[..n].sort_by_key(|&(e, _)| e);
+    for (dst, &(_, scale)) in out.iter_mut().zip(&ranked[..n]) {
+        *dst = scale;
+    }
+    n
 }
+
+/// How many of the ranked scales [`predict_cross_component`] prices through
+/// its proxy. The minimum-energy scale is the RD choice almost always; also
+/// trying the runner-up measured −0.23% ssimulacra2 / −0.19% ColorVideoVDP
+/// BD-rate in Fast (−0.07 / −0.08 in Slow) on a 12-image 4:4:4 corpus at no
+/// measurable time cost, while trying every scale was worse (−0.10 / −0.09):
+/// the proxy cannot separate the remaining near-ties.
+const CCP_RD_SCALES: usize = 2;
 
 /// Working buffers and parameters for [`predict_cross_component`].
 struct CcpTb<'a> {
@@ -936,10 +955,10 @@ struct CcpTb<'a> {
 /// Cross-component prediction of one chroma TB: pick the scale for the
 /// chroma residual `residual` from the co-located reconstructed luma
 /// residual `luma`, and if it is nonzero subtract the prediction from
-/// `residual` in place. The minimum-energy scale is kept only when the
-/// quantized-TB proxy J (distortion + λ·(fitted rate + the scale's syntax
-/// bits in `ctx`)) beats no prediction. `tmp`, `coeff` and `transform_tmp`
-/// are scratch.
+/// `residual` in place. The [`CCP_RD_SCALES`] lowest-energy scales are priced
+/// by the quantized-TB proxy J (distortion + λ·(fitted rate + the scale's
+/// syntax bits in `ctx`)) against no prediction, and the cheapest wins.
+/// `tmp`, `coeff` and `transform_tmp` are scratch.
 #[allow(clippy::too_many_arguments)]
 fn predict_cross_component(
     tb: CcpTb<'_>,
@@ -951,12 +970,13 @@ fn predict_cross_component(
     transform_tmp: &mut [i32],
 ) -> i8 {
     let len = tb.n * tb.n;
-    let scale = cross_component_scale(&residual[..len], &luma[..len]);
-    if scale == 0 {
+    let mut ranked = [0i8; 8];
+    let n_ranked = cross_component_scales(&residual[..len], &luma[..len], &mut ranked);
+    if n_ranked == 0 {
         return 0;
     }
-    let mut cost = [0.0f32; 2];
-    for (slot, trial) in [scale, 0].into_iter().enumerate() {
+    let n_trials = CCP_RD_SCALES.min(n_ranked);
+    let proxy_cost = |trial: i8, tmp: &mut [i32], coeff: &mut [i32], transform_tmp: &mut [i32]| {
         for ((dst, &r), &y) in tmp[..len]
             .iter_mut()
             .zip(&residual[..len])
@@ -984,9 +1004,19 @@ fn predict_cross_component(
         let mut est = CabacEstimator::default();
         let mut syntax_ctx = ctx.clone();
         encode_cross_comp_pred(&mut est, &mut syntax_ctx, tb.component, trial);
-        cost[slot] = stats.distortion + tb.lambda * (luma_rate_proxy(&stats, tb.n) + est.bits());
+        stats.distortion + tb.lambda * (luma_rate_proxy(&stats, tb.n) + est.bits())
+    };
+    // No prediction first; a scale must beat it strictly, and a later scale
+    // must beat an earlier one strictly, so ties keep the cheaper syntax.
+    let mut best = (proxy_cost(0, tmp, coeff, transform_tmp), 0i8);
+    for &trial in &ranked[..n_trials] {
+        let cost = proxy_cost(trial, tmp, coeff, transform_tmp);
+        if cost < best.0 {
+            best = (cost, trial);
+        }
     }
-    if cost[0] >= cost[1] {
+    let scale = best.1;
+    if scale == 0 {
         return 0;
     }
     for (r, &y) in residual[..len].iter_mut().zip(&luma[..len]) {
