@@ -50,8 +50,9 @@ fn clip_sample(v: i32, max_val: i32) -> u16 {
     v.max(0).min(max_val) as u16
 }
 
-/// Chroma QP mapping (HEVC Table 8-22) for 4:2:0, including the PPS Cb/Cr
-/// offset that §8.7.2.5.5 adds to the edge-average luma QP before the mapping.
+/// Chroma QP mapping including the PPS Cb/Cr offset that §8.7.2.5.5 adds to
+/// the edge-average luma QP: HEVC Table 8-22 for 4:2:0, `Min(qPi, 51)` for
+/// 4:2:2 and 4:4:4.
 fn chroma_qp(qpi: i32, chroma: crate::fmt::ChromaFormat, cqo: i8) -> i32 {
     let qpi = clip3(0, 57, qpi + i32::from(cqo));
     if !matches!(chroma, crate::fmt::ChromaFormat::Yuv420) {
@@ -436,8 +437,9 @@ fn filter_luma_segment(
     }
 }
 
-/// Chroma deblocking. Chroma edges sit on the 8-chroma-sample grid (= 16 luma),
-/// i.e. every 8th chroma sample, processed in 4-sample segments. bS = 2 always.
+/// Chroma deblocking. Chroma edges sit on the 8-chroma-sample grid (16 luma
+/// samples along a subsampled axis, 8 otherwise), processed in 4-sample
+/// segments. bS = 2 always.
 #[allow(clippy::too_many_arguments)]
 fn deblock_chroma(
     c: &mut [u16],
@@ -457,7 +459,7 @@ fn deblock_chroma(
     let max_val = (1i32 << bit_depth) - 1;
 
     if vertical {
-        // chroma vertical edges at chroma column x = 8,16,... (every 16 luma)
+        // chroma vertical edges at chroma column x = 8,16,...
         let mut x = 8;
         while x < cw {
             let mut yk = 0;

@@ -1065,6 +1065,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         None,
         0,
         None,
+        None,
         cfg.screen_content,
         cfg.implicit_rdpcm,
         cfg.persistent_rice,
@@ -1172,6 +1173,11 @@ where
     Ok(out)
 }
 
+/// Picture-wide decisions for a grid, made once on the full source: the
+/// per-QG AQ map, the Cb/Cr QP offset and `transform_skip_enabled_flag`.
+/// Every tile item decodes with tile 0's hvcC, so anything that lands in the
+/// SPS/PPS must come from here, never from a cell's own content (an edge
+/// cell's replicated padding looks like screen content).
 #[allow(clippy::too_many_arguments)]
 fn grid_global_aq_map(
     src: &[u16],
@@ -1179,12 +1185,13 @@ fn grid_global_aq_map(
     height: u32,
     channels: usize,
     bit_depth: BitDepth,
+    chroma: ChromaFormat,
     quality: u8,
     lossless: bool,
-) -> (Option<Vec<i8>>, i8) {
+) -> (Option<Vec<i8>>, i8, bool) {
     let qp = hevc::quality_to_qp(quality);
     if lossless {
-        return (None, 0);
+        return (None, 0, false);
     }
     let luma_yuv = if channels == 2 {
         // Interleaved gray+alpha: analysis wants the luma channel only.
@@ -1200,20 +1207,26 @@ fn grid_global_aq_map(
             &yuv::YcbcrMatrix::new(None, bit_depth),
         )
     };
-    let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, false);
+    let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, chroma, false);
+    let transform_skip = hevc::transform_skip_for(&luma_yuv, qp, false);
     let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp));
-    (map, cqo)
+    (map, cqo, transform_skip)
 }
 
 /// [`grid_global_aq_map`] for a source that is already a [`Yuv`].
-fn grid_global_aq_map_from_yuv(yuv: &Yuv, quality: u8, lossless: bool) -> (Option<Vec<i8>>, i8) {
+fn grid_global_aq_map_from_yuv(
+    yuv: &Yuv,
+    quality: u8,
+    lossless: bool,
+) -> (Option<Vec<i8>>, i8, bool) {
     let qp = hevc::quality_to_qp(quality);
     if lossless {
-        return (None, 0);
+        return (None, 0, false);
     }
-    let cqo = hevc::adaptive_chroma_qp_offset(yuv, false);
+    let cqo = hevc::adaptive_chroma_qp_offset(yuv, yuv.chroma, false);
+    let transform_skip = hevc::transform_skip_for(yuv, qp, false);
     let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(yuv, qp));
-    (map, cqo)
+    (map, cqo, transform_skip)
 }
 
 fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8) -> Vec<i8> {
@@ -1228,8 +1241,8 @@ fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8) -> Vec<i8> {
 /// Per-QG offsets are clamped to ±`MAX_AQ_OFFSET` (the λ-scale table), so a cell whose
 /// mean activity sits far from the picture mean would saturate the clamp and
 /// lose dynamic range. The rounded mean of the cell's real-content offsets is
-/// lifted into the cell's slice QP instead (each grid cell is an independent
-/// HEVC image with its own PPS), and the residual per-QG offsets re-center
+/// lifted into the cell's slice QP instead (`slice_qp_delta`, so the PPS that
+/// every tile shares is untouched), and the residual per-QG offsets re-center
 /// around it. Groups past the true picture extent (edge cells encode
 /// replication padding) follow the bias with a neutral residual.
 fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Vec<i8>, i8) {
@@ -1237,24 +1250,23 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
     let global_ctus_y = (height as usize).div_ceil(64);
     let cell_ctus = (TILE_SIZE / 64) as usize;
     const QGS: usize = aq::QGS_PER_CTU;
-    let mut local = vec![0i8; cell_ctus * cell_ctus * QGS];
+    // `None` marks padding groups. A column past the picture must not index
+    // the map: `row * ctus_x + col` would wrap into the next CTU row.
+    let mut window = vec![None; cell_ctus * cell_ctus * QGS];
     let mut sum = 0i32;
     let mut count = 0i32;
     for r in 0..cell_ctus {
         for c in 0..cell_ctus {
             let global_row = row as usize * cell_ctus + r;
             let global_col = col as usize * cell_ctus + c;
-            let in_picture = global_row < global_ctus_y && global_col < global_ctus_x;
+            if global_row >= global_ctus_y || global_col >= global_ctus_x {
+                continue;
+            }
             for q in 0..QGS {
-                let offset = map
-                    .get((global_row * global_ctus_x + global_col) * QGS + q)
-                    .copied()
-                    .unwrap_or(0);
-                local[(r * cell_ctus + c) * QGS + q] = offset;
-                if in_picture {
-                    sum += i32::from(offset);
-                    count += 1;
-                }
+                let offset = map[(global_row * global_ctus_x + global_col) * QGS + q];
+                window[(r * cell_ctus + c) * QGS + q] = Some(offset);
+                sum += i32::from(offset);
+                count += 1;
             }
         }
     }
@@ -1263,10 +1275,15 @@ fn cell_aq_slice(map: &[i8], width: u32, height: u32, col: u32, row: u32) -> (Ve
     } else {
         0
     };
-    for offset in &mut local {
-        let max = i32::from(aq::MAX_AQ_OFFSET);
-        *offset = (i32::from(*offset) - i32::from(bias)).clamp(-max, max) as i8;
-    }
+    let max = i32::from(aq::MAX_AQ_OFFSET);
+    let local = window
+        .into_iter()
+        .map(|offset| {
+            offset.map_or(0, |o| {
+                (i32::from(o) - i32::from(bias)).clamp(-max, max) as i8
+            })
+        })
+        .collect();
     (local, bias)
 }
 
@@ -1285,6 +1302,7 @@ fn encode_cell(
     aq_override: Option<&[i8]>,
     qp_bias: i8,
     chroma_qp_offset: Option<i8>,
+    transform_skip: Option<bool>,
     screen_content: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
@@ -1312,6 +1330,7 @@ fn encode_cell(
         aq_override,
         qp_bias,
         chroma_qp_offset,
+        transform_skip,
         screen_content,
         implicit_rdpcm,
         persistent_rice,
@@ -1342,8 +1361,16 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map(rgb, width, height, 3, bit_depth, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+        rgb,
+        width,
+        height,
+        3,
+        bit_depth,
+        cfg.chroma,
+        cfg.quality,
+        cfg.lossless,
+    );
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1390,6 +1417,7 @@ fn encode_rgb_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1428,8 +1456,16 @@ fn encode_gray_tiled(
     let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map(gray, width, height, 1, bit_depth, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+        gray,
+        width,
+        height,
+        1,
+        bit_depth,
+        ChromaFormat::Monochrome,
+        cfg.quality,
+        cfg.lossless,
+    );
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1464,6 +1500,7 @@ fn encode_gray_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1503,7 +1540,8 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) =
+        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1562,6 +1600,7 @@ fn encode_yuv_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1591,6 +1630,7 @@ fn encode_yuv_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1637,7 +1677,8 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) = grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) =
+        grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1696,6 +1737,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1731,8 +1773,16 @@ fn encode_rgba_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map(rgba, width, height, 4, bit_depth, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+        rgba,
+        width,
+        height,
+        4,
+        bit_depth,
+        cfg.chroma,
+        cfg.quality,
+        cfg.lossless,
+    );
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1784,6 +1834,7 @@ fn encode_rgba_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1812,6 +1863,7 @@ fn encode_rgba_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1857,8 +1909,16 @@ fn encode_gray_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo) =
-        grid_global_aq_map(ya, width, height, 2, bit_depth, cfg.quality, cfg.lossless);
+    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+        ya,
+        width,
+        height,
+        2,
+        bit_depth,
+        ChromaFormat::Monochrome,
+        cfg.quality,
+        cfg.lossless,
+    );
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
         let col = idx as u32 % cols;
@@ -1903,6 +1963,7 @@ fn encode_gray_alpha_tiled(
             cell_aq_offsets,
             cell_qp_bias,
             Some(grid_cqo),
+            Some(grid_transform_skip),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1930,6 +1991,7 @@ fn encode_gray_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -2379,6 +2441,73 @@ mod tests {
             out.array_windows::<4>().any(|w| w == b"grid"),
             "expected grid item"
         );
+    }
+
+    /// Regression: every grid tile decodes with tile 0's PPS, so the
+    /// `transform_skip_enabled_flag` must be decided on the whole picture. Here
+    /// the right cell holds an 84-pixel strip of constant rows whose
+    /// replication padding makes the cell screen-like on its own, while the
+    /// picture (mostly noise) is not. A per-cell decision flipped the flag in
+    /// that cell and Apple ImageIO refused the file. Debug builds also check
+    /// every tile's parameter sets in `wrap_hevc_grid`.
+    #[test]
+    fn grid_transform_skip_is_decided_on_the_whole_picture() {
+        let (w, h) = (596u32, 512u32);
+        let mut state = 0x1234_5678u32;
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < TILE_SIZE {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u16
+                } else if (y / 2) % 2 == 0 {
+                    40
+                } else {
+                    200
+                };
+                rgb.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let quality = 90;
+        let qp = hevc::quality_to_qp(quality);
+        let mut tile = Vec::new();
+        extract_rgb_tile_into(&mut tile, &rgb, w, h, 1, 0, TILE_SIZE, 3);
+        let matrix = yuv::YcbcrMatrix::new(None, BitDepth::Eight);
+        let edge_cell = yuv::rgb_to_yuv(
+            &tile,
+            TILE_SIZE,
+            TILE_SIZE,
+            ChromaFormat::Monochrome,
+            BitDepth::Eight,
+            &matrix,
+        );
+        assert!(
+            hevc::transform_skip_for(&edge_cell, qp, false),
+            "the padded edge cell should look like screen content on its own"
+        );
+        let (_, _, transform_skip) = grid_global_aq_map(
+            &rgb,
+            w,
+            h,
+            3,
+            BitDepth::Eight,
+            ChromaFormat::Yuv420,
+            quality,
+            false,
+        );
+        assert!(!transform_skip, "the picture as a whole is not screen-like");
+
+        let rgb8: Vec<u8> = rgb.iter().map(|&v| v as u8).collect();
+        for parallelism in [ParallelismStrategy::Grid, ParallelismStrategy::GridWpp] {
+            let out = encode_rgb(
+                &rgb8,
+                w,
+                h,
+                &cfg().with_quality(quality).with_parallelism(parallelism),
+            )
+            .unwrap();
+            assert!(out.array_windows::<4>().any(|w| w == b"grid"));
+        }
     }
 
     #[test]

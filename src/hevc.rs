@@ -718,6 +718,7 @@ pub(crate) fn encode_intra(
         None,
         0,
         None,
+        None,
         scc,
         implicit_rdpcm,
         persistent_rice,
@@ -749,6 +750,10 @@ pub(crate) fn encode_intra_opts(
     // Shared Cb/Cr QP offset: grid cells receive the full picture's value so
     // every cell treats chroma identically; `None` derives it from `yuv`.
     chroma_qp_offset: Option<i8>,
+    // `transform_skip_enabled_flag`, likewise decided on the full picture for
+    // grid cells: every tile decodes with tile 0's PPS, so a cell whose padding
+    // looks screen-like must not flip it. `None` derives it from `yuv`.
+    transform_skip: Option<bool>,
     // Screen-content coding tools (palette mode). Signals the SPS SCC extension
     // and lets every CU choose palette mode over intra prediction.
     scc: bool,
@@ -813,9 +818,10 @@ pub(crate) fn encode_intra_opts(
         persistent_rice,
     );
     let qp_val: u8 = quality_to_qp(quality);
-    let cqo = chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, lossless));
+    let cqo =
+        chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, yuv.chroma, lossless));
     let tools = PictureTools {
-        transform_skip: transform_skip_enabled(qp_val, lossless) && screen_like(yuv),
+        transform_skip: transform_skip.unwrap_or_else(|| transform_skip_for(yuv, qp_val, lossless)),
         cross_component: cross_component_enabled(yuv.chroma, lossless, scc, ibc),
     };
     let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo, ibc, tools);
@@ -1018,6 +1024,12 @@ const TRANSFORM_SKIP_MAX_QP: u8 = 20;
 /// every residual coder of the picture agree.
 fn transform_skip_enabled(qp: u8, lossless: bool) -> bool {
     !lossless && qp <= TRANSFORM_SKIP_MAX_QP
+}
+
+/// The picture's `transform_skip_enabled_flag`: [`transform_skip_enabled`] at
+/// the PPS QP and [`screen_like`] content.
+pub(crate) fn transform_skip_for(yuv: &Yuv, qp: u8, lossless: bool) -> bool {
+    transform_skip_enabled(qp, lossless) && screen_like(yuv)
 }
 
 /// Whether the picture looks like synthetic screen content, where 4×4
@@ -3146,25 +3158,36 @@ fn lambda_base_factor() -> f32 {
 
 const LAMBDA_BASE_DEFAULT: f32 = 0.57;
 
-fn chroma_qp_offset_env() -> Option<i8> {
-    None
-}
-
-/// Picture-level Cb/Cr QP offset: more chroma bits for textured pictures
-/// (mean 8×8 log-variance ramping from `LOG_VARIANCE_LOW` to `_HIGH`), none
-/// for flat/dark ones whose chroma is already cheap.
+/// Picture-level Cb/Cr QP offset.
 ///
-/// `DEPTH` is where the two perceptual metrics disagree: ssimulacra2 keeps
-/// rewarding chroma bits down to −4, ColorVideoVDP prefers 0 (it spends the
-/// bits on luma). −2 is the compromise — against libx265 it is −4.4% / −1.3%
-/// (ssimulacra2 / CVVDP BD-rate) on Kodak and −0.6% / +2.9% on jyrki31,
-/// versus −5.5% / +0.4% and −0.8% / +6.1% at −4.
-pub(crate) fn adaptive_chroma_qp_offset(yuv: &Yuv, lossless: bool) -> i8 {
+/// 4:4:4 takes a constant +3: without 4:2:0's QpC table (which already lowers
+/// chroma QP at mid/high QP) and with full-resolution chroma, 4:4:4 chroma was
+/// overspent. Against the 4:2:0 rule below, +3 is −4.0% / −10.0% (Fast) and
+/// −4.2% / −10.2% (Slow) ssimulacra2 / CVVDP BD-rate; +4 trades ~0.6% ss2 for
+/// ~1% CVVDP. Keeping the texture ramp under the constant measured worse.
+///
+/// 4:2:0 and 4:2:2: more chroma bits for textured pictures (mean 8×8
+/// log-variance ramping from `LOG_VARIANCE_LOW` to `_HIGH`), none for
+/// flat/dark ones whose chroma is already cheap. `DEPTH` is where the two
+/// perceptual metrics disagree: ssimulacra2 keeps rewarding chroma bits down
+/// to −4, ColorVideoVDP prefers 0 (it spends the bits on luma). −2 is the
+/// compromise — against libx265 it is −4.4% / −1.3% (ssimulacra2 / CVVDP
+/// BD-rate) on Kodak and −0.6% / +2.9% on jyrki31, versus −5.5% / +0.4% and
+/// −0.8% / +6.1% at −4.
+///
+/// `chroma` is the coded format; it is passed separately because the grid
+/// path analyses a luma-only (monochrome) copy of the source.
+pub(crate) fn adaptive_chroma_qp_offset(
+    yuv: &Yuv,
+    chroma: crate::fmt::ChromaFormat,
+    lossless: bool,
+) -> i8 {
+    const OFFSET_444: i8 = 3;
     if lossless {
         return 0;
     }
-    if let Some(fixed) = chroma_qp_offset_env() {
-        return fixed;
+    if matches!(chroma, crate::fmt::ChromaFormat::Yuv444) {
+        return OFFSET_444;
     }
     const DEPTH: f32 = 2.0;
     const LOG_VARIANCE_LOW: f32 = 1.2;
@@ -11310,6 +11333,31 @@ mod tests {
         assert_eq!(
             chroma_lambda_scale(43, crate::fmt::ChromaFormat::Yuv444, -3),
             0.5
+        );
+    }
+
+    #[test]
+    fn chroma_qp_offset_follows_the_coded_format_not_the_analysis_copy() {
+        use crate::fmt::ChromaFormat;
+        // A textured luma-only copy, as the grid path analyses it.
+        let (w, h) = (64usize, 64usize);
+        let y = (0..w * h).map(|i| ((i * 37) % 256) as u16).collect();
+        let luma = luma_only_yuv(w, h, y);
+        assert_eq!(
+            adaptive_chroma_qp_offset(&luma, ChromaFormat::Yuv444, false),
+            3
+        );
+        assert_eq!(
+            adaptive_chroma_qp_offset(&luma, ChromaFormat::Yuv420, false),
+            -2
+        );
+        assert_eq!(
+            adaptive_chroma_qp_offset(&luma, ChromaFormat::Yuv422, false),
+            -2
+        );
+        assert_eq!(
+            adaptive_chroma_qp_offset(&luma, ChromaFormat::Yuv444, true),
+            0
         );
     }
 
