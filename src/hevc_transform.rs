@@ -129,7 +129,7 @@ pub(crate) static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 /// selects coefficient levels, coefficient-group significance, CBF and the last
 /// position; no second magnitude replay is needed.
 pub(crate) struct RdoqScratch {
-    /// Whether the perceptual distortion weights apply (see `RDOQ_HF_WEIGHT`).
+    /// Whether the perceptual distortion weights apply (see `RDOQ_WEIGHTS`).
     /// Cleared while ranking mode candidates, whose RD comparison measures
     /// plain pixel SSE; only the committed coefficients are weighted.
     pub(crate) perceptual: bool,
@@ -144,17 +144,110 @@ pub(crate) struct RdoqScratch {
     group_flags: [u8; 64],
 }
 
-/// Per-frequency weights on RDOQ's distortion term.
+/// Per-coefficient weights on RDOQ's distortion term, one table per TB
+/// transform (DST4, DCT4/8/16/32).
 ///
-/// A coefficient whose distortion is made cheaper is more readily rounded down
-/// or zeroed. Cheapening high-frequency AC (`row + col >= RDOQ_HF_START · n`)
-/// trades ringing for slight blur, which perceptual metrics strongly prefer;
-/// weighting DC up protects flat areas. Measured against plain SSE weights
-/// (14 images, q40–92): ssimulacra2 −3.4%, CVVDP −4.0% BD-rate (PSNR +3.2%,
-/// which the encoder deliberately does not target).
-const RDOQ_DC_WEIGHT: f32 = 1.8;
-const RDOQ_HF_WEIGHT: f32 = 0.4;
-const RDOQ_HF_START: f32 = 0.7;
+/// The table is the diagonal of the decision distortion expressed in the TB
+/// basis, `diag(Bᵀ Q B)`, where `Q` is the 4×4-tile weighted DCT of
+/// [`crate::cost::weighted_sse`] and `B` the orthonormal inverse transform. A
+/// coefficient whose distortion is made cheaper is more readily rounded down
+/// or zeroed, so high-frequency AC trades ringing for slight blur, which
+/// perceptual metrics strongly prefer, while DC-like error stays dear. In
+/// 8/16/32 TBs the low-frequency coefficients look like tile DC and weigh
+/// 1.3–1.8; the 4×4 luma DST gets its own table.
+///
+/// Measured against the previous three-level weights (DC 1.8, HF 0.4 from
+/// `row + col >= 0.7·n`, 1.0 elsewhere; 8 images, q40–92, piecewise-linear
+/// BD): ssimulacra2 −0.93% / CVVDP −1.09% Fast, −1.01% / −0.98% Slow. The same
+/// tile pattern with RDOQ's old HF 0.4 instead of the decision weights' 0.2 is
+/// about null (−0.55% / −0.16% Fast). H also has substantial off-diagonal
+/// terms (≈ 0.3–0.4 of its Frobenius norm outside DCT4), which this ignores.
+static RDOQ_WEIGHTS: OnceLock<[Vec<f32>; 5]> = OnceLock::new();
+
+fn rdoq_weight_tables() -> &'static [Vec<f32>; 5] {
+    RDOQ_WEIGHTS.get_or_init(|| {
+        let w = crate::cost::DISTORTION_WEIGHTS;
+        let t4 = crate::cost::DCT4;
+        let basis = |n: usize, dst: bool| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|k| {
+                    let v: Vec<f64> = (0..n)
+                        .map(|i| {
+                            let (i, k, nf) = (i as f64, k as f64, n as f64);
+                            if dst {
+                                (std::f64::consts::PI * (2.0 * i + 1.0) * (k + 1.0) / 9.0).sin()
+                            } else {
+                                (std::f64::consts::PI * (2.0 * i + 1.0) * k / (2.0 * nf)).cos()
+                            }
+                        })
+                        .collect();
+                    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    v.into_iter().map(|x| x / norm).collect()
+                })
+                .collect()
+        };
+        let table = |n: usize, dst: bool| -> Vec<f32> {
+            let b = basis(n, dst);
+            // e[k][tile][f]: energy of basis k's tile `tile` at 4-point frequency f.
+            let e: Vec<Vec<[f64; 4]>> = b
+                .iter()
+                .map(|v| {
+                    (0..n / 4)
+                        .map(|t| {
+                            let mut out = [0.0; 4];
+                            for (f, o) in out.iter_mut().enumerate() {
+                                let c: f64 = (0..4).map(|i| t4[f][i] as f64 * v[4 * t + i]).sum();
+                                *o = c * c;
+                            }
+                            out
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut out = vec![0f32; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    let mut d = 0.0;
+                    for er in &e[r] {
+                        for ec in &e[c] {
+                            for k in 0..4 {
+                                for l in 0..4 {
+                                    d += w[k][l] as f64 * er[k] * ec[l];
+                                }
+                            }
+                        }
+                    }
+                    out[r * n + c] = d as f32;
+                }
+            }
+            out
+        };
+        [
+            table(4, true),
+            table(4, false),
+            table(8, false),
+            table(16, false),
+            table(32, false),
+        ]
+    })
+}
+
+/// The RDOQ distortion weights of this TB, or `None` for plain SSE.
+fn rdoq_weights_for(n: usize, is_luma: bool, perceptual: bool) -> Option<&'static [f32]> {
+    if !perceptual {
+        return None;
+    }
+    let t = rdoq_weight_tables();
+    // Intra-only encoder: every 4×4 luma TB (outside transform skip, which
+    // runs plain RDOQ) uses the DST.
+    Some(match n {
+        4 if is_luma => &t[0],
+        4 => &t[1],
+        8 => &t[2],
+        16 => &t[3],
+        _ => &t[4],
+    })
+}
 
 impl RdoqScratch {
     pub(crate) fn new() -> Self {
@@ -730,12 +823,7 @@ fn rdoq_with_sign_hiding_into(
         lambda,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
-    let (dc_weight, hf_weight) = if scratch.perceptual {
-        (RDOQ_DC_WEIGHT, RDOQ_HF_WEIGHT)
-    } else {
-        (1.0, 1.0)
-    };
-    let hf_start = (RDOQ_HF_START * n as f32) as usize;
+    let weights = rdoq_weights_for(n, is_luma, scratch.perceptual);
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
@@ -818,13 +906,7 @@ fn rdoq_with_sign_hiding_into(
             let coeff_abs = (coeff[pos] as i64).abs();
             let scaled = coeff_abs * q_scale;
             let max_abs = ((scaled + round) >> q_bits).clamp(0, i16::MAX as i64) as u32;
-            let dist_weight = if pos == 0 {
-                dc_weight
-            } else if row + col >= hf_start {
-                hf_weight
-            } else {
-                1.0
-            };
+            let dist_weight = weights.map_or(1.0, |w| w[pos]);
             let dist0 = distortion.coefficient_cost(coeff_abs, 0) * dist_weight;
             cost_coeff0[scan_pos] = dist0;
             block_uncoded_cost += dist0;
@@ -1056,18 +1138,12 @@ fn rdoq_with_sign_hiding_into(
     let p = FrozenTbCost {
         is_luma,
         cbf_depth,
-        dc_weight,
-        hf_weight,
-        hf_start,
+        weights,
     };
     let pre = *levels;
     if rd {
         let p_repair = if rd_mode == 2 {
-            FrozenTbCost {
-                dc_weight: 1.0,
-                hf_weight: 1.0,
-                ..p
-            }
+            FrozenTbCost { weights: None, ..p }
         } else {
             p
         };
@@ -2202,9 +2278,8 @@ pub fn sbh_repair_stats_take() -> SbhRepairStats {
 struct FrozenTbCost {
     is_luma: bool,
     cbf_depth: usize,
-    dc_weight: f32,
-    hf_weight: f32,
-    hf_start: usize,
+    /// RDOQ distortion weights (`rdoq_weights_for`); `None` is plain SSE.
+    weights: Option<&'static [f32]>,
 }
 
 /// Weighted distortion of one coefficient group under the RDOQ model.
@@ -2214,13 +2289,7 @@ fn group_dist(tb: &RdoqTb<'_>, levels: &[i16; MAX_TB], p: &FrozenTbCost, group: 
     let mut dist = 0.0f32;
     for &(row, col) in &tb.scan[group * 16..group * 16 + 16] {
         let pos = row * n + col;
-        let w = if pos == 0 {
-            p.dc_weight
-        } else if row + col >= p.hf_start {
-            p.hf_weight
-        } else {
-            1.0
-        };
+        let w = p.weights.map_or(1.0, |w| w[pos]);
         let level = levels[pos].unsigned_abs() as u32;
         dist += distortion.coefficient_cost((tb.coeff[pos] as i64).abs(), level) * w;
     }
@@ -2596,13 +2665,7 @@ fn rd_sign_hiding_repair(
         for k in 0..GROUP_SIZE {
             let (row, col) = scan[gs + k];
             let pos = row * n + col;
-            weight[k] = if pos == 0 {
-                p.dc_weight
-            } else if row + col >= p.hf_start {
-                p.hf_weight
-            } else {
-                1.0
-            };
+            weight[k] = p.weights.map_or(1.0, |w| w[pos]);
             lv[k] = levels[pos];
             dist_k[k] = distortion
                 .coefficient_cost((coeff[pos] as i64).abs(), lv[k].unsigned_abs() as u32)

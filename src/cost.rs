@@ -140,7 +140,8 @@ fn satd_scalar_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
 
 /// Weights of [`weighted_sse`] on a 4×4 DCT of the error: DC error is dearer,
 /// high-frequency error (k + l ≥ 3) cheaper — the RDOQ notion of perceptual
-/// distortion (`RDOQ_DC_WEIGHT` / `RDOQ_HF_START`), applied to decisions.
+/// distortion, applied to decisions (RDOQ itself uses this matrix's diagonal in
+/// the TB basis, see `RDOQ_WEIGHTS` in hevc_transform.rs).
 ///
 /// Every RD decision (luma/chroma mode, TU split, PART_NxN, CU split) used to
 /// compare plain pixel SSE while RDOQ weighted the same error by frequency;
