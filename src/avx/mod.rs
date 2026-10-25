@@ -27,11 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod aq;
 mod dequant;
+mod math;
 mod satd;
 mod transform;
 mod weighted_sse;
 
+pub(crate) use aq::{block_log_variances_avx2_fma, ctu_qg_log_variances_avx2_fma};
 pub(crate) use dequant::dequantize_avx2;
 pub(crate) use satd::satd_avx2;
 pub(crate) use transform::{fwd_transform_avx2, inv_transform_avx2};
