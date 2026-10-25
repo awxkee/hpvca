@@ -842,6 +842,21 @@ fn sps_chroma_format_idc(stream: &NaluStream) -> Option<u8> {
     Some(read_ue(&mut pos) as u8)
 }
 
+/// A grid writes one hvcC (tile 0's) for every tile item, so a tile whose own
+/// VPS/SPS/PPS differ is decoded with the wrong syntax: garbage from its first
+/// CTU, and Apple ImageIO rejects the whole image.
+fn debug_assert_shared_parameter_sets(tiles: &[NaluStream], shared: &[u8], bit_depth: u8) {
+    if cfg!(debug_assertions) {
+        for (i, tile) in tiles.iter().enumerate().skip(1) {
+            let own = build_hvcc(tile, bit_depth).ok();
+            debug_assert!(
+                own.as_deref() == Some(shared),
+                "grid tile {i} has parameter sets that differ from tile 0's"
+            );
+        }
+    }
+}
+
 fn build_hvcc(stream: &NaluStream, bit_depth: u8) -> Result<Vec<u8>, EncodeError> {
     let mut vps: Vec<&[u8]> = Vec::new();
     let mut sps: Vec<&[u8]> = Vec::new();
@@ -937,6 +952,7 @@ pub(crate) fn wrap_hevc_grid(
 
     // Build hvcC once from the first tile (all tiles share the same SPS/PPS).
     let hvcc_data = build_hvcc(&tiles[0], bit_depth.bits())?;
+    debug_assert_shared_parameter_sets(tiles, &hvcc_data, bit_depth.bits());
 
     // Pre-encode all tile mdat samples.
     let tile_samples: Vec<Vec<u8>> = tiles
@@ -1356,6 +1372,8 @@ pub(crate) fn wrap_hevc_grid_with_alpha(
 
     let color_hvcc = build_hvcc(&color_tiles[0], bit_depth.bits())?;
     let alpha_hvcc = build_hvcc(&alpha_tiles[0], bit_depth.bits())?;
+    debug_assert_shared_parameter_sets(color_tiles, &color_hvcc, bit_depth.bits());
+    debug_assert_shared_parameter_sets(alpha_tiles, &alpha_hvcc, bit_depth.bits());
 
     let color_samples: Vec<Vec<u8>> = color_tiles
         .iter()
