@@ -1880,6 +1880,7 @@ mod tests {
                     false,
                     false, // implicit_rdpcm
                     true,  // persistent_rice
+                    None,  // scaling lists
                 ),
                 build_pps(30, false, false),
             ],
@@ -1909,6 +1910,7 @@ mod tests {
                     false,
                     true, // implicit_rdpcm
                     true, // persistent_rice
+                    None, // scaling lists
                 ),
                 build_pps(30, true, false),
             ],

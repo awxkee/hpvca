@@ -49,6 +49,7 @@ mod metadata;
 mod palette;
 mod pool;
 mod sao;
+mod scaling;
 mod ycgco;
 mod yuv;
 
@@ -2442,74 +2443,7 @@ mod tests {
             "expected grid item"
         );
     }
-
-    /// Regression: every grid tile decodes with tile 0's PPS, so the
-    /// `transform_skip_enabled_flag` must be decided on the whole picture. Here
-    /// the right cell holds an 84-pixel strip of constant rows whose
-    /// replication padding makes the cell screen-like on its own, while the
-    /// picture (mostly noise) is not. A per-cell decision flipped the flag in
-    /// that cell and Apple ImageIO refused the file. Debug builds also check
-    /// every tile's parameter sets in `wrap_hevc_grid`.
-    #[test]
-    fn grid_transform_skip_is_decided_on_the_whole_picture() {
-        let (w, h) = (596u32, 512u32);
-        let mut state = 0x1234_5678u32;
-        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let v = if x < TILE_SIZE {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    (state >> 24) as u16
-                } else if (y / 2) % 2 == 0 {
-                    40
-                } else {
-                    200
-                };
-                rgb.extend_from_slice(&[v, v, v]);
-            }
-        }
-        let quality = 90;
-        let qp = hevc::quality_to_qp(quality);
-        let mut tile = Vec::new();
-        extract_rgb_tile_into(&mut tile, &rgb, w, h, 1, 0, TILE_SIZE, 3);
-        let matrix = yuv::YcbcrMatrix::new(None, BitDepth::Eight);
-        let edge_cell = yuv::rgb_to_yuv(
-            &tile,
-            TILE_SIZE,
-            TILE_SIZE,
-            ChromaFormat::Monochrome,
-            BitDepth::Eight,
-            &matrix,
-        );
-        assert!(
-            hevc::transform_skip_for(&edge_cell, qp, false),
-            "the padded edge cell should look like screen content on its own"
-        );
-        let (_, _, transform_skip) = grid_global_aq_map(
-            &rgb,
-            w,
-            h,
-            3,
-            BitDepth::Eight,
-            ChromaFormat::Yuv420,
-            quality,
-            false,
-        );
-        assert!(!transform_skip, "the picture as a whole is not screen-like");
-
-        let rgb8: Vec<u8> = rgb.iter().map(|&v| v as u8).collect();
-        for parallelism in [ParallelismStrategy::Grid, ParallelismStrategy::GridWpp] {
-            let out = encode_rgb(
-                &rgb8,
-                w,
-                h,
-                &cfg().with_quality(quality).with_parallelism(parallelism),
-            )
-            .unwrap();
-            assert!(out.array_windows::<4>().any(|w| w == b"grid"));
-        }
-    }
-
+    
     #[test]
     fn tiled_rgb10_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 3];

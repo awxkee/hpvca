@@ -31,6 +31,7 @@
 
 use crate::cabac::residual::sig_coeff_ctx;
 use crate::cabac::{ContextSet, MAX_PERSISTENT_RICE};
+use crate::scaling::ScalingTable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 4×4 HEVC transform matrix.
@@ -119,7 +120,7 @@ pub(crate) static T32: [[i32; 32]; 32] = [
     [4, -13, 22, -31, 38, -46, 54, -61, 67, -73, 78, -82, 85, -88, 90, -90, 90, -90, 88, -85, 82, -78, 73, -67, 61, -54, 46, -38, 31, -22, 13, -4],
 ];
 
-static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
+pub(crate) static QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 
 /// Largest supported transform: 32×32 → 1024 coefficients per fixed buffer.
 pub(crate) const MAX_TB: usize = 1024;
@@ -401,14 +402,85 @@ pub(crate) fn run_dequantize(
     n: usize,
     qp: u8,
     bit_depth: u8,
+    scaling: Option<&[i32]>,
     out: &mut [i32],
 ) {
     let out = out
         .try_into()
         .expect("dequantization output buffer has MAX_TB elements");
+    if let Some(m) = scaling {
+        // SAFETY: as above; `m` holds one factor per coefficient.
+        unsafe { resolve_scaled_dequantize()(level, n, qp, bit_depth, m, out) }
+        return;
+    }
     // SAFETY: resolvers only return implementations with this slice-based
     // contract; callers provide one complete supported transform block.
     unsafe { f(level, n, qp, bit_depth, out) }
+}
+
+pub(crate) type ScaledDequantizeFn = unsafe fn(&[i16], usize, u8, u8, &[i32], &mut [i32; MAX_TB]);
+static SCALED_DEQUANTIZE: OnceLock<ScaledDequantizeFn> = OnceLock::new();
+
+#[inline]
+fn resolve_scaled_dequantize() -> ScaledDequantizeFn {
+    *SCALED_DEQUANTIZE.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::dequantize_scaled_neon as ScaledDequantizeFn
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            let mut f = dequantize_scaled_safe as ScaledDequantizeFn;
+            if std::is_x86_feature_detected!("avx2") {
+                f = crate::avx::dequantize_scaled_avx2 as ScaledDequantizeFn;
+            }
+            f
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "x86_64", feature = "avx")
+        )))]
+        {
+            dequantize_scaled_safe as ScaledDequantizeFn
+        }
+    })
+}
+
+/// [`dequantize_scaled_into`] behind the `unsafe fn` pointer contract.
+#[cfg_attr(all(target_arch = "aarch64", feature = "neon"), allow(dead_code))]
+unsafe fn dequantize_scaled_safe(
+    level: &[i16],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    m: &[i32],
+    out: &mut [i32; MAX_TB],
+) {
+    dequantize_scaled_into(level, n, qp, bit_depth, m, out);
+}
+
+/// [`dequantize_into`] with a scaling list: `m[pos]` replaces the flat 16
+/// (spec 8.6.4.2, `scaling_list_enabled_flag = 1`).
+pub(crate) fn dequantize_scaled_into(
+    level: &[i16],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    m: &[i32],
+    out: &mut [i32; MAX_TB],
+) {
+    let log2n = n.trailing_zeros() as i64;
+    let bd = bit_depth as i64;
+    let bd_shift = bd + log2n - 5;
+    let add = 1i64 << (bd_shift - 1);
+    let factor = DEQUANT_SCALE[(qp % 6) as usize] << ((qp as i64) / 6);
+    for ((dst, &level), &m) in out[..n * n]
+        .iter_mut()
+        .zip(&level[..n * n])
+        .zip(&m[..n * n])
+    {
+        *dst = ((level as i64 * m as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
+    }
 }
 
 #[inline]
@@ -767,16 +839,18 @@ impl RdoqDistortion {
             1.0 / (1u32 << (-exponent) as u32) as f32
         };
         Self {
-            factor: DEQUANT_SCALE[(qp % 6) as usize] * (1i64 << (qp / 6)) * 16,
+            factor: DEQUANT_SCALE[(qp % 6) as usize] * (1i64 << (qp / 6)),
             add: 1i64 << (shift - 1),
             shift,
             scale,
         }
     }
 
+    /// Squared reconstruction error of coding `level` for a coefficient of
+    /// magnitude `coeff_abs`, `m` its scaling-list factor (16 when flat).
     #[inline]
-    fn coefficient_cost(self, coeff_abs: i64, level: u32) -> f32 {
-        let dequant = ((level as i64 * self.factor + self.add) >> self.shift).clamp(0, 32767);
+    fn coefficient_cost(self, coeff_abs: i64, level: u32, m: i64) -> f32 {
+        let dequant = ((level as i64 * self.factor * m + self.add) >> self.shift).clamp(0, 32767);
         let error = coeff_abs - dequant;
         (error * error) as f32 * self.scale
     }
@@ -790,6 +864,41 @@ pub(crate) struct RdoqTb<'a> {
     pub scan: &'a [(usize, usize)],
     pub scan_idx: u8,
     pub lambda: f32,
+    /// The picture's scaling list for this TB size and component, `None`
+    /// when flat.
+    pub scaling: Option<&'a ScalingTable>,
+}
+
+/// Per-coefficient quantizer multiplier and scaling factor of a TB: the flat
+/// `(QUANT_SCALE[qp % 6], 16)` or the scaling list's own.
+#[derive(Clone, Copy)]
+struct CoeffScale<'a> {
+    q_scale: i64,
+    table: Option<(&'a [i32], &'a [i32])>,
+}
+
+impl<'a> CoeffScale<'a> {
+    #[inline]
+    fn new(qp: u8, scaling: Option<&'a ScalingTable>) -> Self {
+        let rem = (qp % 6) as usize;
+        Self {
+            q_scale: QUANT_SCALE[rem],
+            table: scaling.map(|s| (&s.qc[rem][..], &s.m[..])),
+        }
+    }
+
+    /// Forward quantizer multiplier (`QUANT_SCALE` scaled by `16 / m`).
+    #[inline]
+    fn qs(self, pos: usize) -> i64 {
+        self.table
+            .map_or(self.q_scale, |(qc, _)| i64::from(qc[pos]))
+    }
+
+    /// Dequantizer scaling factor `m`.
+    #[inline]
+    fn m(self, pos: usize) -> i64 {
+        self.table.map_or(16, |(_, m)| i64::from(m[pos]))
+    }
 }
 
 fn rdoq_lambda_scale() -> f32 {
@@ -810,7 +919,15 @@ fn rdoq_with_sign_hiding_into(
     scratch: &mut RdoqScratch,
 ) {
     if rdoq_disabled() {
-        quantize_impl_into(tb.coeff, tb.n, tb.qp, tb.bit_depth, Some(tb.scan), levels);
+        quantize_impl_into(
+            tb.coeff,
+            tb.n,
+            tb.qp,
+            tb.bit_depth,
+            Some(tb.scan),
+            tb.scaling,
+            levels,
+        );
         return;
     }
     let RdoqTb {
@@ -821,6 +938,7 @@ fn rdoq_with_sign_hiding_into(
         scan,
         scan_idx,
         lambda,
+        scaling,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
     let weights = rdoq_weights_for(n, is_luma, scratch.perceptual);
@@ -835,7 +953,7 @@ fn rdoq_with_sign_hiding_into(
     let sb_side = n / 4;
     let sb_scan = crate::dct::sb_scan_for(log2_size, scan_idx);
     let q_bits = 14 + qp as i64 / 6 + (15 - bit_depth as i64 - log2_size as i64);
-    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let cs = CoeffScale::new(qp, scaling);
     let round = 1i64 << (q_bits - 1);
     let distortion = RdoqDistortion::new(n, qp, bit_depth);
 
@@ -904,10 +1022,11 @@ fn rdoq_with_sign_hiding_into(
             let (row, col) = scan[scan_pos];
             let pos = row * n + col;
             let coeff_abs = (coeff[pos] as i64).abs();
-            let scaled = coeff_abs * q_scale;
+            let scaled = coeff_abs * cs.qs(pos);
+            let m = cs.m(pos);
             let max_abs = ((scaled + round) >> q_bits).clamp(0, i16::MAX as i64) as u32;
             let dist_weight = weights.map_or(1.0, |w| w[pos]);
-            let dist0 = distortion.coefficient_cost(coeff_abs, 0) * dist_weight;
+            let dist0 = distortion.coefficient_cost(coeff_abs, 0, m) * dist_weight;
             cost_coeff0[scan_pos] = dist0;
             block_uncoded_cost += dist0;
 
@@ -940,7 +1059,7 @@ fn rdoq_with_sign_hiding_into(
             if max_abs > 0 {
                 let min_abs = if max_abs > 1 { max_abs - 1 } else { 1 };
                 for abs_level in [max_abs, min_abs] {
-                    let dist = distortion.coefficient_cost(coeff_abs, abs_level) * dist_weight;
+                    let dist = distortion.coefficient_cost(coeff_abs, abs_level, m) * dist_weight;
                     let rate =
                         rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx);
                     let coded_cost = dist + sig1 + lambda * rate;
@@ -957,7 +1076,8 @@ fn rdoq_with_sign_hiding_into(
                 if !is_last && max_abs >= 3 {
                     best_cost = f32::MAX;
                     for abs_level in [max_abs, min_abs] {
-                        let dist = distortion.coefficient_cost(coeff_abs, abs_level) * dist_weight;
+                        let dist =
+                            distortion.coefficient_cost(coeff_abs, abs_level, m) * dist_weight;
                         let rate = rdoq_level_bits(
                             abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx,
                         );
@@ -1132,7 +1252,7 @@ fn rdoq_with_sign_hiding_into(
     let rd_mode = sbh_rd_mode(rd_sign_hiding);
     let rd = rd_mode != 0;
     if !stat && !rd {
-        apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
+        apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan, scaling);
         return;
     }
     let p = FrozenTbCost {
@@ -1151,7 +1271,7 @@ fn rdoq_with_sign_hiding_into(
     }
     // Safety net: a no-op once every eligible group's parity holds.
     let mid = *levels;
-    apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan);
+    apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan, scaling);
     if rd && stat && mid[..n * n] != levels[..n * n] {
         sbh_stats().net_fired += 1;
     }
@@ -1223,13 +1343,14 @@ pub(crate) fn quantize_with_sign_hiding_into(
     qp: u8,
     bit_depth: u8,
     scan: &[(usize, usize)],
+    scaling: Option<&ScalingTable>,
     out: &mut [i16],
 ) {
     debug_assert_eq!(scan.len(), n * n);
     let out = out
         .try_into()
         .expect("quantization output buffer has MAX_TB elements");
-    quantize_impl_into(coeff, n, qp, bit_depth, Some(scan), out);
+    quantize_impl_into(coeff, n, qp, bit_depth, Some(scan), scaling, out);
 }
 
 /// Apply HEVC sign-data hiding to an already selected set of coefficient levels.
@@ -1244,12 +1365,13 @@ fn apply_sign_hiding_to_levels(
     qp: u8,
     bit_depth: u8,
     scan: &[(usize, usize)],
+    scaling: Option<&ScalingTable>,
 ) {
     let abs_sum = levels[..n * n].iter().fold(0u32, |sum, level| {
         sum.saturating_add(level.unsigned_abs() as u32)
     });
     if abs_sum >= 2 {
-        sign_bit_hiding_hdq(levels, coeff, n, scan, qp, bit_depth, false);
+        sign_bit_hiding_hdq(levels, coeff, n, scan, qp, bit_depth, scaling, false);
     }
 }
 
@@ -1259,20 +1381,21 @@ fn quantize_impl_into(
     qp: u8,
     bit_depth: u8,
     sign_hiding_scan: Option<&[(usize, usize)]>,
+    scaling: Option<&ScalingTable>,
     out: &mut [i16; MAX_TB],
 ) {
     let log2n = n.trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bd - log2n);
-    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let cs = CoeffScale::new(qp, scaling);
     let offset = 171i64 << (q_bits - 9); // intra
     let mut abs_sum = 0u32;
 
-    for (level, &coefficient) in out[..n * n].iter_mut().zip(coeff) {
+    for (pos, (level, &coefficient)) in out[..n * n].iter_mut().zip(coeff).enumerate() {
         // i64 product: |coeff| can reach ~2^16 and q_scale ~2^15, so the product
         // overflows i32; keep this one multiply in i64.
         let coefficient = coefficient as i64;
-        let magnitude = (coefficient.abs() * q_scale + offset) >> q_bits;
+        let magnitude = (coefficient.abs() * cs.qs(pos) + offset) >> q_bits;
         let signed = if coefficient < 0 {
             -magnitude
         } else {
@@ -1286,10 +1409,11 @@ fn quantize_impl_into(
     if abs_sum >= 2
         && let Some(scan) = sign_hiding_scan
     {
-        sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, true);
+        sign_bit_hiding_hdq(out, coeff, n, scan, qp, bit_depth, scaling, true);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_bit_hiding_hdq(
     levels: &mut [i16; MAX_TB],
     coeff: &[i32],
@@ -1297,6 +1421,7 @@ fn sign_bit_hiding_hdq(
     scan: &[(usize, usize)],
     qp: u8,
     bit_depth: u8,
+    scaling: Option<&ScalingTable>,
     use_rounded_magnitude: bool,
 ) {
     const GROUP_SIZE: usize = 16;
@@ -1309,7 +1434,7 @@ fn sign_bit_hiding_hdq(
     let log2n = n.trailing_zeros() as i64;
     let q_bits = 14 + qp as i64 / 6 + (15 - bit_depth as i64 - log2n);
     let q_bits_8 = q_bits - 8;
-    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let cs = CoeffScale::new(qp, scaling);
     let quant_offset = 171i64 << (q_bits - 9);
 
     let mut found_last_group = false;
@@ -1375,7 +1500,7 @@ fn sign_bit_hiding_hdq(
         for i in (0..=search_top).rev() {
             let pos = row_major(i);
             let level = levels[pos];
-            let scaled = (coeff[pos] as i64).abs() * q_scale;
+            let scaled = (coeff[pos] as i64).abs() * cs.qs(pos);
             let magnitude = if use_rounded_magnitude {
                 (scaled + quant_offset) >> q_bits
             } else {
@@ -1878,7 +2003,7 @@ mod tests {
         sign_hiding_scan: Option<&[(usize, usize)]>,
     ) -> [i16; MAX_TB] {
         let mut out = [0i16; MAX_TB];
-        quantize_impl_into(coeff, n, qp, bit_depth, sign_hiding_scan, &mut out);
+        quantize_impl_into(coeff, n, qp, bit_depth, sign_hiding_scan, None, &mut out);
         out
     }
 
@@ -1890,7 +2015,7 @@ mod tests {
         scan: &[(usize, usize)],
     ) -> [i16; MAX_TB] {
         let mut out = [0i16; MAX_TB];
-        quantize_with_sign_hiding_into(coeff, n, qp, bit_depth, scan, &mut out);
+        quantize_with_sign_hiding_into(coeff, n, qp, bit_depth, scan, None, &mut out);
         out
     }
 
@@ -1905,7 +2030,7 @@ mod tests {
 
         let direct = quantize_with_sign_hiding(&coeff, 8, 22, 8, scan);
         let mut split = quantize_impl(&coeff, 8, 22, 8, None);
-        apply_sign_hiding_to_levels(&mut split, &coeff, 8, 22, 8, scan);
+        apply_sign_hiding_to_levels(&mut split, &coeff, 8, 22, 8, scan, None);
         assert_eq!(split, direct);
     }
 
@@ -1948,6 +2073,7 @@ mod tests {
             scan,
             scan_idx,
             lambda,
+            scaling: None,
         };
         rdoq_luma_with_sign_hiding_into(&tb, ctx, &mut levels, &mut scratch);
         levels
@@ -1972,6 +2098,7 @@ mod tests {
             scan,
             scan_idx: 0,
             lambda: 0.57 * 2f32.powf((22.0 - 12.0) / 3.0),
+            scaling: None,
         };
         rdoq_chroma_with_sign_hiding_into(&tb, &ctx, &mut levels, &mut scratch);
         assert!(levels[..16].iter().any(|&level| level != 0));
@@ -2028,7 +2155,7 @@ mod tests {
         coeff[p0] = -100;
         coeff[p4] = 300;
 
-        sign_bit_hiding_hdq(&mut levels, &coeff, 4, scan, 22, 8, false);
+        sign_bit_hiding_hdq(&mut levels, &coeff, 4, scan, 22, 8, None, false);
 
         assert_ne!(levels[p0], 0);
         let parity: u32 = scan[..16]
@@ -2057,7 +2184,7 @@ mod tests {
             coeff[p4] = 300;
         }
 
-        sign_bit_hiding_hdq(&mut levels, &coeff, 8, scan, 22, 8, false);
+        sign_bit_hiding_hdq(&mut levels, &coeff, 8, scan, 22, 8, None, false);
 
         for group in 0..4 {
             let start = group * 16;
@@ -2140,6 +2267,7 @@ pub(crate) fn quantized_tb_stats(
     qp: u8,
     bit_depth: u8,
     scan: &[(usize, usize)],
+    scaling: Option<&ScalingTable>,
 ) -> QuantizedTbStats {
     static LOG2_1P: [f32; 16] = [
         0.0,
@@ -2161,14 +2289,21 @@ pub(crate) fn quantized_tb_stats(
     ];
     let log2n = n.trailing_zeros() as i64;
     let q_bits = 14 + (qp as i64) / 6 + (15 - bit_depth as i64 - log2n);
-    let q_scale = QUANT_SCALE[(qp % 6) as usize];
+    let cs = CoeffScale::new(qp, scaling);
     let offset = 171i64 << (q_bits - 9); // intra, as quantize_impl_into
-    let inv_scale = 1.0f32 / q_scale as f32;
+    let inv_scale = 1.0f32 / cs.q_scale as f32;
     let mut stats = QuantizedTbStats::default();
     let mut coeff_sse = 0.0f32;
     for (index, &(row, col)) in scan[..n * n].iter().enumerate() {
-        let scaled = (coeff[row * n + col] as i64).abs() * q_scale;
+        let pos = row * n + col;
+        let qs = cs.qs(pos);
+        let scaled = (coeff[pos] as i64).abs() * qs;
         let level = (scaled + offset) >> q_bits;
+        let inv_scale = if cs.table.is_some() {
+            1.0 / qs as f32
+        } else {
+            inv_scale
+        };
         let error = (scaled - (level << q_bits)) as f32 * inv_scale;
         coeff_sse += error * error;
         if level != 0 {
@@ -2286,12 +2421,13 @@ struct FrozenTbCost {
 fn group_dist(tb: &RdoqTb<'_>, levels: &[i16; MAX_TB], p: &FrozenTbCost, group: usize) -> f32 {
     let n = tb.n;
     let distortion = RdoqDistortion::new(n, tb.qp, tb.bit_depth);
+    let cs = CoeffScale::new(tb.qp, tb.scaling);
     let mut dist = 0.0f32;
     for &(row, col) in &tb.scan[group * 16..group * 16 + 16] {
         let pos = row * n + col;
         let w = p.weights.map_or(1.0, |w| w[pos]);
         let level = levels[pos].unsigned_abs() as u32;
-        dist += distortion.coefficient_cost((tb.coeff[pos] as i64).abs(), level) * w;
+        dist += distortion.coefficient_cost((tb.coeff[pos] as i64).abs(), level, cs.m(pos)) * w;
     }
     dist
 }
@@ -2565,7 +2701,7 @@ fn rd_sign_hiding_repair(
     let log2_size = n.trailing_zeros();
     let num_coeffs = n * n;
     let q_bits = 14 + tb.qp as i64 / 6 + (15 - tb.bit_depth as i64 - log2_size as i64);
-    let q_scale = QUANT_SCALE[(tb.qp % 6) as usize];
+    let cs = CoeffScale::new(tb.qp, tb.scaling);
     let idx = |sp: usize| {
         let (row, col) = scan[sp];
         row * n + col
@@ -2667,9 +2803,11 @@ fn rd_sign_hiding_repair(
             let pos = row * n + col;
             weight[k] = p.weights.map_or(1.0, |w| w[pos]);
             lv[k] = levels[pos];
-            dist_k[k] = distortion
-                .coefficient_cost((coeff[pos] as i64).abs(), lv[k].unsigned_abs() as u32)
-                * weight[k];
+            dist_k[k] = distortion.coefficient_cost(
+                (coeff[pos] as i64).abs(),
+                lv[k].unsigned_abs() as u32,
+                cs.m(pos),
+            ) * weight[k];
         }
         let base_sum: i32 = lv.iter().map(|&l| l as i32).sum();
         let mut ctx_set = if group == 0 || !p.is_luma {
@@ -2773,13 +2911,15 @@ fn rd_sign_hiding_repair(
                 if !legal {
                     continue;
                 }
-                let dd = distortion
-                    .coefficient_cost((coeff[pos] as i64).abs(), new.unsigned_abs() as u32)
-                    * weight[k]
+                let dd = distortion.coefficient_cost(
+                    (coeff[pos] as i64).abs(),
+                    new.unsigned_abs() as u32,
+                    cs.m(pos),
+                ) * weight[k]
                     - dist_k[k];
                 let dr = own_bits(k, new) - own_bits(k, old);
                 let class = if old != 0 {
-                    let toward = ((coeff[pos] as i64).abs() * q_scale
+                    let toward = ((coeff[pos] as i64).abs() * cs.qs(pos)
                         > (old.unsigned_abs() as i64) << q_bits)
                         == (dir > 0);
                     (!toward) as u8
