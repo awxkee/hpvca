@@ -10528,17 +10528,7 @@ impl<W: CabacWriter> crate::palette::PaletteBitWriter for PaletteBridge<'_, W> {
     }
 
     fn run_prefix_bin(&mut self, bin_idx: usize, copy_above: bool, bin: u8) {
-        // HEVC Table 9-51. The first COPY_INDEX bin is handled separately
-        // because its context depends on palette_index_idc.
-        let ctx_idx = match (copy_above, bin_idx) {
-            (false, 1 | 2) => Some(3),
-            (false, 3 | 4) => Some(4),
-            (true, 0) => Some(5),
-            (true, 1 | 2) => Some(6),
-            (true, 3 | 4) => Some(7),
-            _ => None,
-        };
-        match ctx_idx {
+        match crate::palette::run_prefix_ctx(bin_idx, copy_above) {
             Some(i) => self
                 .enc
                 .encode_bin(bin, &mut self.ctx.palette.run_prefix[i]),
@@ -10547,15 +10537,9 @@ impl<W: CabacWriter> crate::palette::PaletteBitWriter for PaletteBridge<'_, W> {
     }
 
     fn run_prefix_index_bin(&mut self, palette_index: u32, bin: u8) {
-        let bucket = if palette_index == 0 {
-            0
-        } else if palette_index < 3 {
-            1
-        } else {
-            2
-        };
+        let i = crate::palette::index_run_prefix_ctx(palette_index);
         self.enc
-            .encode_bin(bin, &mut self.ctx.palette.run_prefix[bucket]);
+            .encode_bin(bin, &mut self.ctx.palette.run_prefix[i]);
     }
 
     fn bypass(&mut self, bin: u8) {
@@ -10608,7 +10592,7 @@ fn write_palette_syntax<W: CabacWriter>(
     ibc: bool,
     x0: usize,
     y0: usize,
-    runs: &mut Vec<crate::palette::PaletteRun>,
+    runs: &[crate::palette::PaletteRun],
 ) {
     let Entropy { enc, ctx, ictx } = ent;
     if lossless {
@@ -10747,6 +10731,35 @@ fn code_cu_with_screen_content<W: CabacWriter>(
         // Distortion alone already loses: no rate estimate can rescue it.
         && scratch.palette_cand.sse < best_cost
     {
+        // Planned once against the pre-intra contexts the CU would be written
+        // from, so the trial and the committed write code the same runs.
+        let rate_model = crate::palette::PaletteRateModel::new(&saved_ctx.palette);
+        let base_rate = crate::palette::plan_runs(
+            &scratch.palette_cand,
+            &rate_model,
+            &mut scratch.palette_runs,
+        );
+        // Lossy: let near-tolerance samples join a neighbouring run, then keep
+        // the smoothed map only if the planned J says it pays as a whole.
+        if !par.lossless {
+            let cand = &mut *scratch.palette_cand;
+            let base_indices = cand.indices;
+            let base_sse = cand.sse;
+            if crate::palette::smooth_indices(
+                &block,
+                &pcfg,
+                par.lambda,
+                crate::palette::SMOOTH_BITS_PER_RUN,
+                cand,
+            ) {
+                let rate = crate::palette::plan_runs(cand, &rate_model, &mut scratch.palette_runs);
+                if cand.sse + par.lambda * rate >= base_sse + par.lambda * base_rate {
+                    cand.indices = base_indices;
+                    cand.sse = base_sse;
+                    crate::palette::plan_runs(cand, &rate_model, &mut scratch.palette_runs);
+                }
+            }
+        }
         let mut est = CabacEstimator::default();
         let mut trial_ctx = saved_ctx.clone();
         let mut trial_ictx = saved_ictx.clone();
@@ -10764,7 +10777,7 @@ fn code_cu_with_screen_content<W: CabacWriter>(
             par.ibc,
             geo.lu_col,
             geo.lu_row,
-            &mut scratch.palette_runs,
+            &scratch.palette_runs,
         );
         let cost = scratch.palette_cand.sse + par.lambda * est.bits();
         if cost < best_cost {
@@ -10792,7 +10805,7 @@ fn code_cu_with_screen_content<W: CabacWriter>(
             par.ibc,
             geo.lu_col,
             geo.lu_row,
-            &mut scratch.palette_runs,
+            &scratch.palette_runs,
         );
         let y_height = rec.y.len() / geo.yw_stride;
         let c_height = rec.cb.len().checked_div(geo.cw_stride).unwrap_or(0);
@@ -11634,7 +11647,7 @@ mod tests {
             coded: false,
         };
         let mut est = CabacEstimator::default();
-        let mut runs = Vec::new();
+        let runs = Vec::new();
         write_palette_syntax(
             Entropy {
                 enc: &mut est,
@@ -11648,7 +11661,7 @@ mod tests {
             false,
             0,
             0,
-            &mut runs,
+            &runs,
         );
         // One context-coded palette_mode_flag = 1 was spent, and the palette is
         // a single signaled entry, so the payload is tiny but non-empty.
