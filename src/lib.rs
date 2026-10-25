@@ -109,10 +109,7 @@ impl Speed {
     }
 
     /// Whether RDOQ's sign-data-hiding parity repair is chosen by
-    /// rate-distortion cost rather than by quantisation error alone. Measured
-    /// −0.8% BD-rate (ssimulacra2) at ~1.1–1.25× CPU in Fast; null in Slow,
-    /// where the repair runs on every in-loop RDOQ call, so Slow keeps the
-    /// plain repair.
+    /// rate-distortion cost rather than by quantization error alone.
     pub(crate) fn rd_sign_hiding(self) -> bool {
         matches!(self, Speed::Fast)
     }

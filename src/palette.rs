@@ -29,6 +29,9 @@
 
 //! Palette mode (HEVC Screen Content Coding, §7.3.8.13 / §8.4.4.2) — encoder side.
 //!
+use crate::cabac::contexts::PaletteContexts;
+use crate::cabac::engine::CtxModel;
+
 pub(crate) const MAX_COMPONENTS: usize = 3;
 
 /// `palette_max_size` signaled in the SPS.
@@ -191,6 +194,91 @@ pub(crate) trait PaletteBitWriter {
     fn bypass_bits(&mut self, value: u32, n: u32);
     /// `delta_qp()` / `chroma_qp_offset()` in the palette-escape position.
     fn escape_qp_syntax(&mut self);
+}
+
+/// `palette_run_prefix` context for bin `bin_idx` (HEVC Table 9-51), or `None`
+/// for a bypass bin. The first COPY_INDEX bin is keyed by the index instead —
+/// see [`index_run_prefix_ctx`].
+#[inline]
+pub(crate) fn run_prefix_ctx(bin_idx: usize, copy_above: bool) -> Option<usize> {
+    match (copy_above, bin_idx) {
+        (false, 1 | 2) => Some(3),
+        (false, 3 | 4) => Some(4),
+        (true, 0) => Some(5),
+        (true, 1 | 2) => Some(6),
+        (true, 3 | 4) => Some(7),
+        _ => None,
+    }
+}
+
+/// Context of the first `palette_run_prefix` bin of a COPY_INDEX run, keyed by
+/// the *unadjusted* `palette_index_idc`.
+#[inline]
+pub(crate) fn index_run_prefix_ctx(palette_index: u32) -> usize {
+    match palette_index {
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    }
+}
+
+/// Bin costs of the context-coded palette syntax, frozen at the context state
+/// the CU starts from. Run planning prices whole candidate runs with it; the
+/// adaptation inside one CU is ignored.
+#[derive(Clone, Copy)]
+pub(crate) struct PaletteRateModel {
+    run_type: [f32; 2],
+    run_prefix: [[f32; 2]; 8],
+}
+
+impl PaletteRateModel {
+    pub(crate) fn new(ctx: &PaletteContexts) -> Self {
+        let bins = |m: CtxModel| [m.estimated_bits(0), m.estimated_bits(1)];
+        Self {
+            run_type: bins(ctx.run_type_flag),
+            run_prefix: ctx.run_prefix.map(bins),
+        }
+    }
+
+    /// Every bin costs one bit.
+    #[cfg(test)]
+    fn flat() -> Self {
+        Self {
+            run_type: [1.0; 2],
+            run_prefix: [[1.0; 2]; 8],
+        }
+    }
+}
+
+/// A [`PaletteBitWriter`] that only adds up [`PaletteRateModel`] costs.
+struct RateSink<'a> {
+    model: &'a PaletteRateModel,
+    bits: f32,
+}
+
+impl PaletteBitWriter for RateSink<'_> {
+    fn run_type_flag(&mut self, bin: u8) {
+        self.bits += self.model.run_type[bin as usize];
+    }
+    fn transpose_flag(&mut self, _bin: u8) {
+        self.bits += 1.0;
+    }
+    fn run_prefix_bin(&mut self, bin_idx: usize, copy_above: bool, bin: u8) {
+        self.bits += match run_prefix_ctx(bin_idx, copy_above) {
+            Some(i) => self.model.run_prefix[i][bin as usize],
+            None => 1.0,
+        };
+    }
+    fn run_prefix_index_bin(&mut self, palette_index: u32, bin: u8) {
+        self.bits += self.model.run_prefix[index_run_prefix_ctx(palette_index)][bin as usize];
+    }
+    fn bypass(&mut self, _bin: u8) {
+        self.bits += 1.0;
+    }
+    fn bypass_bits(&mut self, _value: u32, n: u32) {
+        self.bits += n as f32;
+    }
+    fn escape_qp_syntax(&mut self) {}
 }
 
 /// SCC bypass Exp-Golomb order-`k`: a run of ones terminated by a zero, then
@@ -749,6 +837,15 @@ pub(crate) fn assign_indices(
     out.escape_present = escapes != 0;
     out.transpose = transpose;
 
+    out.sse = palette_sse(src, cfg, out);
+    true
+}
+
+/// Distortion of the palette reconstruction over exactly the samples the
+/// decoder writes.
+fn palette_sse(src: &SourceBlock<'_>, cfg: &PaletteConfig, out: &PaletteCu) -> f32 {
+    let size = out.size;
+    let transpose = out.transpose;
     // Unweighted, matching `region_sse_plain`: the palette J is compared directly
     // against the intra CU's J, so both must measure distortion the same way.
     let mut sse = 0.0f64;
@@ -773,8 +870,112 @@ pub(crate) fn assign_indices(
             }
         }
     }
-    out.sse = sse as f32;
-    true
+    sse as f32
+}
+
+/// Squared error of coding the (untransposed) sample at `scan` as `entry`,
+/// counting chroma only where the decoder writes a chroma sample.
+#[inline]
+fn entry_sse(
+    src: &SourceBlock<'_>,
+    cfg: &PaletteConfig,
+    scan: usize,
+    size: usize,
+    entry: &[u16; MAX_COMPONENTS],
+) -> f32 {
+    let (col, row) = scan_pos(scan, size);
+    let d = f32::from(entry[0]) - f32::from(src.luma(col, row));
+    let mut sse = d * d;
+    if col % cfg.sub_w == 0 && row % cfg.sub_h == 0 {
+        for (comp, &value) in entry.iter().enumerate().take(cfg.num_comps).skip(1) {
+            let d = f32::from(value) - f32::from(src.chroma(comp, col, row, cfg.sub_w, cfg.sub_h));
+            sse += d * d;
+        }
+    }
+    sse
+}
+
+/// Price of one run break in [`smooth_indices`], in bits. Swept 2/4/8/16 on
+/// screenshots (BD-rate PSNR vs no smoothing): −0.26/−0.43/−0.37/−0.32%.
+pub(crate) const SMOOTH_BITS_PER_RUN: f32 = 4.0;
+
+/// Rate-distortion smoothing of a lossy index map: a stretch of equal indices
+/// is recolored to its left neighbour's entry, or sample by sample to the
+/// entry above, when every sample stays within the palette tolerance and the
+/// added distortion is below `lambda · bits_per_run` — the price of the run
+/// break it removes. Escapes are never touched. Returns whether any index
+/// changed; `sse` is updated.
+pub(crate) fn smooth_indices(
+    src: &SourceBlock<'_>,
+    cfg: &PaletteConfig,
+    lambda: f32,
+    bits_per_run: f32,
+    out: &mut PaletteCu,
+) -> bool {
+    debug_assert!(!out.transpose && !cfg.lossless);
+    let size = out.size;
+    let n = size * size;
+    let escape = out.palette_size as u32;
+    let tol = out.tolerance;
+    let budget = lambda * bits_per_run;
+    let mut changed = false;
+
+    let fits = |out: &PaletteCu, scan: usize, v: u32| -> bool {
+        let (col, row) = scan_pos(scan, size);
+        let sample = src.grid_sample(row, col, false, cfg);
+        within(&out.palette[v as usize], &sample, cfg.num_comps, tol)
+    };
+    let delta = |out: &PaletteCu, scan: usize, from: u32, to: u32| -> f32 {
+        entry_sse(src, cfg, scan, size, &out.palette[to as usize])
+            - entry_sse(src, cfg, scan, size, &out.palette[from as usize])
+    };
+
+    let mut start = 0usize;
+    while start < n {
+        let value = out.indices[start];
+        let mut end = start + 1;
+        while end < n && out.indices[end] == value {
+            end += 1;
+        }
+        if value != escape {
+            // Join the run on the left.
+            let mut done = false;
+            if start > 0 {
+                let left = out.indices[start - 1];
+                if left != escape && (start..end).all(|s| fits(out, s, left)) {
+                    let cost: f32 = (start..end).map(|s| delta(out, s, value, left)).sum();
+                    if cost < budget {
+                        out.indices[start..end].fill(left);
+                        changed = true;
+                        done = true;
+                    }
+                }
+            }
+            // Or become part of a COPY_ABOVE run.
+            if !done && start >= size {
+                let ok = (start..end).all(|s| {
+                    let above = index_above(&out.indices[..n], s, size);
+                    above != escape && (above == value || fits(out, s, above))
+                });
+                if ok {
+                    let cost: f32 = (start..end)
+                        .map(|s| delta(out, s, value, index_above(&out.indices[..n], s, size)))
+                        .sum();
+                    if cost < budget {
+                        for s in start..end {
+                            out.indices[s] = index_above(&out.indices[..n], s, size);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+        start = end;
+    }
+    if changed {
+        out.sse = palette_sse(src, cfg, out);
+    }
+    changed
 }
 
 #[inline]
@@ -813,9 +1014,226 @@ pub(crate) struct PaletteRun {
     scan: usize,
 }
 
-/// Segment the index map into COPY_INDEX / COPY_ABOVE runs, following exactly
-/// the mode-availability rules the decoder's walk applies.
-fn segment_runs(cu: &PaletteCu, runs: &mut Vec<PaletteRun>) {
+/// Truncated-binary length of `value` over an alphabet of `alphabet` symbols.
+#[inline]
+fn truncated_binary_bits(value: u32, alphabet: u32) -> f32 {
+    if alphabet <= 1 {
+        return 0.0;
+    }
+    let k = 31 - alphabet.leading_zeros();
+    let u = (1u32 << (k + 1)) - alphabet;
+    (k + u32::from(value >= u)) as f32
+}
+
+/// `palette_index_idc` for a COPY_INDEX run of `value` whose reference sample
+/// (left, or above after a COPY_ABOVE run) holds `reference`.
+#[inline]
+fn adjusted_index(value: u32, reference: Option<u32>) -> u32 {
+    match reference {
+        Some(r) if value > r => value - 1,
+        _ => value,
+    }
+}
+
+const COPY_INDEX_STATE: usize = 0;
+const COPY_ABOVE_STATE: usize = 1;
+
+/// Segment the index map into COPY_INDEX / COPY_ABOVE runs at minimum rate.
+///
+/// A shortest path over scan positions, with the mode of the run that ended
+/// there as the state — the state fixes both whether COPY_ABOVE is available
+/// next and the reference the next index is adjusted against. The syntax
+/// leaves exactly one freedom the greedy longest-run rule ignores: a
+/// COPY_INDEX run may stop short wherever a COPY_ABOVE run can take over
+/// (stopping anywhere else would code the same index twice in a row, which the
+/// adjusted-index rule cannot express), and COPY_ABOVE runs are always
+/// maximal for the same reason. Within one stretch of above-matching samples
+/// the cost of the split is concave in the split point, so only the stretch
+/// starts are tried.
+///
+/// Rates are `model` costs with `palette_max_run` taken as the samples left
+/// after the run; the exact bound also reserves the runs still to come, which
+/// only shortens a truncated prefix near the end of the block. Returns the
+/// planned index-map rate under `model`.
+pub(crate) fn plan_runs(
+    cu: &PaletteCu,
+    model: &PaletteRateModel,
+    runs: &mut Vec<PaletteRun>,
+) -> f32 {
+    runs.clear();
+    let max_palette_index = cu.max_palette_index();
+    if max_palette_index <= 0 {
+        return 0.0;
+    }
+    let mpi = max_palette_index as u32;
+    let size = cu.size;
+    let n = size * size;
+    let indices = &cu.indices[..n];
+
+    let mut above = [0u32; MAX_SAMPLES];
+    for (scan, slot) in above[..n].iter_mut().enumerate() {
+        *slot = index_above(indices, scan, size);
+    }
+    // Same-index run length from each position; COPY_ABOVE run length from
+    // each position (0 where above does not match); first above-matching
+    // stretch start at or after each position.
+    let mut index_len = [0u16; MAX_SAMPLES + 1];
+    let mut above_len = [0u16; MAX_SAMPLES + 1];
+    let mut stretch_start = [0u16; MAX_SAMPLES + 1];
+    stretch_start[n] = n as u16;
+    for p in (0..n).rev() {
+        index_len[p] = if p + 1 < n && indices[p] == indices[p + 1] {
+            index_len[p + 1] + 1
+        } else {
+            1
+        };
+        above_len[p] = if p >= size && indices[p] == above[p] {
+            above_len[p + 1] + 1
+        } else {
+            0
+        };
+    }
+    for p in (0..n).rev() {
+        let starts = above_len[p] != 0 && (p == 0 || above_len[p - 1] == 0);
+        stretch_start[p] = if starts {
+            p as u16
+        } else {
+            stretch_start[p + 1]
+        };
+    }
+
+    // Each COPY_INDEX run also lengthens num_palette_indices_minus1, a Rice
+    // code with parameter `rice`: about 2^-rice bits per run.
+    let rice = 3 + ((mpi + 1) >> 3);
+    let per_index_run = 1.0 / (1u32 << rice) as f32;
+    let run_bits = |run: usize, max_run: usize, copy_above: bool, raw: u32| -> f32 {
+        let mut sink = RateSink { model, bits: 0.0 };
+        write_run(&mut sink, run as u32, max_run as u32, copy_above, raw);
+        sink.bits
+    };
+
+    let mut cost = [[f32::INFINITY; 2]; MAX_SAMPLES + 1];
+    // Back-pointer: the position and state the run ending here started from.
+    let mut from = [[(0u16, 0u8); 2]; MAX_SAMPLES + 1];
+    cost[0][COPY_INDEX_STATE] = 0.0;
+    let mut relax = |cost: &mut [[f32; 2]; MAX_SAMPLES + 1], q: usize, m: usize, c: f32, p, pm| {
+        if c < cost[q][m] {
+            cost[q][m] = c;
+            from[q][m] = (p as u16, pm as u8);
+        }
+    };
+
+    for p in 0..n {
+        for pm in [COPY_INDEX_STATE, COPY_ABOVE_STATE] {
+            let c = cost[p][pm];
+            if !c.is_finite() {
+                continue;
+            }
+            let can_copy_above = p >= size && pm != COPY_ABOVE_STATE;
+            let flag_coded = can_copy_above && p + 1 < n;
+            let max_run = n - p - 1;
+
+            // COPY_INDEX
+            let value = indices[p];
+            let reference = match (p, pm) {
+                (0, _) => None,
+                (_, COPY_ABOVE_STATE) => Some(above[p]),
+                _ => Some(indices[p - 1]),
+            };
+            if reference != Some(value) {
+                let raw = adjusted_index(value, reference);
+                let alphabet = if p == 0 { mpi + 1 } else { mpi };
+                let head = c
+                    + if flag_coded { model.run_type[0] } else { 0.0 }
+                    + truncated_binary_bits(raw, alphabet)
+                    + per_index_run;
+                let full = p + index_len[p] as usize;
+                // Early stops, each handing over to a COPY_ABOVE run.
+                let mut q = if above_len[p + 1] != 0 {
+                    p + 1
+                } else {
+                    stretch_start[p + 1] as usize
+                };
+                while q < full {
+                    relax(
+                        &mut cost,
+                        q,
+                        COPY_INDEX_STATE,
+                        head + run_bits(q - p - 1, max_run, false, raw),
+                        p,
+                        pm,
+                    );
+                    q = stretch_start[q + 1] as usize;
+                }
+                // The last run's length is inferred, not coded.
+                let tail = if full == n {
+                    0.0
+                } else {
+                    run_bits(full - p - 1, max_run, false, raw)
+                };
+                relax(&mut cost, full, COPY_INDEX_STATE, head + tail, p, pm);
+            }
+
+            // COPY_ABOVE, always maximal. As the last run its type flag is
+            // inferred and its length is not coded.
+            if can_copy_above && above_len[p] != 0 {
+                let len = above_len[p] as usize;
+                let q = p + len;
+                let add = if q == n {
+                    0.0
+                } else {
+                    model.run_type[1] + run_bits(len - 1, max_run, true, 0)
+                };
+                relax(&mut cost, q, COPY_ABOVE_STATE, c + add, p, pm);
+            }
+        }
+    }
+
+    // copy_above_indices_for_final_run_flag closes the choice.
+    let end_index = cost[n][COPY_INDEX_STATE] + model.run_type[0];
+    let end_above = cost[n][COPY_ABOVE_STATE] + model.run_type[1];
+    let (mut m, total) = if end_above < end_index {
+        (COPY_ABOVE_STATE, end_above)
+    } else {
+        (COPY_INDEX_STATE, end_index)
+    };
+    let mut q = n;
+    while q > 0 {
+        let (p, pm) = from[q][m];
+        let (p, pm) = (p as usize, pm as usize);
+        let copy_above = m == COPY_ABOVE_STATE;
+        let raw_index = if copy_above {
+            0
+        } else {
+            let reference = match (p, pm) {
+                (0, _) => None,
+                (_, COPY_ABOVE_STATE) => Some(above[p]),
+                _ => Some(indices[p - 1]),
+            };
+            debug_assert_ne!(
+                reference,
+                Some(indices[p]),
+                "run plan breaks the adjusted-index rule"
+            );
+            adjusted_index(indices[p], reference)
+        };
+        runs.push(PaletteRun {
+            copy_above,
+            raw_index,
+            run: (q - p - 1) as u32,
+            scan: p,
+        });
+        q = p;
+        m = pm;
+    }
+    runs.reverse();
+    total
+}
+
+/// Greedy segmentation (longest run first, COPY_ABOVE on ties) — the rule
+/// [`plan_runs`] replaced, kept as its reference.
+#[cfg(test)]
+fn segment_runs_greedy(cu: &PaletteCu, runs: &mut Vec<PaletteRun>) {
     let size = cu.size;
     let n = size * size;
     let indices = &cu.indices[..n];
@@ -876,14 +1294,15 @@ fn segment_runs(cu: &PaletteCu, runs: &mut Vec<PaletteRun>) {
     }
 }
 
-/// Write `palette_coding()` (§7.3.8.13) for an analysed CU.
+/// Write `palette_coding()` (§7.3.8.13) for an analysed CU whose index map
+/// [`plan_runs`] has segmented into `runs`.
 pub(crate) fn write_palette_cu<B: PaletteBitWriter>(
     bits: &mut B,
     cu: &PaletteCu,
     cfg: &PaletteConfig,
     x0: usize,
     y0: usize,
-    runs: &mut Vec<PaletteRun>,
+    runs: &[PaletteRun],
 ) {
     let size = cu.size;
     let n = size * size;
@@ -914,7 +1333,7 @@ pub(crate) fn write_palette_cu<B: PaletteBitWriter>(
     let max_palette_index = cu.max_palette_index();
     if max_palette_index > 0 {
         let mpi = max_palette_index as u32;
-        segment_runs(cu, runs);
+        debug_assert_eq!(runs.iter().map(|r| r.run as usize + 1).sum::<usize>(), n);
 
         // (5a) num_palette_indices_minus1 + palette_index_idc + final-run flag
         let index_runs = runs.iter().filter(|r| !r.copy_above).count();
@@ -1291,16 +1710,24 @@ mod tests {
         indices
     }
 
-    fn write_index_map_only(cu: &PaletteCu) -> Vec<u8> {
+    fn write_index_map_only(cu: &PaletteCu, runs: &[PaletteRun]) -> Vec<u8> {
         let mut sink = Sink::default();
-        let mut runs = Vec::new();
+        write_index_map_into(&mut sink, cu, runs);
+        sink.bins
+    }
+
+    /// The index-map part of `write_palette_cu` (5a/5b), for any sink.
+    fn write_index_map_into<B: PaletteBitWriter>(
+        sink: &mut B,
+        cu: &PaletteCu,
+        runs: &[PaletteRun],
+    ) {
         let mpi = cu.max_palette_index() as u32;
-        segment_runs(cu, &mut runs);
         let index_runs = runs.iter().filter(|r| !r.copy_above).count();
-        write_num_palette_indices(&mut sink, index_runs as u32 - 1, mpi);
+        write_num_palette_indices(sink, index_runs as u32 - 1, mpi);
         let mut first = true;
         for run in runs.iter().filter(|r| !r.copy_above) {
-            write_truncated_binary(&mut sink, run.raw_index, if first { mpi + 1 } else { mpi });
+            write_truncated_binary(sink, run.raw_index, if first { mpi + 1 } else { mpi });
             first = false;
         }
         let final_copy_above = runs.last().map(|r| r.copy_above).unwrap_or(false);
@@ -1322,7 +1749,7 @@ mod tests {
             if !last_run {
                 let reserved = remaining + usize::from(final_copy_above);
                 write_run(
-                    &mut sink,
+                    sink,
                     run.run,
                     (n - scan - 1 - reserved) as u32,
                     run.copy_above,
@@ -1331,7 +1758,28 @@ mod tests {
             }
             prev_copy_above = run.copy_above;
         }
-        sink.bins
+    }
+
+    /// Both segmentations of `cu`, each verified to round-trip through the
+    /// decoder walk; returns their exact index-map rates under `model`.
+    fn plan_and_greedy_rates(cu: &PaletteCu, model: &PaletteRateModel) -> (f32, f32) {
+        let mpi = cu.max_palette_index() as u32;
+        let n = cu.size * cu.size;
+        let mut rates = [0.0f32; 2];
+        for (slot, dp) in rates.iter_mut().zip([true, false]) {
+            let mut runs = Vec::new();
+            if dp {
+                plan_runs(cu, model, &mut runs);
+            } else {
+                segment_runs_greedy(cu, &mut runs);
+            }
+            let decoded = replay_index_map(write_index_map_only(cu, &runs), cu.size, mpi);
+            assert_eq!(decoded, cu.indices[..n].to_vec(), "dp={dp}");
+            let mut sink = RateSink { model, bits: 0.0 };
+            write_index_map_into(&mut sink, cu, &runs);
+            *slot = sink.bits;
+        }
+        (rates[0], rates[1])
     }
 
     fn cu_with(size: usize, palette_size: usize, indices: &[u32]) -> Box<PaletteCu> {
@@ -1448,9 +1896,9 @@ mod tests {
         ];
         for (size, palette_size, indices) in &cases {
             let cu = cu_with(*size, *palette_size, indices);
-            let bins = write_index_map_only(&cu);
-            let decoded = replay_index_map(bins, *size, cu.max_palette_index() as u32);
-            assert_eq!(&decoded, indices, "size={size}");
+            let (dp, greedy) = plan_and_greedy_rates(&cu, &PaletteRateModel::flat());
+            // The plan prices the run bound loosely, so allow it a hair of slack.
+            assert!(dp <= greedy + 0.5, "size={size} dp={dp} greedy={greedy}");
         }
     }
 
@@ -1475,11 +1923,118 @@ mod tests {
                 if cu.max_palette_index() <= 0 {
                     continue;
                 }
-                let bins = write_index_map_only(&cu);
-                let decoded = replay_index_map(bins, size, cu.max_palette_index() as u32);
-                assert_eq!(decoded, indices, "size={size} palette={palette_size}");
+                plan_and_greedy_rates(&cu, &PaletteRateModel::flat());
             }
         }
+    }
+
+    #[test]
+    fn planned_runs_beat_greedy_on_structured_maps() {
+        // Screen-like maps: each row mostly repeats the one above, with short
+        // horizontal strokes of a new index — where COPY_INDEX vs COPY_ABOVE
+        // splits actually compete.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let model = PaletteRateModel::flat();
+        let (mut dp_total, mut greedy_total) = (0.0f32, 0.0f32);
+        for size in [8usize, 16, 32] {
+            for palette_size in [2usize, 3, 6] {
+                for _ in 0..8 {
+                    let n = size * size;
+                    let mut indices = vec![0u32; n];
+                    for row in 0..size {
+                        for col in 0..size {
+                            let above = if row == 0 {
+                                0
+                            } else {
+                                indices[scan_pos_inv(col, row - 1, size)]
+                            };
+                            indices[scan_pos_inv(col, row, size)] = above;
+                        }
+                        let mut col = 0;
+                        while col < size {
+                            if next() % 4 == 0 {
+                                let v = (next() % palette_size as u64) as u32;
+                                let len = 1 + (next() % 6) as usize;
+                                for c in col..(col + len).min(size) {
+                                    indices[scan_pos_inv(c, row, size)] = v;
+                                }
+                                col += len;
+                            }
+                            col += 1;
+                        }
+                    }
+                    let cu = cu_with(size, palette_size, &indices);
+                    if cu.max_palette_index() <= 0 {
+                        continue;
+                    }
+                    let (dp, greedy) = plan_and_greedy_rates(&cu, &model);
+                    assert!(dp <= greedy + 0.5, "size={size} dp={dp} greedy={greedy}");
+                    dp_total += dp;
+                    greedy_total += greedy;
+                }
+            }
+        }
+        assert!(
+            dp_total < greedy_total,
+            "dp={dp_total} greedy={greedy_total}"
+        );
+    }
+
+    #[test]
+    fn smoothing_merges_cheap_run_breaks_only() {
+        // A flat 100 field with isolated 104 samples; both are palette entries
+        // and 4 sits inside the tolerance, so each 104 is a run break that
+        // costs 16 of squared error to remove.
+        let size = 8;
+        let mut y = vec![100u16; size * size];
+        for i in [5usize, 19, 42] {
+            y[i] = 104;
+        }
+        let cb = vec![128u16; size * size];
+        let cr = vec![128u16; size * size];
+        let src = SourceBlock {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            yw: size,
+            yh: size,
+            cw: size,
+            chh: size,
+            x0: 0,
+            y0: 0,
+            size,
+        };
+        let cfg = cfg444();
+        let mut indices = vec![0u32; size * size];
+        for row in 0..size {
+            for col in 0..size {
+                if y[row * size + col] == 104 {
+                    indices[scan_pos_inv(col, row, size)] = 1;
+                }
+            }
+        }
+        let mut cu = cu_with(size, 2, &indices);
+        cu.palette[0] = [100, 128, 128];
+        cu.palette[1] = [104, 128, 128];
+        cu.tolerance = 6;
+        cu.sse = palette_sse(&src, &cfg, &cu);
+        assert_eq!(cu.sse, 0.0);
+
+        // λ·bits below 16: nothing is worth merging.
+        let mut keep = cu.clone();
+        assert!(!smooth_indices(&src, &cfg, 1.0, 4.0, &mut keep));
+        assert_eq!(keep.indices[..size * size], indices[..]);
+
+        let mut merged = cu.clone();
+        assert!(smooth_indices(&src, &cfg, 10.0, 4.0, &mut merged));
+        assert!(merged.indices[..size * size].iter().all(|&i| i == 0));
+        assert_eq!(merged.sse, 3.0 * 16.0);
     }
 
     #[test]
