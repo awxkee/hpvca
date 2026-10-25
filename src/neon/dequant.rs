@@ -31,7 +31,7 @@ use crate::hevc_transform::{DEQUANT_SCALE, MAX_TB};
 use core::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
-pub(crate) unsafe fn dequantize_neon(
+pub(crate) fn dequantize_neon(
     level: &[i16],
     n: usize,
     qp: u8,
@@ -124,6 +124,51 @@ fn clamp(value: int32x4_t, min: int32x4_t, max: int32x4_t) -> int32x4_t {
     vminq_s32(vmaxq_s32(value, min), max)
 }
 
+/// [`dequantize_neon`] with a scaling list: the per-coefficient factor `m`
+/// (1..=255) replaces the flat 16, so the product `level · scale · m` stays
+/// below 2³¹ and the left shift saturates where the scalar clamp would.
+#[target_feature(enable = "neon")]
+pub(crate) fn dequantize_scaled_neon(
+    level: &[i16],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    m: &[i32],
+    out: &mut [i32; MAX_TB],
+) {
+    let len = n * n;
+    let bd_shift = bit_depth as i32 + n.trailing_zeros() as i32 - 5;
+    let net_shift = qp as i32 / 6 - bd_shift;
+    let scale = DEQUANT_SCALE[(qp % 6) as usize] as i32;
+    let min = vdupq_n_s32(-32768);
+    let max = vdupq_n_s32(32767);
+    let (level, lr) = level[..len].as_chunks::<8>();
+    let (m, mr) = m[..len].as_chunks::<8>();
+    let (out, or) = out[..len].as_chunks_mut::<8>();
+    debug_assert!(lr.is_empty() && mr.is_empty() && or.is_empty());
+    let shift = vdupq_n_s32(net_shift);
+    let add = vdupq_n_s32(if net_shift < 0 {
+        1 << (-net_shift - 1)
+    } else {
+        0
+    });
+    for ((level, m), out) in level.iter().zip(m).zip(out) {
+        let packed = unsafe { vld1q_s16(level.as_ptr()) };
+        let (m_lo, m_hi) = unsafe { (vld1q_s32(m.as_ptr()), vld1q_s32(m[4..].as_ptr())) };
+        let low = vmulq_s32(vmulq_n_s32(vmovl_s16(vget_low_s16(packed)), scale), m_lo);
+        let high = vmulq_s32(vmulq_n_s32(vmovl_high_s16(packed), scale), m_hi);
+        // vqshlq: a negative shift is a (truncating) right shift, which with
+        // the pre-added rounding term matches `(v + add) >> s`; a positive
+        // one saturates, which the ±32767 clamp then absorbs.
+        let low = clamp(vqshlq_s32(vaddq_s32(low, add), shift), min, max);
+        let high = clamp(vqshlq_s32(vaddq_s32(high, add), shift), min, max);
+        unsafe {
+            vst1q_s32(out.as_mut_ptr(), low);
+            vst1q_s32(out[4..].as_mut_ptr(), high);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +192,39 @@ mod tests {
                     crate::hevc_transform::dequantize_into(&level, n, qp, bit_depth, &mut expected);
                     unsafe { dequantize_neon(&level, n, qp, bit_depth, &mut actual) };
                     assert_eq!(actual, expected, "n={n}, bit_depth={bit_depth}, qp={qp}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dequantize_scaled_neon_matches_scalar() {
+        for n in [8usize, 16, 32] {
+            for bit_depth in [8u8, 10, 12] {
+                let max_qp = 51 + 6 * (bit_depth - 8);
+                for qp in (0..=max_qp).step_by(5) {
+                    let mut level = [0i16; MAX_TB];
+                    let mut m = vec![16i32; n * n];
+                    for i in 0..n * n {
+                        level[i] = ((i as i32 * 7919 + qp as i32 * 13) % 65536 - 32768) as i16;
+                        m[i] = 1 + (i as i32 * 37 + qp as i32) % 255;
+                    }
+                    let mut expected = [0i32; MAX_TB];
+                    let mut actual = [0i32; MAX_TB];
+                    crate::hevc_transform::dequantize_scaled_into(
+                        &level,
+                        n,
+                        qp,
+                        bit_depth,
+                        &m,
+                        &mut expected,
+                    );
+                    unsafe { dequantize_scaled_neon(&level, n, qp, bit_depth, &m, &mut actual) };
+                    assert_eq!(
+                        &expected[..n * n],
+                        &actual[..n * n],
+                        "n{n} bd{bit_depth} qp{qp}"
+                    );
                 }
             }
         }

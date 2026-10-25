@@ -392,6 +392,7 @@ pub(crate) fn build_sps(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
+    scaling: Option<&crate::scaling::ScalingLists>,
 ) -> Nalu {
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
@@ -474,7 +475,11 @@ pub(crate) fn build_sps(
     // transform trees. Smaller CUs naturally stop at the 4×4 minimum TB size.
     bw.write_ue(3);
 
-    bw.write_bit(false); // scaling_list_enabled_flag
+    bw.write_bit(scaling.is_some()); // scaling_list_enabled_flag
+    if let Some(lists) = scaling {
+        bw.write_bit(true); // sps_scaling_list_data_present_flag
+        lists.write(&mut bw);
+    }
     bw.write_bit(false); // amp_enabled_flag
     bw.write_bit(true); // sample_adaptive_offset_enabled_flag = 1 (matches x265 &
     // Kvazaar; Apple's decoder expects per-CTB SAO syntax in
@@ -806,6 +811,22 @@ pub(crate) fn encode_intra_opts(
         scc,
         ibc,
     );
+    let qp_val: u8 = quality_to_qp(quality);
+    let cqo =
+        chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, yuv.chroma, lossless));
+    let transform_skip =
+        transform_skip.unwrap_or_else(|| transform_skip_for(yuv, qp_val, lossless));
+    let tools = PictureTools {
+        transform_skip,
+        cross_component: cross_component_enabled(yuv.chroma, lossless, scc, ibc),
+        // Keyed on the PPS QP like transform skip: a grid cell's rebiased
+        // slice QP must not change the shared SPS.
+        scaling: if lossless {
+            None
+        } else {
+            crate::scaling::lists_for_qp(qp_val)
+        },
+    };
     let sps = build_sps(
         width,
         height,
@@ -816,14 +837,8 @@ pub(crate) fn encode_intra_opts(
         ibc,
         implicit_rdpcm,
         persistent_rice,
+        tools.scaling,
     );
-    let qp_val: u8 = quality_to_qp(quality);
-    let cqo =
-        chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, yuv.chroma, lossless));
-    let tools = PictureTools {
-        transform_skip: transform_skip.unwrap_or_else(|| transform_skip_for(yuv, qp_val, lossless)),
-        cross_component: cross_component_enabled(yuv.chroma, lossless, scc, ibc),
-    };
     let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo, ibc, tools);
     // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
     // background workers plus the calling thread give `threads`-way concurrency; the
@@ -915,6 +930,7 @@ struct CcpTb<'a> {
     scan: &'a [(usize, usize)],
     lambda: f32,
     component: usize,
+    scaling: Option<&'a crate::scaling::ScalingTable>,
 }
 
 /// Cross-component prediction of one chroma TB: pick the scale for the
@@ -963,6 +979,7 @@ fn predict_cross_component(
             tb.chroma_qp,
             tb.bit_depth,
             tb.scan,
+            tb.scaling,
         );
         let mut est = CabacEstimator::default();
         let mut syntax_ctx = ctx.clone();
@@ -998,6 +1015,9 @@ pub(crate) struct PictureTools {
     /// `cross_component_prediction_enabled_flag` (see
     /// [`cross_component_enabled`]).
     pub(crate) cross_component: bool,
+    /// The SPS scaling lists (`scaling_list_enabled_flag`), a function of the
+    /// picture QP alone so every grid cell signals the same SPS; `None` = off.
+    pub(crate) scaling: Option<&'static crate::scaling::ScalingLists>,
 }
 
 /// Whether the picture enables cross-component prediction (RExt §7.4.3.3.2):
@@ -4796,6 +4816,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
             scan: luma_scan,
             scan_idx: luma_scan_idx,
             lambda,
+            scaling: scratch.tools.scaling.and_then(|s| s.table(32, true)),
         };
         crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
             &tb,
@@ -4828,6 +4849,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
             32,
             qp,
             bit_depth.bits(),
+            scratch.tools.scaling.and_then(|s| s.factor(32, true)),
             &mut scratch.dequant,
         );
         crate::hevc_transform::run_inv_transform(
@@ -5022,6 +5044,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 scan: chroma_scan,
                 scan_idx: chroma_scan_idx,
                 lambda: chroma_lambda,
+                scaling: scratch.tools.scaling.and_then(|s| s.table(16, false)),
             };
             crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                 &tb,
@@ -5061,6 +5084,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 16,
                 chroma_qp,
                 bit_depth.bits(),
+                scratch.tools.scaling.and_then(|s| s.factor(16, false)),
                 &mut scratch.dequant,
             );
             crate::hevc_transform::run_inv_transform(
@@ -6252,6 +6276,7 @@ fn choose_luma4x4_transform(
                 scan,
                 scan_idx,
                 lambda,
+                scaling: scratch.tools.scaling.and_then(|s| s.table(N, true)),
             },
             1,
             ctx,
@@ -6268,6 +6293,7 @@ fn choose_luma4x4_transform(
         N,
         qp,
         bit_depth,
+        scratch.tools.scaling.and_then(|s| s.factor(N, true)),
         &mut scratch.dequant,
     );
     crate::hevc_transform::run_inv_transform(
@@ -6302,6 +6328,7 @@ fn choose_luma4x4_transform(
         N,
         qp,
         bit_depth,
+        scratch.tools.scaling.and_then(|s| s.factor(N, true)),
         &mut dequant,
     );
     crate::hevc_transform::run_inv_transform(
@@ -6329,6 +6356,7 @@ fn choose_luma4x4_transform(
         N,
         qp,
         bit_depth,
+        scratch.tools.scaling.and_then(|s| s.factor(N, true)),
         &mut dequant,
     );
     crate::hevc_transform::transform_skip_inv_into(&dequant, N, bit_depth, &mut inverse);
@@ -6471,6 +6499,7 @@ fn commit_split_luma(
                 scan,
                 scan_idx,
                 lambda,
+                scaling: scratch.tools.scaling.and_then(|s| s.table(child, true)),
             };
             crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                 &tb,
@@ -6540,6 +6569,7 @@ fn commit_split_luma(
                     child,
                     qp,
                     bit_depth,
+                    scratch.tools.scaling.and_then(|s| s.factor(child, true)),
                     &mut scratch.dequant,
                 );
                 crate::hevc_transform::run_inv_transform(
@@ -6759,6 +6789,10 @@ fn commit_split_chroma(
                                 scan,
                                 lambda,
                                 component,
+                                scaling: scratch
+                                    .tools
+                                    .scaling
+                                    .and_then(|s| s.table(child_side, false)),
                             },
                             &mut scratch.residual,
                             &scratch.ccp_child_luma_res[luma_offset..luma_offset + child_len],
@@ -6788,6 +6822,10 @@ fn commit_split_chroma(
                         scan,
                         scan_idx,
                         lambda,
+                        scaling: scratch
+                            .tools
+                            .scaling
+                            .and_then(|s| s.table(child_side, false)),
                     };
                     crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                         &tb,
@@ -6863,6 +6901,10 @@ fn commit_split_chroma(
                         child_side,
                         chroma_qp,
                         bit_depth,
+                        scratch
+                            .tools
+                            .scaling
+                            .and_then(|s| s.factor(child_side, false)),
                         &mut scratch.dequant,
                     );
                     crate::hevc_transform::run_inv_transform(
@@ -7058,6 +7100,7 @@ fn evaluate_chroma_mode(
                         scan,
                         lambda,
                         component,
+                        scaling: scratch.tools.scaling.and_then(|s| s.table(side, false)),
                     },
                     &mut scratch.residual,
                     &scratch.ccp_child_luma_res[offset..offset + block_len],
@@ -7085,6 +7128,7 @@ fn evaluate_chroma_mode(
                     scan,
                     scan_idx,
                     lambda,
+                    scaling: scratch.tools.scaling.and_then(|s| s.table(side, false)),
                 };
                 crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                     &tb,
@@ -7100,6 +7144,7 @@ fn evaluate_chroma_mode(
                     chroma_qp,
                     bit_depth,
                     scan,
+                    scratch.tools.scaling.and_then(|s| s.table(side, false)),
                     &mut scratch.levels,
                 );
             }
@@ -7136,6 +7181,7 @@ fn evaluate_chroma_mode(
                 side,
                 chroma_qp,
                 bit_depth,
+                scratch.tools.scaling.and_then(|s| s.factor(side, false)),
                 &mut scratch.dequant,
             );
             crate::hevc_transform::run_inv_transform(
@@ -7721,6 +7767,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                     scan,
                     scan_idx,
                     lambda,
+                    scaling: scratch.tools.scaling.and_then(|s| s.table(PU, true)),
                 };
                 crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                     &tb,
@@ -7736,6 +7783,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                     qp,
                     bit_depth.bits(),
                     scan,
+                    scratch.tools.scaling.and_then(|s| s.table(PU, true)),
                     &mut scratch.levels,
                 );
             }
@@ -7766,6 +7814,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 PU,
                 qp,
                 bit_depth.bits(),
+                scratch.tools.scaling.and_then(|s| s.factor(PU, true)),
                 &mut scratch.dequant,
             );
             crate::hevc_transform::run_inv_transform(
@@ -7814,6 +7863,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             scan,
             scan_idx,
             lambda,
+            scaling: scratch.tools.scaling.and_then(|s| s.table(PU, true)),
         };
         crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
             &tb,
@@ -7878,6 +7928,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 PU,
                 qp,
                 bit_depth.bits(),
+                scratch.tools.scaling.and_then(|s| s.factor(PU, true)),
                 &mut scratch.dequant,
             );
             crate::hevc_transform::run_inv_transform(
@@ -8802,6 +8853,7 @@ fn encode_cu<W: CabacWriter>(
                 qp,
                 bit_depth.bits(),
                 dct::coeff_scan(luma_log2_ts, scan_idx),
+                scratch.tools.scaling.and_then(|s| s.table(lu, true)),
             );
             *cost = stats.distortion
                 + lambda
@@ -8879,6 +8931,7 @@ fn encode_cu<W: CabacWriter>(
                     scan,
                     scan_idx,
                     lambda,
+                    scaling: scratch.tools.scaling.and_then(|s| s.table(lu, true)),
                 };
                 // Perceptual RDOQ, matching the weighted decision distortion
                 // (with plain-SSE decisions this had to be plain RDOQ).
@@ -8895,6 +8948,7 @@ fn encode_cu<W: CabacWriter>(
                     qp,
                     bit_depth.bits(),
                     scan,
+                    scratch.tools.scaling.and_then(|s| s.table(lu, true)),
                     &mut scratch.levels,
                 );
             }
@@ -8936,6 +8990,7 @@ fn encode_cu<W: CabacWriter>(
                 lu,
                 qp,
                 bit_depth.bits(),
+                scratch.tools.scaling.and_then(|s| s.factor(lu, true)),
                 &mut scratch.dequant,
             );
             crate::hevc_transform::run_inv_transform(
@@ -9100,6 +9155,7 @@ fn encode_cu<W: CabacWriter>(
             scan: luma_scan,
             scan_idx: luma_scan_idx,
             lambda,
+            scaling: scratch.tools.scaling.and_then(|s| s.table(lu, true)),
         };
         crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
             &tb,
@@ -9128,6 +9184,7 @@ fn encode_cu<W: CabacWriter>(
             lu,
             qp,
             bit_depth.bits(),
+            scratch.tools.scaling.and_then(|s| s.factor(lu, true)),
             &mut scratch.dequant,
         );
         crate::hevc_transform::run_inv_transform(
@@ -9662,6 +9719,10 @@ fn encode_cu<W: CabacWriter>(
                                         scan,
                                         lambda: chroma_lambda,
                                         component,
+                                        scaling: scratch
+                                            .tools
+                                            .scaling
+                                            .and_then(|s| s.table(ctb, false)),
                                     },
                                     &mut scratch.residual,
                                     &scratch.ccp_luma_res,
@@ -9692,6 +9753,7 @@ fn encode_cu<W: CabacWriter>(
                                 scan,
                                 scan_idx,
                                 lambda: chroma_lambda,
+                                scaling: scratch.tools.scaling.and_then(|s| s.table(ctb, false)),
                             };
                             crate::hevc_transform::rdoq_chroma_with_sign_hiding_into(
                                 &tb,
@@ -9706,6 +9768,7 @@ fn encode_cu<W: CabacWriter>(
                                 chroma_qp,
                                 bit_depth.bits(),
                                 scan,
+                                scratch.tools.scaling.and_then(|s| s.table(ctb, false)),
                                 &mut scratch.levels,
                             );
                         }
@@ -9742,6 +9805,7 @@ fn encode_cu<W: CabacWriter>(
                             ctb,
                             chroma_qp,
                             bit_depth.bits(),
+                            scratch.tools.scaling.and_then(|s| s.factor(ctb, false)),
                             &mut scratch.dequant,
                         );
                         crate::hevc_transform::run_inv_transform(
@@ -11487,6 +11551,7 @@ mod tests {
             false,
             false,
             true,
+            None, // scaling lists
         );
         let scc = build_sps(
             64,
@@ -11498,6 +11563,7 @@ mod tests {
             false,
             false,
             true,
+            None, // scaling lists
         );
         // 8-bit 4:2:0 lossy needs no range extension, so the SCC stream is the
         // only one carrying an sps_extension at all.
@@ -11808,6 +11874,7 @@ mod tests {
                 false,
                 false,
                 true,
+                None, // scaling lists
             );
             // NAL header (2 bytes), sps_vps_id/max_sub_layers/nesting (1 byte),
             // profile_tier_level with no sub-layers (12 bytes).
