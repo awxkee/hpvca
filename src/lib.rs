@@ -2443,7 +2443,7 @@ mod tests {
             "expected grid item"
         );
     }
-    
+
     #[test]
     fn tiled_rgb10_produces_grid_heic() {
         let px = vec![512u16; 1024 * 768 * 3];
