@@ -139,25 +139,20 @@ fn satd_scalar_n<const N: usize>(orig: &[u16], pred: &[u16]) -> u32 {
 }
 
 /// Weights of [`weighted_sse`] on a 4×4 DCT of the error: DC error is dearer,
-/// high-frequency error (k + l ≥ 3) cheaper — the RDOQ notion of perceptual
-/// distortion, applied to decisions (RDOQ itself uses this matrix's diagonal in
-/// the TB basis, see `RDOQ_WEIGHTS` in hevc_transform.rs).
-///
-/// Every RD decision (luma/chroma mode, TU split, PART_NxN, CU split) used to
-/// compare plain pixel SSE while RDOQ weighted the same error by frequency;
-/// measuring decisions this way is −2.3% ssimulacra2 / −1.7% CVVDP BD-rate
-/// (Fast; Slow −3.2 / −2.4), every image better on both. The 4×4 tile puts
-/// the high-frequency edge at the same absolute frequency as RDOQ's band in
-/// any TB size and keeps NxN and 2Nx2N comparable. A uniform weight (≡ a λ
-/// change) recovers almost none of it. HF 0.2 here beats RDOQ's own 0.4
-/// (−2.32 vs −2.07 ss2); 0.1 or 0.0 are no better.
+/// the lowest AC (k + l = 1) is at par, the second band (k + l = 2) is
+/// discounted and high-frequency error (k + l ≥ 3) is cheap — the RDOQ notion
+/// of perceptual distortion, applied to decisions (RDOQ itself uses this
+/// matrix's diagonal in the TB basis, see `RDOQ_WEIGHTS` in
+/// hevc_transform.rs, so changing it here retunes RDOQ as well).
 pub(crate) static DISTORTION_WEIGHTS: [[f32; 4]; 4] = {
     const DC: f32 = 1.8;
+    const DIAG: f32 = 0.8; // (1, 1)
+    const AXIS: f32 = 0.4; // (0, 2) and (2, 0)
     const HF: f32 = 0.2;
     [
-        [DC, 1.0, 1.0, HF],
-        [1.0, 1.0, HF, HF],
-        [1.0, HF, HF, HF],
+        [DC, 1.0, AXIS, HF],
+        [1.0, DIAG, HF, HF],
+        [AXIS, HF, HF, HF],
         [HF, HF, HF, HF],
     ]
 };
