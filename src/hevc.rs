@@ -9067,10 +9067,9 @@ fn encode_cu<W: CabacWriter>(
     // 2Nx2N path below runs. (A source-statistics gate used to keep Fast off
     // most blocks; it cost −0.69% ssimulacra2 / −0.38% CVVDP BD-rate for ~4%
     // of encode time.)
-    // PART_NxN's inferred transform split reaches four 4×4 chroma TBs. For 4:2:2
-    // those TBs use the stacked square layout that the split path does not yet
-    // model, so NxN is likewise restricted to the square 4:2:0/4:4:4 chroma
-    // formats (and monochrome).
+    // In 4:2:0/4:2:2 the 4×4 chroma TBs cannot split further, so NxN codes the
+    // CU's chroma once at the parent level (4:2:2: two stacked 4×4 TBs), exactly
+    // like the 2Nx2N split-transform path.
     // cu_transquant_bypass_flag is the CU's first syntax element, and SCC's
     // palette_mode_flag directly follows it. Both precede part_mode, which the
     // PART_NxN path below writes itself, so they are emitted here rather than
@@ -9084,7 +9083,7 @@ fn encode_cu<W: CabacWriter>(
         enc.encode_bin(0, &mut ictx.palette_mode_flag);
     }
 
-    if lu == 8 && !lossless && !matches!(chroma, crate::fmt::ChromaFormat::Yuv422) {
+    if lu == 8 && !lossless {
         // The NxN search reuses scratch.orig / best_pred / best_coeff, so snapshot
         // the 2Nx2N winner state and restore it if NxN loses the RD comparison.
         let mut saved_orig = [0u16; 64];
