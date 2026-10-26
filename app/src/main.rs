@@ -47,7 +47,7 @@ fn main() {
             .with_parallelism(ParallelismStrategy::Wpp)
             .with_sao(false)
             .with_quality(70)
-            .with_speed(Speed::Fast)
+            .with_speed(Speed::Slow)
             .with_lossless(false)
             .with_screen_content(false)
             .with_implicit_rdpcm(false)
