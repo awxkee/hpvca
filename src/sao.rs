@@ -414,7 +414,10 @@ fn analyze_chroma_ctu(
         let (mut p_cb, mut p_cr) = (b_cb.param, b_cr.param);
         p_cb.type_idx = 1;
         p_cr.type_idx = 1;
-        let bits = b_cb.bits.max(1 + 5) + b_cr.bits.max(1 + 5) - 1;
+        // A component that preferred OFF still codes the shared type, a band
+        // position and four zero offsets (one bin each) once promoted.
+        const PROMOTED_BITS: u32 = 1 + 5 + 4;
+        let bits = b_cb.bits.max(PROMOTED_BITS) + b_cr.bits.max(PROMOTED_BITS) - 1;
         let cost = (b_cb.delta + b_cr.delta) as f64 + f64::from(lambda) * f64::from(bits);
         if cost < best_cost {
             best_cost = cost;

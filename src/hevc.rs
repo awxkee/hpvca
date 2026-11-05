@@ -6614,8 +6614,10 @@ fn advance_lossless_luma_tree_context(
 /// On entry `scratch.residual[..16]` holds the raster residual and
 /// `scratch.levels` its committed (perceptually weighted) DST RDOQ levels. On
 /// return `scratch.levels` holds the winner's levels and `scratch.inverse[..16]`
-/// its reconstructed residual. Returns whether skip won and by how much it
-/// lowers the committed DST's RD cost (0 when the DST stays).
+/// its reconstructed residual. Returns whether skip won and how much it lowers
+/// the committed DST's RD cost *in the perceptually weighted metric* the mode
+/// decision uses (`weighted_sse`) — negative when skip, chosen on plain SSE,
+/// costs more there — and 0 when the DST stays.
 ///
 /// Candidates are priced as residual-domain SSE + λ·(cbf + residual syntax
 /// incl. the flag) on clones of `ctx`. Skip is quantized by plain-SSE RDOQ —
@@ -6640,30 +6642,36 @@ fn choose_luma4x4_transform(
         scan_idx,
         lambda,
     } = tb;
-    let rd_cost = |levels: &[i16], inverse: &[i32], residual: &[i32], ts: bool, sdh: bool| -> f32 {
-        let mut packed = [0i16; LEN];
-        let mut nonzero = false;
-        for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
-            *dst = levels[r * N + c];
-            nonzero |= *dst != 0;
-        }
-        let mut rctx = ctx.clone();
-        let mut bits = rctx.cbf_luma[0].estimate_and_update(nonzero as u8);
-        if nonzero {
-            bits += estimate_residual_bits_ts(&mut rctx, &packed, 2, true, scan_idx, sdh, ts);
-        }
-        let sse: i64 = residual[..LEN]
-            .iter()
-            .zip(&inverse[..LEN])
-            .map(|(&a, &b)| {
-                let d = i64::from(a - b);
-                d * d
-            })
-            .sum();
-        sse as f32 + lambda * bits
-    };
-    // Plain-SSE RDOQ of `scratch.coeff` into `levels`.
-    let plain_rdoq = |scratch: &mut CompressionContext, levels: &mut [i16; MAX_TB]| {
+    // (plain-SSE cost, weighted-SSE cost): the first decides DST vs skip, the
+    // second is what the caller's mode decision compares against.
+    let rd_cost =
+        |levels: &[i16], inverse: &[i32], residual: &[i32], ts: bool, sdh: bool| -> (f32, f32) {
+            let mut packed = [0i16; LEN];
+            let mut nonzero = false;
+            for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
+                *dst = levels[r * N + c];
+                nonzero |= *dst != 0;
+            }
+            let mut rctx = ctx.clone();
+            let mut bits = rctx.cbf_luma[0].estimate_and_update(nonzero as u8);
+            if nonzero {
+                bits += estimate_residual_bits_ts(&mut rctx, &packed, 2, true, scan_idx, sdh, ts);
+            }
+            let sse: i64 = residual[..LEN]
+                .iter()
+                .zip(&inverse[..LEN])
+                .map(|(&a, &b)| {
+                    let d = i64::from(a - b);
+                    d * d
+                })
+                .sum();
+            let weighted =
+                crate::cost::weighted_sse(N, N, |r, c| residual[r * N + c] - inverse[r * N + c]);
+            (sse as f32 + lambda * bits, weighted + lambda * bits)
+        };
+    // Plain-SSE RDOQ of `scratch.coeff` into `levels`, priced with the
+    // contexts (single sig ctx, Rice statistic bank) of the given transform.
+    let plain_rdoq = |scratch: &mut CompressionContext, levels: &mut [i16; MAX_TB], ts: bool| {
         let perceptual = scratch.rdoq.perceptual;
         scratch.rdoq.perceptual = false;
         crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
@@ -6676,7 +6684,7 @@ fn choose_luma4x4_transform(
                 scan_idx,
                 lambda,
                 scaling: scratch.tools.scaling.and_then(|s| s.table(N, true)),
-                transform_skip: true,
+                transform_skip: ts,
             },
             1,
             ctx,
@@ -6725,7 +6733,7 @@ fn choose_luma4x4_transform(
         true,
     );
     let mut levels = [0i16; MAX_TB];
-    plain_rdoq(scratch, &mut levels);
+    plain_rdoq(scratch, &mut levels, false);
     let mut dequant = [0i32; MAX_TB];
     let mut inverse = [0i32; MAX_TB];
     crate::hevc_transform::run_dequantize(
@@ -6746,7 +6754,9 @@ fn choose_luma4x4_transform(
         &mut scratch.transform_tmp,
         true,
     );
-    let j_ref = j_dst.min(rd_cost(&levels, &inverse, &scratch.residual, false, true));
+    let j_ref = j_dst
+        .0
+        .min(rd_cost(&levels, &inverse, &scratch.residual, false, true).0);
 
     // Transform-skip candidate. With `transform_skip_rotation_enabled_flag`
     // the coefficients are the 180°-rotated residual (§8.6.4.2), so the
@@ -6789,7 +6799,7 @@ fn choose_luma4x4_transform(
                 &mut scratch.coeff,
             );
         }
-        plain_rdoq(scratch, &mut levels);
+        plain_rdoq(scratch, &mut levels, true);
         crate::hevc_transform::run_dequantize(
             scratch.dequantize,
             &levels,
@@ -6806,10 +6816,10 @@ fn choose_luma4x4_transform(
         rd_cost(&levels, &inverse, &scratch.residual, true, true)
     };
 
-    if j_ts < j_ref {
+    if j_ts.0 < j_ref {
         scratch.levels[..LEN].copy_from_slice(&levels[..LEN]);
         scratch.inverse[..LEN].copy_from_slice(&inverse[..LEN]);
-        (true, j_dst - j_ts)
+        (true, j_dst.1 - j_ts.1)
     } else {
         (false, 0.0)
     }
@@ -8348,7 +8358,9 @@ fn encode_cu_nxn<W: CabacWriter>(
                 },
             );
             transform_skip = ts;
-            // The mode loop priced this PU with the DST; skip only lowers it.
+            // The mode loop priced this PU with the DST in the weighted metric;
+            // `gain` is skip's change in that same metric and may be negative
+            // (skip wins on plain SSE but loses perceptually).
             nxn_cost -= gain;
         }
         let rdpcm_tb = transform_skip && lossy_rdpcm_vertical(scratch.tools, best_mode).is_some();

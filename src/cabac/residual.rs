@@ -761,10 +761,13 @@ fn encode_coeff_levels<W: CabacWriter>(
     }
 }
 
-/// Ceiling for the Rice parameter under persistent adaptation. The spec removes
-/// the fixed bound of 4; this bound is high enough never to bind for 8/10/12-bit
-/// coefficients while keeping `encode_coeff_remaining`'s shifts in range.
-pub(crate) const MAX_PERSISTENT_RICE: u32 = 10;
+/// Ceiling for the Rice parameter under persistent adaptation. The spec (and
+/// HM) leave it unbounded, so this must never bind: coefficient levels are
+/// limited to 16 bits, so `total > 3 << rice` stops firing at rice 14 and the
+/// statistic-seeded start cannot exceed 15. A lower ceiling desynchronises
+/// CABAC — 12-bit lossless residuals reach 4095 > 3 << 10. 16 also keeps
+/// `encode_coeff_remaining`'s shifts in range.
+pub(crate) const MAX_PERSISTENT_RICE: u32 = 16;
 
 /// Bypass-coded coeff_abs_level_remaining using truncated Rice/Exp-Golomb.
 fn encode_coeff_remaining<W: CabacWriter>(enc: &mut W, value: u32, rice_k: u32) {

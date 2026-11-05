@@ -705,6 +705,16 @@ fn fwd_transform_32(res: &[i32], bit_depth: u8, out: &mut [i32; MAX_TB], tmp: &m
     }
 }
 
+/// Starting Rice parameter of a coefficient group under persistent Rice
+/// adaptation (RExt §9.3.3.11). The statistic is banked by component and by
+/// whether the block is transformed; RDOQ never sees transquant-bypass blocks,
+/// so transform skip alone selects the "non-transformed" bank — the same index
+/// `encode_residual` updates when the levels are coded.
+#[inline]
+fn persistent_rice_seed(ctx: &ContextSet, is_luma: bool, transform_skip: bool) -> u32 {
+    u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2 + usize::from(transform_skip)] / 4)
+}
+
 #[inline]
 fn coeff_remaining_bits(value: u32, rice: u32) -> f32 {
     if value < (4u32 << rice) {
@@ -1005,13 +1015,12 @@ fn rdoq_with_sign_hiding_into(
         let mut c1_idx = 0u32;
         let mut c2_idx = 0u32;
         // Persistent Rice adaptation seeds each coefficient group from the
-        // running statistic instead of 0. RDOQ is lossy-only (transquant-bypass
-        // blocks never reach it), so the statistic index is the "transformed"
-        // half. The statistic itself is not updated here: RDOQ prices a single
-        // candidate block, and the real update happens when the chosen levels
-        // are coded.
+        // running statistic instead of 0, read from the same bank the emitter
+        // uses (see [`persistent_rice_seed`]). The statistic itself is not
+        // updated here: RDOQ prices a single candidate block, and the real
+        // update happens when the chosen levels are coded.
         let mut rice = if ctx.persistent_rice {
-            u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+            persistent_rice_seed(ctx, is_luma, transform_skip)
         } else {
             0
         };
@@ -2497,7 +2506,7 @@ fn price_group(
     let mut c1_idx = 0u32;
     let mut c2_idx = 0u32;
     let mut rice = if ctx.persistent_rice {
-        u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+        persistent_rice_seed(ctx, is_luma, tb.transform_skip)
     } else {
         0
     };
@@ -2746,7 +2755,7 @@ fn rd_sign_hiding_repair(
             ctx_set += 1;
         }
         let rice0 = if ctx.persistent_rice {
-            u32::from(ctx.stat_coeff[usize::from(!p.is_luma) * 2] / 4)
+            persistent_rice_seed(ctx, p.is_luma, tb.transform_skip)
         } else {
             0
         };
