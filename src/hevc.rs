@@ -351,9 +351,15 @@ pub(crate) fn build_vps(
     }
 }
 
-fn write_sps_range_extension(bw: &mut BitWriter, implicit_rdpcm: bool, persistent_rice: bool) {
-    bw.write_bit(false); // transform_skip_rotation_enabled_flag
-    bw.write_bit(false); // transform_skip_context_enabled_flag
+fn write_sps_range_extension(
+    bw: &mut BitWriter,
+    implicit_rdpcm: bool,
+    persistent_rice: bool,
+    ts_rotation: bool,
+    ts_context: bool,
+) {
+    bw.write_bit(ts_rotation); // transform_skip_rotation_enabled_flag
+    bw.write_bit(ts_context); // transform_skip_context_enabled_flag
     // In transquant-bypass intra TUs this is inferred for final horizontal
     // and vertical prediction modes; no CU/TU syntax element is required.
     bw.write_bit(implicit_rdpcm); // implicit_rdpcm_enabled_flag
@@ -392,8 +398,9 @@ pub(crate) fn build_sps(
     ibc: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
-    scaling: Option<&crate::scaling::ScalingLists>,
+    tools: PictureTools,
 ) -> Nalu {
+    let scaling = tools.scaling;
     let mut bw = BitWriter::new();
     nalu_header(&mut bw, 33);
 
@@ -520,6 +527,8 @@ pub(crate) fn build_sps(
                 &mut bw,
                 implicit_rdpcm,
                 persistent_rice_enabled(chroma, bit_depth, implicit_rdpcm, persistent_rice),
+                tools.ts_rotation,
+                tools.ts_context,
             );
         }
         if scc {
@@ -662,7 +671,7 @@ pub(crate) fn build_pps_tiled(
     // pps_scc_extension carries pps_curr_pic_ref_enabled_flag, which is what
     // actually places the current picture in RefPicList0 for IntraBC.
     // pps_range_extension carries cross_component_prediction_enabled_flag.
-    let range_ext = tools.cross_component;
+    let range_ext = tools.cross_component || tools.chroma_qp_list;
     bw.write_bit(ibc || range_ext); // pps_extension_present_flag
     if ibc || range_ext {
         bw.write_bit(range_ext); // pps_range_extension_flag
@@ -676,7 +685,16 @@ pub(crate) fn build_pps_tiled(
             bw.write_ue(0); // log2_max_transform_skip_block_size_minus2: 4×4
         }
         bw.write_bit(tools.cross_component); // cross_component_prediction_enabled_flag
-        bw.write_bit(false); // chroma_qp_offset_list_enabled_flag
+        bw.write_bit(tools.chroma_qp_list); // chroma_qp_offset_list_enabled_flag
+        if tools.chroma_qp_list {
+            // Chroma QP offset groups coincide with the AQ quantization groups.
+            bw.write_ue(6 - crate::aq::QG_LOG2); // diff_cu_chroma_qp_offset_depth
+            bw.write_ue(CHROMA_QP_OFFSET_LIST.len() as u32 - 1); // chroma_qp_offset_list_len_minus1
+            for &offset in &CHROMA_QP_OFFSET_LIST {
+                bw.write_se(i32::from(offset)); // cb_qp_offset_list[i]
+                bw.write_se(i32::from(offset)); // cr_qp_offset_list[i]
+            }
+        }
         bw.write_ue(0); // log2_sao_offset_scale_luma
         bw.write_ue(0); // log2_sao_offset_scale_chroma
     }
@@ -724,6 +742,7 @@ pub(crate) fn encode_intra(
         0,
         None,
         None,
+        None,
         scc,
         implicit_rdpcm,
         persistent_rice,
@@ -759,6 +778,9 @@ pub(crate) fn encode_intra_opts(
     // grid cells: every tile decodes with tile 0's PPS, so a cell whose padding
     // looks screen-like must not flip it. `None` derives it from `yuv`.
     transform_skip: Option<bool>,
+    // [`screen_like`] of the full picture, for the lossless RExt tool gating
+    // (see [`rext_residual_tools`]); `None` derives it from `yuv`.
+    screen: Option<bool>,
     // Screen-content coding tools (palette mode). Signals the SPS SCC extension
     // and lets every CU choose palette mode over intra prediction.
     scc: bool,
@@ -802,20 +824,16 @@ pub(crate) fn encode_intra_opts(
     // The tool only exists for transquant-bypass blocks, so it is meaningless
     // outside lossless coding.
     let implicit_rdpcm = implicit_rdpcm && lossless;
-    let vps = build_vps(
-        width,
-        height,
-        yuv.chroma,
-        yuv.bit_depth,
-        implicit_rdpcm,
-        scc,
-        ibc,
-    );
     let qp_val: u8 = quality_to_qp(quality);
     let cqo =
         chroma_qp_offset.unwrap_or_else(|| adaptive_chroma_qp_offset(yuv, yuv.chroma, lossless));
     let transform_skip =
         transform_skip.unwrap_or_else(|| transform_skip_for(yuv, qp_val, lossless));
+    // Picture-wide like `transform_skip`: a grid cell must not classify its
+    // own padding. Only lossless pictures consult it.
+    let screen = screen.unwrap_or_else(|| lossless && screen_like(yuv));
+    let (ts_context, ts_rotation, lossy_rdpcm) =
+        rext_residual_tools(yuv.chroma, lossless, transform_skip, implicit_rdpcm, screen);
     let tools = PictureTools {
         transform_skip,
         cross_component: cross_component_enabled(yuv.chroma, lossless, scc, ibc),
@@ -826,7 +844,26 @@ pub(crate) fn encode_intra_opts(
         } else {
             crate::scaling::lists_for_qp(qp_val)
         },
+        transquant_bypass: lossless,
+        ts_context,
+        ts_rotation,
+        lossy_rdpcm,
+        chroma_qp_list: chroma_qp_list_enabled(yuv.chroma, lossless, scc, qp_val),
     };
+    // The one SPS `implicit_rdpcm_enabled_flag` serves both the lossless tool
+    // (`implicit_rdpcm`, which also disables the intra boundary filter of
+    // bypass CUs) and its lossy transform-skip form; the profile and the
+    // range-extension presence follow the SPS value.
+    let sps_implicit_rdpcm = implicit_rdpcm || lossy_rdpcm;
+    let vps = build_vps(
+        width,
+        height,
+        yuv.chroma,
+        yuv.bit_depth,
+        sps_implicit_rdpcm,
+        scc,
+        ibc,
+    );
     let sps = build_sps(
         width,
         height,
@@ -835,9 +872,9 @@ pub(crate) fn encode_intra_opts(
         color.as_ref(),
         scc,
         ibc,
-        implicit_rdpcm,
+        sps_implicit_rdpcm,
         persistent_rice,
-        tools.scaling,
+        tools,
     );
     let pps = build_pps_tiled(qp_val, lossless, wpp, tile_cols, tile_rows, cqo, ibc, tools);
     // Context-local worker pool for this encode's tile/WPP fan-out. `threads-1`
@@ -892,6 +929,8 @@ fn init_context_set(
         ContextSet::init_islice_ext(qp, persistent_rice)
     };
     ctx.transform_skip_enabled = tools.transform_skip;
+    ctx.transform_skip_context = tools.ts_context;
+    ctx.transquant_bypass = tools.transquant_bypass;
     ctx.cross_component = tools.cross_component;
     ctx
 }
@@ -1048,6 +1087,121 @@ pub(crate) struct PictureTools {
     /// The SPS scaling lists (`scaling_list_enabled_flag`), a function of the
     /// picture QP alone so every grid cell signals the same SPS; `None` = off.
     pub(crate) scaling: Option<&'static crate::scaling::ScalingLists>,
+    /// Every CU is transquant-bypass (`transquant_bypass_enabled_flag`,
+    /// lossless coding).
+    pub(crate) transquant_bypass: bool,
+    /// SPS `transform_skip_context_enabled_flag` (see [`rext_residual_tools`]).
+    pub(crate) ts_context: bool,
+    /// SPS `transform_skip_rotation_enabled_flag` (see [`rext_residual_tools`]).
+    pub(crate) ts_rotation: bool,
+    /// `implicit_rdpcm_enabled_flag` applied to lossy transform-skipped luma
+    /// TBs (see [`rext_residual_tools`]).
+    pub(crate) lossy_rdpcm: bool,
+    /// PPS `chroma_qp_offset_list_enabled_flag` with [`CHROMA_QP_OFFSET_LIST`]
+    /// (see [`chroma_qp_list_enabled`]): per-quantization-group Cb/Cr QP
+    /// offsets chosen by [`crate::aq::chroma_qp_offsets`].
+    pub(crate) chroma_qp_list: bool,
+}
+
+/// The PPS `cb_qp_offset_list` / `cr_qp_offset_list` (equal for Cb and Cr);
+/// `cu_chroma_qp_offset_idx` selects an entry, `cu_chroma_qp_offset_flag`
+/// 0 means no offset.
+pub(crate) const CHROMA_QP_OFFSET_LIST: [i8; 6] = [-3, -2, -1, 1, 2, 3];
+
+/// `cu_chroma_qp_offset_flag`/`_idx` for a wanted offset: 0 = flag 0, else
+/// 1 + list index.
+#[inline]
+fn chroma_qp_list_index(offset: i8) -> u8 {
+    CHROMA_QP_OFFSET_LIST
+        .iter()
+        .position(|&o| o == offset)
+        .map_or(0, |i| i as u8 + 1)
+}
+
+/// Whether the picture signals the RExt chroma QP offset list: a Main 4:4:4
+/// family tool (Table A.5), usable with activity AQ (it shares the
+/// quantization groups) outside lossless and screen-content coding (palette
+/// escapes would carry the syntax too; not modeled).
+fn chroma_qp_list_enabled(
+    chroma: crate::fmt::ChromaFormat,
+    lossless: bool,
+    scc: bool,
+    qp: u8,
+) -> bool {
+    matches!(chroma, crate::fmt::ChromaFormat::Yuv444)
+        && !lossless
+        && !scc
+        && activity_aq_enabled(qp, lossless)
+        && CHROMA_QP_LIST_RULE.is_some()
+}
+
+/// Rule for the chroma QP offset list, `Some((saturation, strength))`:
+/// the luma-activity rule ([`crate::aq::chroma_qp_offsets`]) or, with
+/// `saturation`, [`crate::aq::chroma_qp_offsets_saturation`]. `None` keeps the
+/// list off (see [`chroma_qp_list_enabled`] for the measurements).
+const CHROMA_QP_LIST_RULE: Option<(bool, f32)> = None;
+
+/// The Range Extensions residual-coding tools of a picture:
+/// `(transform_skip_context, transform_skip_rotation, lossy implicit RDPCM)`.
+///
+/// `screen` is [`screen_like`] of the whole picture (only consulted for
+/// lossless pictures).
+///
+/// All three only exist in the Main 4:4:4 profile family (Table A.5), so they
+/// are used where the stream already advertises it: 4:4:4, or the explicit
+/// `implicit_rdpcm` opt-in (which switches the profile the same way). They
+/// are no-ops without transform-skipped or transquant-bypass TBs, hence the
+/// `transform_skip` / `lossless` gates.
+///
+/// Decoder support differs per tool, which decides the lossless gating:
+/// - the single significance context is implemented for both skipped and
+///   bypass TBs by HM, libde265, ffmpeg and hpvcd, so it is always on;
+/// - the rotation of bypass TBs (§8.6.2) is applied by HM and libde265 but
+///   skipped by ffmpeg, so for lossless pictures it rides the same
+///   `implicit_rdpcm` opt-in that already gives up ffmpeg; lossy
+///   transform-skip rotation decodes everywhere;
+/// - implicit RDPCM on lossy transform skip never touches a bypass CU, so
+///   the ffmpeg boundary-filter divergence of the lossless tool does not
+///   apply and it is always on.
+fn rext_residual_tools(
+    chroma: crate::fmt::ChromaFormat,
+    lossless: bool,
+    transform_skip: bool,
+    implicit_rdpcm: bool,
+    screen: bool,
+) -> (bool, bool, bool) {
+    let main_444 = matches!(chroma, crate::fmt::ChromaFormat::Yuv444) || implicit_rdpcm;
+    if !main_444 {
+        return (false, false, false);
+    }
+    let ts_rotation = if lossless {
+        implicit_rdpcm
+    } else {
+        transform_skip
+    };
+    // Lossless: the single context loses the position-dependent significance
+    // priors that large bypass TBs of flat UI content with text rely on
+    // (+0.75% on a 3446×1918 screenshot) while photographs gain 0.15–1.1%;
+    // with the rotation on it measured neutral-to-positive on every picture.
+    let ts_context = if lossless {
+        ts_rotation || !screen
+    } else {
+        transform_skip
+    };
+    let lossy_rdpcm = !lossless && transform_skip;
+    (ts_context, ts_rotation, lossy_rdpcm)
+}
+
+/// Whether a lossy transform-skipped luma TB of intra `mode` is coded with
+/// implicit RDPCM, and in which direction: `Some(true)` is vertical (mode 26),
+/// `Some(false)` horizontal (mode 10).
+#[inline]
+fn lossy_rdpcm_vertical(tools: PictureTools, mode: u8) -> Option<bool> {
+    match (tools.lossy_rdpcm, mode) {
+        (true, 10) => Some(false),
+        (true, 26) => Some(true),
+        _ => None,
+    }
 }
 
 /// Whether the picture enables cross-component prediction (RExt §7.4.3.3.2):
@@ -1093,7 +1247,7 @@ pub(crate) fn transform_skip_for(yuv: &Yuv, qp: u8, lossless: bool) -> bool {
 /// blocks; UI screenshots 29–68% with ≥89% equal neighbors; game-texture
 /// captures (many few-valued blocks but noisy, ≤33% equal neighbors) lose
 /// slightly with skip and are excluded by the second test.
-fn screen_like(yuv: &Yuv) -> bool {
+pub(crate) fn screen_like(yuv: &Yuv) -> bool {
     const MIN_FEW_VALUED: f32 = 0.10;
     const MIN_EQUAL_NEIGHBORS: f32 = 0.60;
     let w = yuv.width as usize;
@@ -1205,8 +1359,9 @@ fn encode_wpp_parallel(
     threads: usize,
     is_last_region: bool,
     pool: &crate::pool::ThreadPool,
-    sao_params: Option<&[crate::sao::SaoParam]>,
+    sao_params: Option<&[crate::sao::SaoCtu]>,
     aq_offsets: &[i8],
+    chroma_qg: &[i8],
     sao_enabled: bool,
     trace: bool,
     rdoq_in_loop: bool,
@@ -1242,12 +1397,6 @@ fn encode_wpp_parallel(
     } = coding;
 
     let progress: Vec<AtomicUsize> = (0..ctus_y).map(|_| AtomicUsize::new(0)).collect();
-    // Debug guard: each row band must have exactly one writer, so the SyncSlice
-    // writes never overlap. Set when a worker claims a row; a double-claim trips.
-    #[cfg(debug_assertions)]
-    let band_claimed: Vec<std::sync::atomic::AtomicBool> = (0..ctus_y)
-        .map(|_| std::sync::atomic::AtomicBool::new(false))
-        .collect();
     // Context models saved after the 2nd CTU of each row, consumed by the next.
     // The palette predictor rides along: §9.3.2.3 stores and restores it at the
     // same WPP sync point as the context variables.
@@ -1288,12 +1437,6 @@ fn encode_wpp_parallel(
             if r >= ctus_y {
                 break;
             }
-            // Debug guard: assert this band has no other writer (disjoint writes).
-            #[cfg(debug_assertions)]
-            assert!(
-                !band_claimed[r].swap(true, Ordering::Relaxed),
-                "WPP row {r} claimed by two workers — writes would alias"
-            );
             // Seed the row's context from the row above's WPP sync point.
             let (mut ctx, mut ictx, palette_pred) = if r == 0 {
                 let mut pred = crate::palette::PalettePredictor::default();
@@ -1365,6 +1508,7 @@ fn encode_wpp_parallel(
                     col,
                     aq_predictor,
                     aq_offsets,
+                    chroma_qg,
                     sao_params,
                     sao_enabled,
                     ibc_hash,
@@ -1427,7 +1571,8 @@ fn code_one_ctu(
     ctu_col: usize,
     aq_predictor: u8,
     aq_offsets: &[i8],
-    sao_params: Option<&[crate::sao::SaoParam]>,
+    chroma_qg: &[i8],
+    sao_params: Option<&[crate::sao::SaoCtu]>,
     sao_enabled: bool,
     ibc_hash: Option<&crate::ibc::HashTable>,
 ) -> u8 {
@@ -1463,11 +1608,17 @@ fn code_one_ctu(
     // Quantization groups are 32×32 (diff_cu_qp_delta_depth = 1): each CTU
     // quadrant gets its own AQ target, lambda and cu_qp_delta below. The tree
     // starts at the slice operating point; the quadrant loop overrides it.
+    let chroma_qp_list = scratch.tools.chroma_qp_list && aq_enabled;
     let aq = AqCtuState {
         enabled: aq_enabled,
         predictor: aq_predictor,
         target: qp,
         coded: false,
+        chroma: ChromaQpAdj {
+            enabled: chroma_qp_list,
+            idx: 0,
+            coded: false,
+        },
     };
 
     if sao_enabled {
@@ -1477,13 +1628,14 @@ fn code_one_ctu(
             .copied()
             .unwrap_or_default();
         cab.mark(crate::cabac::bin_trace::SAO_BEGIN);
-        crate::sao::encode_luma(
+        crate::sao::encode_ctu(
             cab,
             ctx,
-            sao,
+            &sao,
             ctu_col > 0,
             ctu_row > 0,
             yuv.bit_depth.bits(),
+            !yuv.chroma.is_monochrome(),
         );
         cab.mark(crate::cabac::bin_trace::SAO_END);
     }
@@ -1517,6 +1669,14 @@ fn code_one_ctu(
                 .copied()
                 .unwrap_or(0)
         }),
+        chroma_qg: std::array::from_fn(|z| {
+            let ctu_index = ctu_row * strides.w.div_ceil(64) + ctu_col;
+            chroma_qg
+                .get(ctu_index * crate::aq::QGS_PER_CTU + z)
+                .copied()
+                .unwrap_or(0)
+        }),
+        pic_cqo: cqo,
         slice_qp: qp,
         slice_lambda: lambda,
         prev_qp: aq_predictor,
@@ -1656,8 +1816,9 @@ fn encode_region_pass(
     threads: usize,
     is_last_region: bool,
     pool: &crate::pool::ThreadPool,
-    sao_params: Option<&[crate::sao::SaoParam]>,
+    sao_params: Option<&[crate::sao::SaoCtu]>,
     aq_offsets: &[i8],
+    chroma_qg: &[i8],
     sao_enabled: bool,
     cqo: i8,
     scc: bool,
@@ -1785,6 +1946,7 @@ fn encode_region_pass(
                     ctu_col,
                     aq_predictor,
                     aq_offsets,
+                    chroma_qg,
                     sao_params,
                     sao_enabled,
                     ibc_hash,
@@ -1832,6 +1994,7 @@ fn encode_region_pass(
             pool,
             sao_params,
             aq_offsets,
+            chroma_qg,
             sao_enabled,
             trace,
             scratch.rdoq_in_loop,
@@ -1902,6 +2065,7 @@ fn encode_region_pass(
                     ctu_col,
                     aq_predictor,
                     aq_offsets,
+                    chroma_qg,
                     sao_params,
                     sao_enabled,
                     ibc_hash,
@@ -2026,6 +2190,20 @@ fn encode_region_substreams(
     } else {
         &[]
     };
+    // Per-group chroma QP offsets (RExt list): an absolute rule, so every
+    // region — grid cells included — derives its own from its source.
+    let computed_chroma;
+    let chroma_qg: &[i8] = match CHROMA_QP_LIST_RULE {
+        Some((saturation, strength)) if tools.chroma_qp_list && !aq_offsets.is_empty() => {
+            computed_chroma = if saturation {
+                crate::aq::chroma_qp_offsets_saturation(yuv, ctus_x, ctus_y, strength)
+            } else {
+                crate::aq::chroma_qp_offsets(yuv, ctus_x, ctus_y, strength)
+            };
+            &computed_chroma
+        }
+        _ => &[],
+    };
     if lossless || !sao_enabled {
         return encode_region_pass(
             yuv,
@@ -2039,6 +2217,7 @@ fn encode_region_substreams(
             pool,
             None,
             aq_offsets,
+            chroma_qg,
             false,
             cqo,
             scc,
@@ -2067,6 +2246,7 @@ fn encode_region_substreams(
         pool,
         None,
         aq_offsets,
+        chroma_qg,
         true,
         cqo,
         scc,
@@ -2087,16 +2267,83 @@ fn encode_region_substreams(
         coded_h,
     );
     let lambda = intra_lambda(qp, yuv.bit_depth.bits());
-    let params = crate::sao::analyze_luma(
-        &ws_ref.sao_original,
-        &ws_ref.rec_y,
-        stride,
-        width as usize,
-        height as usize,
-        coded_h,
-        yuv.bit_depth.bits(),
+    let bit_depth = yuv.bit_depth.bits();
+    let luma = crate::sao::analyze_luma(
+        crate::sao::SaoPlane {
+            original: &ws_ref.sao_original,
+            rec: &ws_ref.rec_y,
+            stride,
+            width: width as usize,
+            height: height as usize,
+            coded_height: coded_h,
+            ctb_w: 64,
+            ctb_h: 64,
+            bit_depth,
+        },
         lambda,
     );
+    let mut params: Vec<crate::sao::SaoCtu> = luma
+        .into_iter()
+        .map(|y| crate::sao::SaoCtu {
+            y,
+            ..Default::default()
+        })
+        .collect();
+    // Chroma: the same search on the deblocked Cb/Cr planes, with the type
+    // and edge class chosen jointly (the syntax shares them). The lambda is
+    // twice the picture's chroma lambda: at 1× (4:2:0, q50–88, 5 pictures)
+    // chroma SAO cost 0.3–1.0% bytes at fixed q for −0.6..−3.6% PSNR-YUV
+    // BD-rate and ssimulacra2 ±0 on average (+0.8% worst); at 2× the PSNR
+    // gain is −0.1..−3.6% for 0.2–0.8% bytes with the worst ssimulacra2 case
+    // halved, and 4× forfeits most of the gain.
+    const CHROMA_SAO_LAMBDA: f32 = 2.0;
+    let chroma = !yuv.chroma.is_monochrome();
+    if chroma {
+        let (sub_w, sub_h) = (yuv.chroma.sub_w(), yuv.chroma.sub_h());
+        let (stride_c, coded_hc) = (stride / sub_w, coded_h / sub_h);
+        let (vis_w, vis_h) = (yuv.chroma_stride(), yuv.chroma_height());
+        pad_plane_into(
+            &mut ws_ref.sao_original_cb,
+            &yuv.cb,
+            vis_w,
+            vis_h,
+            stride_c,
+            coded_hc,
+        );
+        pad_plane_into(
+            &mut ws_ref.sao_original_cr,
+            &yuv.cr,
+            vis_w,
+            vis_h,
+            stride_c,
+            coded_hc,
+        );
+        let geometry = crate::sao::SaoPlane {
+            original: &[],
+            rec: &[],
+            stride: stride_c,
+            width: (width as usize).div_ceil(sub_w),
+            height: (height as usize).div_ceil(sub_h),
+            coded_height: coded_hc,
+            ctb_w: 64 / sub_w,
+            ctb_h: 64 / sub_h,
+            bit_depth,
+        };
+        crate::sao::analyze_chroma(
+            crate::sao::SaoPlane {
+                original: &ws_ref.sao_original_cb,
+                rec: &ws_ref.rec_cb,
+                ..geometry
+            },
+            crate::sao::SaoPlane {
+                original: &ws_ref.sao_original_cr,
+                rec: &ws_ref.rec_cr,
+                ..geometry
+            },
+            lambda * chroma_lambda_scale(qp, yuv.chroma, cqo) * CHROMA_SAO_LAMBDA,
+            &mut params,
+        );
+    }
     let substreams = replay_with_sao(
         &analysis.traces,
         &params,
@@ -2110,7 +2357,8 @@ fn encode_region_substreams(
             ibc,
             ws.cc.tools,
         ),
-        yuv.bit_depth.bits(),
+        bit_depth,
+        chroma,
     );
     // The analysis pass's reconstruction (and, in tests, its recon copies)
     // stays; only the substreams change.
@@ -2120,18 +2368,45 @@ fn encode_region_substreams(
     let ws_ref = &mut *ws;
     // SAO filters the whole coded picture, padding included, as the decoder
     // does; filtering only the visible crop left its last column/row unfiltered.
-    crate::sao::apply_luma(
+    crate::sao::apply_plane(
         &mut ws_ref.rec_y,
         stride,
-        stride,
         coded_h,
-        yuv.bit_depth.bits(),
-        &params,
+        64,
+        64,
+        bit_depth,
+        |i| params[i].y,
         &mut ws_ref.sao_apply,
     );
+    if chroma {
+        let (sub_w, sub_h) = (yuv.chroma.sub_w(), yuv.chroma.sub_h());
+        let (stride_c, coded_hc) = (stride / sub_w, coded_h / sub_h);
+        crate::sao::apply_plane(
+            &mut ws_ref.rec_cb,
+            stride_c,
+            coded_hc,
+            64 / sub_w,
+            64 / sub_h,
+            bit_depth,
+            |i| params[i].cb,
+            &mut ws_ref.sao_apply,
+        );
+        crate::sao::apply_plane(
+            &mut ws_ref.rec_cr,
+            stride_c,
+            coded_hc,
+            64 / sub_w,
+            64 / sub_h,
+            bit_depth,
+            |i| params[i].cr,
+            &mut ws_ref.sao_apply,
+        );
+    }
     #[cfg(test)]
     {
         output.y = ws.rec_y.clone();
+        output.cb = ws.rec_cb.clone();
+        output.cr = ws.rec_cr.clone();
     }
     output
 }
@@ -2140,17 +2415,18 @@ fn encode_region_substreams(
 /// as each CTU's SAO syntax in place of the recorded (all-off) syntax.
 ///
 /// Regular bins carry their recorded probability state, so only the SAO
-/// contexts are modelled here. They follow the slice's context rules: the
+/// contexts are modeled here. They follow the slice's context rules: the
 /// single substream of a non-WPP region starts from `initial`, and each WPP
 /// row starts from the row above's state after its second CTU (§9.3.2.4), or
 /// from `initial` when that row is too narrow to have one.
 fn replay_with_sao(
     traces: &[Vec<u16>],
-    params: &[crate::sao::SaoParam],
+    params: &[crate::sao::SaoCtu],
     ctus_x: usize,
     wpp: bool,
     initial: ContextSet,
     bit_depth: u8,
+    chroma: bool,
 ) -> Vec<Vec<u8>> {
     use crate::cabac::bin_trace::{BYPASS, MARKER, REGULAR, SAO_BEGIN, SAO_END, TERMINATE};
     let mut substreams = Vec::with_capacity(traces.len());
@@ -2171,13 +2447,14 @@ fn replay_with_sao(
                     if wpp && col == 2 {
                         row_sync = Some(ctx.clone());
                     }
-                    crate::sao::encode_luma(
+                    crate::sao::encode_ctu(
                         &mut enc,
                         &mut ctx,
-                        params[ctu],
+                        &params[ctu],
                         col > 0,
                         row > 0,
                         bit_depth,
+                        chroma,
                     );
                     ctu += 1;
                     in_recorded_sao = true;
@@ -2317,7 +2594,7 @@ fn build_idr_slice(
     // §7.3.6.1), so it is omitted for monochrome.
     hdr.write_bit(sao); // slice_sao_luma_flag
     if !yuv.chroma.is_monochrome() {
-        hdr.write_bit(false); // slice_sao_chroma_flag = 0 (luma SAO search only)
+        hdr.write_bit(sao); // slice_sao_chroma_flag
     }
     if ibc {
         // P-slice reference configuration (§7.3.6.1). Everything here is either
@@ -2338,6 +2615,9 @@ fn build_idr_slice(
     // parameter-set config, so a per-cell PPS init_qp would never reach the
     // decoder); a rebased grid cell shifts its QP here instead.
     hdr.write_se(i32::from(qp_bias)); // slice_qp_delta
+    if tools.chroma_qp_list {
+        hdr.write_bit(true); // cu_chroma_qp_offset_enabled_flag
+    }
     // slice_loop_filter_across_slices_enabled_flag — REQUIRED here by HEVC §7.3.6.1:
     // it is present whenever pps_loop_filter_across_slices_enabled_flag (set in our
     // PPS) is 1 and (slice_sao_luma_flag || slice_sao_chroma_flag || deblocking not
@@ -2393,17 +2673,19 @@ fn build_idr_slice(
         // num_tile_columns_minus1/num_tile_rows_minus1 in the PPS).
         let col_bd: Vec<usize> = (0..=tile_cols).map(|i| i * ctus_x / tile_cols).collect();
         let row_bd: Vec<usize> = (0..=tile_rows).map(|j| j * ctus_y / tile_rows).collect();
-        let mut bounds = Vec::with_capacity(num_tiles);
-        for tj in 0..tile_rows {
-            for ti in 0..tile_cols {
-                let x0 = col_bd[ti] * 64;
-                let y0 = row_bd[tj] * 64;
-                // The last tile column/row ends at the picture edge, mid-CTB.
-                let tw = (col_bd[ti + 1] * 64).min(w) - x0;
-                let th = (row_bd[tj + 1] * 64).min(h) - y0;
-                bounds.push((x0, y0, tw, th));
-            }
-        }
+        // The last tile column/row ends at the picture edge, mid-CTB.
+        let bounds: Vec<_> = row_bd
+            .array_windows::<2>()
+            .flat_map(|&[top, bottom]| {
+                let y0 = top * 64;
+                let th = (bottom * 64).min(h) - y0;
+                col_bd.array_windows::<2>().map(move |&[left, right]| {
+                    let x0 = left * 64;
+                    let tw = (right * 64).min(w) - x0;
+                    (x0, y0, tw, th)
+                })
+            })
+            .collect();
         // AQ is normalized against the WHOLE picture: compute (or take) the
         // full map here and hand each tile its window, so rate still shifts
         // between flat and textured tiles instead of each tile spending as if
@@ -3361,6 +3643,19 @@ struct AqCtuState {
     predictor: u8,
     target: u8,
     coded: bool,
+    /// The chroma QP offset group state (RExt `cu_chroma_qp_offset`), which
+    /// shares the quantization groups.
+    chroma: ChromaQpAdj,
+}
+
+/// `IsCuChromaQpOffsetCoded` bookkeeping of the current chroma QP offset
+/// group: `idx` is the value [`encode_cu_chroma_qp_offset`] codes (0 = flag
+/// 0, else 1 + list index) and the offset every chroma QP of the group uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChromaQpAdj {
+    enabled: bool,
+    idx: u8,
+    coded: bool,
 }
 
 impl AqCtuState {
@@ -3409,15 +3704,48 @@ fn encode_cu_qp_delta<W: CabacWriter>(enc: &mut W, ctx: &mut ContextSet, aq: &mu
     aq.coded = true;
 }
 
+/// `chroma_qp_offset()` of a transform unit with a coded chroma residual
+/// (§7.3.8.10, once per chroma QP offset group): `cu_chroma_qp_offset_flag`,
+/// then `cu_chroma_qp_offset_idx` as truncated unary (cMax = list length − 1)
+/// on its single context.
+fn encode_cu_chroma_qp_offset<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    aq: &mut AqCtuState,
+) {
+    let state = &mut aq.chroma;
+    if !state.enabled || state.coded {
+        return;
+    }
+    enc.encode_bin(u8::from(state.idx != 0), &mut ctx.cu_chroma_qp_offset_flag);
+    if state.idx != 0 {
+        let value = usize::from(state.idx - 1);
+        let max = CHROMA_QP_OFFSET_LIST.len() - 1;
+        for _ in 0..value {
+            enc.encode_bin(1, &mut ctx.cu_chroma_qp_offset_idx);
+        }
+        if value < max {
+            enc.encode_bin(0, &mut ctx.cu_chroma_qp_offset_idx);
+        }
+    }
+    state.coded = true;
+}
+
+/// The QP syntax at the head of a transform unit's residuals: `cu_qp_delta`
+/// when any residual is coded, `chroma_qp_offset()` when a chroma one is.
 #[inline]
 fn encode_cu_qp_delta_if_needed<W: CabacWriter>(
     enc: &mut W,
     ctx: &mut ContextSet,
     aq: &mut AqCtuState,
     need_qp: bool,
+    cbf_chroma: bool,
 ) {
     if need_qp {
         encode_cu_qp_delta(enc, ctx, aq);
+    }
+    if cbf_chroma {
+        encode_cu_chroma_qp_offset(enc, ctx, aq);
     }
 }
 
@@ -3597,6 +3925,10 @@ struct TuTreeScratch {
     y_scan_idx: [u8; 4],
     /// transform_skip_flag of each 4×4 luma child (always false for larger TBs).
     y_ts: [bool; 4],
+    /// Whether each 4×4 luma child is coded with implicit RDPCM (transform
+    /// skip + intra mode 10/26 with the tool on), which turns its sign hiding
+    /// off (§7.3.8.11).
+    y_rdpcm: [bool; 4],
     chroma_scan_idx: [u8; 8],
     /// Whether each child TU's chroma uses the DM mode — with a coded luma
     /// residual, the condition for `cross_comp_pred()` in a 4:4:4 picture
@@ -3625,6 +3957,7 @@ impl TuTreeScratch {
             cr_nz: [false; 8],
             y_scan_idx: [0; 4],
             y_ts: [false; 4],
+            y_rdpcm: [false; 4],
             chroma_scan_idx: [0; 8],
             chroma_dm: [false; 4],
             ccp_scale: [[0; 2]; 4],
@@ -3863,6 +4196,10 @@ struct CuTreeState<'a> {
     aq: AqCtuState,
     /// This CTU's AQ offsets, one per quantization group in Z order.
     qg_offsets: [i8; crate::aq::QGS_PER_CTU],
+    /// This CTU's chroma QP offsets per group (RExt list; all zero when off).
+    chroma_qg: [i8; crate::aq::QGS_PER_CTU],
+    /// The picture's PPS Cb/Cr offset; `cqo` is this plus the group's offset.
+    pic_cqo: i8,
     slice_qp: u8,
     slice_lambda: f32,
     /// qPY_PREV: QpY of the last CU of the previous quantization group in
@@ -3911,9 +4248,11 @@ impl CuTreeState<'_> {
             (col % 64) / crate::aq::QG_SIZE,
         );
         let mut sum = 0i16;
+        let mut chroma_sum = 0i16;
         for qr in qr0..qr0 + side {
             for qc in qc0..qc0 + side {
                 sum += i16::from(self.qg_offsets[crate::aq::qg_z(qr, qc)]);
+                chroma_sum += i16::from(self.chroma_qg[crate::aq::qg_z(qr, qc)]);
             }
         }
         let offset = (f32::from(sum) / (side * side) as f32).fast_round() as i16;
@@ -3932,11 +4271,27 @@ impl CuTreeState<'_> {
         };
         self.qp = target;
         self.lambda = self.slice_lambda * AQ_LAMBDA_SCALE[(delta + MAX_AQ) as usize];
+        // The chroma QP offset group (same node): one offset for the groups
+        // the node covers, applied to every chroma QP derived below it.
+        let chroma_enabled = self.aq.chroma.enabled;
+        let chroma_offset = if chroma_enabled {
+            (f32::from(chroma_sum) / (side * side) as f32)
+                .fast_round()
+                .clamp(-3.0, 3.0) as i8
+        } else {
+            0
+        };
+        self.cqo = self.pic_cqo + chroma_offset;
         self.aq = AqCtuState {
             enabled: true,
             predictor: ((u16::from(a) + u16::from(b) + 1) >> 1) as u8,
             target,
             coded: false,
+            chroma: ChromaQpAdj {
+                enabled: chroma_enabled,
+                idx: chroma_qp_list_index(chroma_offset),
+                coded: false,
+            },
         };
     }
 
@@ -4592,10 +4947,10 @@ struct Cu32Plan {
 /// context modeling changes materially; see the hevc-lossy-rdo memory note.
 const CU64_ENABLED_DEFAULT: bool = false;
 
-/// Experiment knobs for the 64×64-CU path: `HPVCA_CU64=1` enables it,
-/// `HPVCA_CU64_GATE` sets the per-quadrant flatness threshold a CTU must sit
-/// below to be a candidate, `HPVCA_CU64_MARGIN` the rate margin (in bits) the
-/// 64-CU must beat the four-32 alternative by.
+/// Knobs for the 64×64-CU path: [`CU64_ENABLED_DEFAULT`] enables it,
+/// [`cu64_gate`] is the per-quadrant flatness threshold a CTU must sit below
+/// to be a candidate, [`cu64_margin`] the rate margin (in bits) the 64-CU must
+/// beat the four-32 alternative by.
 fn cu64_enabled() -> bool {
     CU64_ENABLED_DEFAULT
 }
@@ -4847,6 +5202,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
             scan_idx: luma_scan_idx,
             lambda,
             scaling: scratch.tools.scaling.and_then(|s| s.table(32, true)),
+            transform_skip: false,
         };
         crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
             &tb,
@@ -5075,6 +5431,7 @@ fn code_ctu_as_cu64<W: CabacWriter>(
                 scan_idx: chroma_scan_idx,
                 lambda: chroma_lambda,
                 scaling: scratch.tools.scaling.and_then(|s| s.table(16, false)),
+                transform_skip: false,
             };
             crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                 &tb,
@@ -5180,8 +5537,9 @@ fn code_ctu_as_cu64<W: CabacWriter>(
             encode_cbf_chroma(enc, ctx, scratch.cu64.cr_nz[t], 1);
         }
         encode_cbf_luma(enc, ctx, scratch.cu64.y_nz[t], 1);
-        let need_qp = scratch.cu64.y_nz[t] || scratch.cu64.cb_nz[t] || scratch.cu64.cr_nz[t];
-        encode_cu_qp_delta_if_needed(enc, ctx, &mut tree.aq, need_qp);
+        let cbf_chroma = scratch.cu64.cb_nz[t] || scratch.cu64.cr_nz[t];
+        let need_qp = scratch.cu64.y_nz[t] || cbf_chroma;
+        encode_cu_qp_delta_if_needed(enc, ctx, &mut tree.aq, need_qp, cbf_chroma);
         if scratch.cu64.y_nz[t] {
             encode_residual(
                 enc,
@@ -5785,6 +6143,12 @@ fn commit_lossless_luma_leaf(
         implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
         &mut scratch.levels,
     );
+    // `transform_skip_rotation_enabled_flag` (§8.6.2): the coefficients of an
+    // intra 4×4 bypass TB are its residual rotated by 180°, applied after the
+    // RDPCM differencing the decoder undoes after un-rotating.
+    if size == 4 && scratch.tools.ts_rotation {
+        scratch.levels[..len].reverse();
+    }
     let log2 = size.trailing_zeros();
     let scan_idx = dct::scan_idx_for(mode, log2, true, false);
     let scan = dct::coeff_scan(log2, scan_idx);
@@ -6074,6 +6438,10 @@ fn commit_lossless_chroma_leaf(
                 implicit_rdpcm_mode(mode, scratch.implicit_rdpcm),
                 &mut scratch.levels,
             );
+            // Rotation of intra 4×4 bypass TBs (§8.6.2), chroma included.
+            if side == 4 && scratch.tools.ts_rotation {
+                scratch.levels[..len].reverse();
+            }
             let offset = *cursor + t * len;
             let packed = if component == 0 {
                 &mut scratch.tu_tree.cb_zz[offset..offset + len]
@@ -6265,13 +6633,14 @@ fn choose_luma4x4_transform(
     const N: usize = 4;
     const LEN: usize = N * N;
     let LumaTb4x4 {
+        mode,
         qp,
         bit_depth,
         scan,
         scan_idx,
         lambda,
     } = tb;
-    let rd_cost = |levels: &[i16], inverse: &[i32], residual: &[i32], ts: bool| -> f32 {
+    let rd_cost = |levels: &[i16], inverse: &[i32], residual: &[i32], ts: bool, sdh: bool| -> f32 {
         let mut packed = [0i16; LEN];
         let mut nonzero = false;
         for (dst, &(r, c)) in packed.iter_mut().zip(scan) {
@@ -6281,7 +6650,7 @@ fn choose_luma4x4_transform(
         let mut rctx = ctx.clone();
         let mut bits = rctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
-            bits += estimate_residual_bits_ts(&mut rctx, &packed, 2, true, scan_idx, true, ts);
+            bits += estimate_residual_bits_ts(&mut rctx, &packed, 2, true, scan_idx, sdh, ts);
         }
         let sse: i64 = residual[..LEN]
             .iter()
@@ -6307,6 +6676,7 @@ fn choose_luma4x4_transform(
                 scan_idx,
                 lambda,
                 scaling: scratch.tools.scaling.and_then(|s| s.table(N, true)),
+                transform_skip: true,
             },
             1,
             ctx,
@@ -6335,7 +6705,13 @@ fn choose_luma4x4_transform(
         &mut scratch.transform_tmp,
         true,
     );
-    let j_dst = rd_cost(&scratch.levels, &scratch.inverse, &scratch.residual, false);
+    let j_dst = rd_cost(
+        &scratch.levels,
+        &scratch.inverse,
+        &scratch.residual,
+        false,
+        true,
+    );
 
     // Reference: the DST under the same plain-SSE criterion skip is held to.
     // Its levels and reconstruction are scored only, never committed.
@@ -6370,27 +6746,65 @@ fn choose_luma4x4_transform(
         &mut scratch.transform_tmp,
         true,
     );
-    let j_ref = j_dst.min(rd_cost(&levels, &inverse, &scratch.residual, false));
+    let j_ref = j_dst.min(rd_cost(&levels, &inverse, &scratch.residual, false, true));
 
-    // Transform-skip candidate.
-    crate::hevc_transform::transform_skip_fwd_into(
-        &scratch.residual,
-        N,
-        bit_depth,
-        &mut scratch.coeff,
-    );
-    plain_rdoq(scratch, &mut levels);
-    crate::hevc_transform::run_dequantize(
-        scratch.dequantize,
-        &levels,
-        N,
-        qp,
-        bit_depth,
-        scratch.tools.scaling.and_then(|s| s.factor(N, true)),
-        &mut dequant,
-    );
-    crate::hevc_transform::transform_skip_inv_into(&dequant, N, bit_depth, &mut inverse);
-    let j_ts = rd_cost(&levels, &inverse, &scratch.residual, true);
+    // Transform-skip candidate. With `transform_skip_rotation_enabled_flag`
+    // the coefficients are the 180°-rotated residual (§8.6.4.2), so the
+    // residual enters the coefficient domain rotated and the reconstruction
+    // is rotated back. Under implicit RDPCM (modes 10 / 26) the decoder
+    // accumulates the residual along the prediction direction, so the TB is
+    // quantized closed-loop sample by sample instead of by RDOQ, and its
+    // sign hiding is off (§7.3.8.11).
+    let rotate = scratch.tools.ts_rotation;
+    let j_ts = if let Some(vertical) = lossy_rdpcm_vertical(scratch.tools, mode) {
+        crate::hevc_transform::rdpcm_transform_skip_quantize_into(
+            &scratch.residual,
+            N,
+            qp,
+            bit_depth,
+            scratch.tools.scaling.and_then(|s| s.table(N, true)),
+            vertical,
+            rotate,
+            &mut levels,
+            &mut inverse,
+        );
+        rd_cost(&levels, &inverse, &scratch.residual, true, false)
+    } else {
+        if rotate {
+            let mut rotated = [0i32; LEN];
+            for (dst, &src) in rotated.iter_mut().zip(scratch.residual[..LEN].iter().rev()) {
+                *dst = src;
+            }
+            crate::hevc_transform::transform_skip_fwd_into(
+                &rotated,
+                N,
+                bit_depth,
+                &mut scratch.coeff,
+            );
+        } else {
+            crate::hevc_transform::transform_skip_fwd_into(
+                &scratch.residual,
+                N,
+                bit_depth,
+                &mut scratch.coeff,
+            );
+        }
+        plain_rdoq(scratch, &mut levels);
+        crate::hevc_transform::run_dequantize(
+            scratch.dequantize,
+            &levels,
+            N,
+            qp,
+            bit_depth,
+            scratch.tools.scaling.and_then(|s| s.factor(N, true)),
+            &mut dequant,
+        );
+        crate::hevc_transform::transform_skip_inv_into(&dequant, N, bit_depth, &mut inverse);
+        if rotate {
+            inverse[..LEN].reverse();
+        }
+        rd_cost(&levels, &inverse, &scratch.residual, true, true)
+    };
 
     if j_ts < j_ref {
         scratch.levels[..LEN].copy_from_slice(&levels[..LEN]);
@@ -6404,6 +6818,7 @@ fn choose_luma4x4_transform(
 /// Quantization parameters of one 4×4 luma TB (see [`choose_luma4x4_transform`]).
 #[derive(Clone, Copy)]
 struct LumaTb4x4<'a> {
+    mode: u8,
     qp: u8,
     bit_depth: u8,
     scan: &'a [(usize, usize)],
@@ -6530,6 +6945,7 @@ fn commit_split_luma(
                 scan_idx,
                 lambda,
                 scaling: scratch.tools.scaling.and_then(|s| s.table(child, true)),
+                transform_skip: false,
             };
             crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                 &tb,
@@ -6547,6 +6963,7 @@ fn commit_split_luma(
                 scratch,
                 &residual_ctx,
                 LumaTb4x4 {
+                    mode,
                     qp,
                     bit_depth,
                     scan,
@@ -6556,6 +6973,7 @@ fn commit_split_luma(
             )
             .0;
 
+        let rdpcm_tb = transform_skip && lossy_rdpcm_vertical(scratch.tools, mode).is_some();
         let packed_offset = index * child_len;
         let packed = &mut scratch.tu_tree.y_zz[packed_offset..packed_offset + child_len];
         let mut nonzero = false;
@@ -6567,6 +6985,7 @@ fn commit_split_luma(
         scratch.tu_tree.y_nz[index] = nonzero;
         scratch.tu_tree.y_scan_idx[index] = scan_idx;
         scratch.tu_tree.y_ts[index] = transform_skip;
+        scratch.tu_tree.y_rdpcm[index] = rdpcm_tb;
         any_nonzero |= nonzero;
         let _ = residual_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
@@ -6576,7 +6995,7 @@ fn commit_split_luma(
                 log2_child,
                 true,
                 scan_idx,
-                !lossless,
+                !lossless && !rdpcm_tb,
                 transform_skip,
             );
         }
@@ -6856,6 +7275,7 @@ fn commit_split_chroma(
                             .tools
                             .scaling
                             .and_then(|s| s.table(child_side, false)),
+                        transform_skip: false,
                     };
                     crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                         &tb,
@@ -7159,6 +7579,7 @@ fn evaluate_chroma_mode(
                     scan_idx,
                     lambda,
                     scaling: scratch.tools.scaling.and_then(|s| s.table(side, false)),
+                    transform_skip: false,
                 };
                 crate::hevc_transform::rdoq_chroma_at_depth_with_sign_hiding_into(
                     &tb,
@@ -7798,6 +8219,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                     scan_idx,
                     lambda,
                     scaling: scratch.tools.scaling.and_then(|s| s.table(PU, true)),
+                    transform_skip: false,
                 };
                 crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
                     &tb,
@@ -7894,6 +8316,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             scan_idx,
             lambda,
             scaling: scratch.tools.scaling.and_then(|s| s.table(PU, true)),
+            transform_skip: false,
         };
         crate::hevc_transform::rdoq_luma_at_depth_with_sign_hiding_into(
             &tb,
@@ -7916,6 +8339,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 scratch,
                 &rdoq_ctx,
                 LumaTb4x4 {
+                    mode: best_mode,
                     qp,
                     bit_depth: bit_depth.bits(),
                     scan,
@@ -7927,6 +8351,7 @@ fn encode_cu_nxn<W: CabacWriter>(
             // The mode loop priced this PU with the DST; skip only lowers it.
             nxn_cost -= gain;
         }
+        let rdpcm_tb = transform_skip && lossy_rdpcm_vertical(scratch.tools, best_mode).is_some();
         let offset = pu_index * PU_LEN;
         let packed = &mut scratch.tu_tree.y_zz[offset..offset + PU_LEN];
         let mut nonzero = false;
@@ -7938,6 +8363,7 @@ fn encode_cu_nxn<W: CabacWriter>(
         scratch.tu_tree.y_nz[pu_index] = nonzero;
         scratch.tu_tree.y_scan_idx[pu_index] = scan_idx;
         scratch.tu_tree.y_ts[pu_index] = transform_skip;
+        scratch.tu_tree.y_rdpcm[pu_index] = rdpcm_tb;
         let _ = rdoq_ctx.cbf_luma[0].estimate_and_update(nonzero as u8);
         if nonzero {
             advance_residual_contexts_ts(
@@ -7946,7 +8372,7 @@ fn encode_cu_nxn<W: CabacWriter>(
                 2,
                 true,
                 scan_idx,
-                true,
+                !rdpcm_tb,
                 transform_skip,
             );
         }
@@ -8303,25 +8729,25 @@ fn encode_split_transform_tree<W: CabacWriter>(
 
         let y_nz = scratch.tu_tree.y_nz[child_index];
         encode_cbf_luma(enc, ctx, y_nz, 1);
-        let mut need_qp = y_nz;
+        let mut cbf_chroma = false;
         if !chroma.is_monochrome() {
             if shared_chroma {
                 // The root chroma CBF applies to every child transform unit.
                 // Consequently cu_qp_delta is present at the first child even
                 // though the shared chroma coefficients themselves are emitted
                 // after the fourth luma child.
-                need_qp = need_qp
-                    || root_cb_nz[..root_count].iter().any(|&nonzero| nonzero)
+                cbf_chroma = root_cb_nz[..root_count].iter().any(|&nonzero| nonzero)
                     || root_cr_nz[..root_count].iter().any(|&nonzero| nonzero);
             } else {
                 for stack_index in 0..stacked {
                     let index = child_index * stacked + stack_index;
-                    need_qp =
-                        need_qp || scratch.tu_tree.cb_nz[index] || scratch.tu_tree.cr_nz[index];
+                    cbf_chroma =
+                        cbf_chroma || scratch.tu_tree.cb_nz[index] || scratch.tu_tree.cr_nz[index];
                 }
             }
         }
-        encode_cu_qp_delta_if_needed(enc, ctx, aq, need_qp);
+        let need_qp = y_nz || cbf_chroma;
+        encode_cu_qp_delta_if_needed(enc, ctx, aq, need_qp, cbf_chroma);
         if y_nz {
             let offset = child_index * child_len;
             encode_residual_ts(
@@ -8331,7 +8757,7 @@ fn encode_split_transform_tree<W: CabacWriter>(
                 child_log2,
                 true,
                 scratch.tu_tree.y_scan_idx[child_index],
-                sign_data_hiding,
+                sign_data_hiding && !scratch.tu_tree.y_rdpcm[child_index],
                 scratch.tu_tree.y_ts[child_index],
             );
         }
@@ -8962,6 +9388,7 @@ fn encode_cu<W: CabacWriter>(
                     scan_idx,
                     lambda,
                     scaling: scratch.tools.scaling.and_then(|s| s.table(lu, true)),
+                    transform_skip: false,
                 };
                 // Perceptual RDOQ, matching the weighted decision distortion
                 // (with plain-SSE decisions this had to be plain RDOQ).
@@ -9185,6 +9612,7 @@ fn encode_cu<W: CabacWriter>(
             scan_idx: luma_scan_idx,
             lambda,
             scaling: scratch.tools.scaling.and_then(|s| s.table(lu, true)),
+            transform_skip: false,
         };
         crate::hevc_transform::rdoq_luma_with_sign_hiding_into(
             &tb,
@@ -9322,7 +9750,7 @@ fn encode_cu<W: CabacWriter>(
                         log2_child,
                         true,
                         scratch.tu_tree.y_scan_idx[i],
-                        !lossless,
+                        !lossless && !scratch.tu_tree.y_rdpcm[i],
                         scratch.tu_tree.y_ts[i],
                     );
                 }
@@ -9618,7 +10046,7 @@ fn encode_cu<W: CabacWriter>(
                         child_log2,
                         true,
                         scratch.tu_tree.y_scan_idx[index],
-                        !lossless,
+                        !lossless && !scratch.tu_tree.y_rdpcm[index],
                         scratch.tu_tree.y_ts[index],
                     );
                 }
@@ -9783,6 +10211,7 @@ fn encode_cu<W: CabacWriter>(
                                 scan_idx,
                                 lambda: chroma_lambda,
                                 scaling: scratch.tools.scaling.and_then(|s| s.table(ctb, false)),
+                                transform_skip: false,
                             };
                             crate::hevc_transform::rdoq_chroma_with_sign_hiding_into(
                                 &tb,
@@ -10034,11 +10463,11 @@ fn encode_cu<W: CabacWriter>(
             }
             encode_cbf_luma(enc, ctx, y_nz, 0);
 
-            let need_qp = y_nz
-                || scratch.chroma_tbs[..n_chroma_tb]
-                    .iter()
-                    .any(|tb| tb.cb_nz || tb.cr_nz);
-            encode_cu_qp_delta_if_needed(enc, ctx, aq, need_qp);
+            let cbf_chroma = scratch.chroma_tbs[..n_chroma_tb]
+                .iter()
+                .any(|tb| tb.cb_nz || tb.cr_nz);
+            let need_qp = y_nz || cbf_chroma;
+            encode_cu_qp_delta_if_needed(enc, ctx, aq, need_qp, cbf_chroma);
 
             if y_nz {
                 encode_residual(
@@ -10553,8 +10982,9 @@ impl<W: CabacWriter> crate::palette::PaletteBitWriter for PaletteBridge<'_, W> {
 
     fn escape_qp_syntax(&mut self) {
         // §7.3.8.13: delta_qp() is present whenever escapes are, including under
-        // transquant bypass. chroma_qp_offset() is never present here — this
-        // encoder's PPS carries no chroma QP offset list.
+        // transquant bypass. chroma_qp_offset() would follow it, but the chroma
+        // QP offset list is never enabled with the screen-content tools.
+        debug_assert!(!self.aq.chroma.enabled);
         encode_cu_qp_delta(self.enc, self.ctx, self.aq);
     }
 }
@@ -11036,6 +11466,7 @@ mod tests {
             predictor: 38,
             target: 35,
             coded: false,
+            chroma: ChromaQpAdj::default(),
         };
         encode_cu_qp_delta(&mut trace, &mut ctx, &mut aq);
         assert_eq!(trace.regular, [1, 1, 1, 0]);
@@ -11083,6 +11514,7 @@ mod tests {
             predictor: 38,
             target: 35,
             coded: false,
+            chroma: ChromaQpAdj::default(),
         };
 
         encode_split_transform_tree(
@@ -11253,7 +11685,6 @@ mod tests {
         };
         let before = sse(&output.unfiltered_y);
         let after = sse(&output.y);
-        eprintln!("deblock luma SSE: {before} -> {after}");
         assert!(
             after < before,
             "deblock SSE did not improve: {before} -> {after}"
@@ -11593,7 +12024,7 @@ mod tests {
             false,
             false,
             true,
-            None, // scaling lists
+            PictureTools::default(),
         );
         let scc = build_sps(
             64,
@@ -11605,7 +12036,7 @@ mod tests {
             false,
             false,
             true,
-            None, // scaling lists
+            PictureTools::default(),
         );
         // 8-bit 4:2:0 lossy needs no range extension, so the SCC stream is the
         // only one carrying an sps_extension at all.
@@ -11644,6 +12075,7 @@ mod tests {
             predictor: 26,
             target: 26,
             coded: false,
+            chroma: ChromaQpAdj::default(),
         };
         let mut est = CabacEstimator::default();
         let runs = Vec::new();
@@ -11717,12 +12149,53 @@ mod tests {
     #[test]
     fn lossless_range_extension_sets_only_implicit_rdpcm() {
         let mut enabled = BitWriter::new();
-        write_sps_range_extension(&mut enabled, true, false);
+        write_sps_range_extension(&mut enabled, true, false, false, false);
         assert_eq!(enabled.finish().as_slice(), &[0x20, 0x00]);
 
         let mut disabled = BitWriter::new();
-        write_sps_range_extension(&mut disabled, false, false);
+        write_sps_range_extension(&mut disabled, false, false, false, false);
         assert_eq!(disabled.finish().as_slice(), &[0x00, 0x00]);
+
+        // transform_skip_rotation_enabled_flag and
+        // transform_skip_context_enabled_flag are the first two bits.
+        let mut ts_tools = BitWriter::new();
+        write_sps_range_extension(&mut ts_tools, false, false, true, true);
+        assert_eq!(ts_tools.finish().as_slice(), &[0xC0, 0x00]);
+    }
+
+    #[test]
+    fn rext_residual_tools_follow_profile_and_decoder_support() {
+        use crate::fmt::ChromaFormat::{Yuv420, Yuv444};
+        let off = (false, false, false);
+        // Main-profile streams never pick up a 4:4:4-family tool.
+        assert_eq!(rext_residual_tools(Yuv420, false, true, false, true), off);
+        assert_eq!(rext_residual_tools(Yuv420, true, false, false, false), off);
+        // Lossy 4:4:4 with transform skip: all three.
+        assert_eq!(
+            rext_residual_tools(Yuv444, false, true, false, true),
+            (true, true, true)
+        );
+        // Lossy 4:4:4 without transform skip: nothing to apply them to.
+        assert_eq!(rext_residual_tools(Yuv444, false, false, false, false), off);
+        // Lossless 4:4:4: the single context by default on photographic
+        // pictures only; the bypass rotation only with the implicit-RDPCM
+        // opt-in (ffmpeg does not rotate bypass TBs), where the context then
+        // helps every picture; never the lossy RDPCM form.
+        assert_eq!(
+            rext_residual_tools(Yuv444, true, false, false, false),
+            (true, false, false)
+        );
+        assert_eq!(rext_residual_tools(Yuv444, true, false, false, true), off);
+        assert_eq!(
+            rext_residual_tools(Yuv444, true, false, true, true),
+            (true, true, false)
+        );
+        // The opt-in switches a 4:2:0 lossless stream to the 4:4:4 profile
+        // family, so the tools follow it there too.
+        assert_eq!(
+            rext_residual_tools(Yuv420, true, false, true, false),
+            (true, true, false)
+        );
     }
 
     /// HEVC §8.4.4.2.6 `disableIntraBoundaryFilter`: a transquant-bypass block
@@ -11916,7 +12389,7 @@ mod tests {
                 false,
                 false,
                 true,
-                None, // scaling lists
+                PictureTools::default(),
             );
             // NAL header (2 bytes), sps_vps_id/max_sub_layers/nesting (1 byte),
             // profile_tier_level with no sub-layers (12 bytes).

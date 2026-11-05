@@ -263,6 +263,10 @@ fn write_residual<W: CabacWriter>(
     // enables the tool. `transform_skip_enabled` is only ever set for lossy
     // streams, so no transquant-bypass CU reaches this point with it on.
     let transform_skip = transform_skip && log2_ts == 2;
+    // RExt `transform_skip_context_enabled_flag` (§9.3.4.2.5): every
+    // sig_coeff_flag of a transform-skipped or transquant-bypass TB uses one
+    // dedicated context.
+    let single_sig_ctx = ctx.transform_skip_context && (transform_skip || ctx.transquant_bypass);
     if ctx.transform_skip_enabled && log2_ts == 2 {
         enc.encode_bin(
             transform_skip as u8,
@@ -390,8 +394,12 @@ fn write_residual<W: CabacWriter>(
             }
 
             let (xc, yc) = pos_of(abs_pos);
-            let ci = sig_coeff_ctx(xc, yc, prev_csbf, log2_ts, scan_idx, is_luma)
-                .min(ctx.sig_coeff_flag.len() - 1);
+            let ci = if single_sig_ctx {
+                single_sig_coeff_ctx(is_luma)
+            } else {
+                sig_coeff_ctx(xc, yc, prev_csbf, log2_ts, scan_idx, is_luma)
+                    .min(ctx.sig_coeff_flag.len() - 1)
+            };
             let is_sig = (coeffs[abs_pos] != 0) as u8;
             enc.encode_bin(is_sig, &mut ctx.sig_coeff_flag[ci]);
             if is_sig != 0 {
@@ -503,6 +511,14 @@ fn encode_last_sig<W: CabacWriter>(
 /// `xc,yc` are the coefficient's position within the whole TU. `prev_csbf` is the
 /// 2-bit neighbor code for this coefficient's sub-block (bit0 = right sub-block
 /// coded, bit1 = bottom sub-block coded). `scan_idx` is 0=diag, 1=horiz, 2=vert.
+/// The dedicated sig_coeff_flag context of transform-skipped / transquant-
+/// bypass TBs when `transform_skip_context_enabled_flag` is set
+/// (§9.3.4.2.5: sigCtx 42 for luma, 27 + 16 for chroma).
+#[inline]
+pub(crate) const fn single_sig_coeff_ctx(is_luma: bool) -> usize {
+    if is_luma { 42 } else { 43 }
+}
+
 pub(crate) fn sig_coeff_ctx(
     xc: usize,
     yc: usize,

@@ -685,6 +685,7 @@ pub(crate) fn encode_gain_map(cfg: &EncodeConfig) -> Result<Option<EncodedGainMa
         0,
         None,
         None,
+        None,
         false,
         cfg.implicit_rdpcm,
         cfg.persistent_rice,

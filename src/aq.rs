@@ -316,6 +316,88 @@ pub(crate) fn activity_qp_offsets_clamped(
     activity_qp_offsets_impl(yuv, ctus_x, ctus_y, max_offset, resolve_aq())
 }
 
+/// Per-quantization-group Cb/Cr QP offsets for the RExt `cu_chroma_qp_offset`
+/// syntax, in Z order per CTU like [`activity_qp_offsets`]: the per-group form
+/// of the picture-level rule in `adaptive_chroma_qp_offset` (log-variance 1.2
+/// → 2.6 ramps the chroma offset by −2), centred so a mid-activity group is
+/// unchanged: smooth groups raise the chroma QP, busy groups lower it, by up
+/// to `strength`. Absolute (no picture normalization), so a grid cell may
+/// compute its own.
+pub(crate) fn chroma_qp_offsets(yuv: &Yuv, ctus_x: usize, ctus_y: usize, strength: f32) -> Vec<i8> {
+    const LOG_VARIANCE_LOW: f32 = 1.2;
+    const LOG_VARIANCE_HIGH: f32 = 2.6;
+    let functions = resolve_aq();
+    let (blocks, bw, bh) = block_log_variances_with(yuv, functions.blocks);
+    let groups = functions.groups;
+    let mut out = Vec::with_capacity(ctus_x * ctus_y * QGS_PER_CTU);
+    for row in 0..ctus_y {
+        for col in 0..ctus_x {
+            for log_variance in unsafe { groups(&blocks, bw, bh, row, col) } {
+                let offset = if log_variance.is_nan() {
+                    0.0
+                } else {
+                    let scale = ((log_variance - LOG_VARIANCE_LOW)
+                        / (LOG_VARIANCE_HIGH - LOG_VARIANCE_LOW))
+                        .clamp(0.0, 1.0);
+                    strength * 2.0 * (0.5 - scale)
+                };
+                out.push(offset.fast_round().clamp(-3.0, 3.0) as i8);
+            }
+        }
+    }
+    out
+}
+
+/// Saturation-based variant of [`chroma_qp_offsets`]: near-grey groups raise
+/// the chroma QP, strongly coloured ones lower it, by up to `strength`.
+pub(crate) fn chroma_qp_offsets_saturation(
+    yuv: &Yuv,
+    ctus_x: usize,
+    ctus_y: usize,
+    strength: f32,
+) -> Vec<i8> {
+    const SAT_LOW: f32 = 6.0;
+    const SAT_HIGH: f32 = 30.0;
+    let (sub_w, sub_h) = (yuv.chroma.sub_w(), yuv.chroma.sub_h());
+    let (cw, ch) = (yuv.chroma_stride(), yuv.chroma_height());
+    let neutral = f32::from(yuv.bit_depth.neutral());
+    let scale = 1.0 / f32::from(1u16 << (yuv.bit_depth.bits() - 8));
+    let (qg_w, qg_h) = (QG_SIZE / sub_w, QG_SIZE / sub_h);
+    let mut out = Vec::with_capacity(ctus_x * ctus_y * QGS_PER_CTU);
+    for row in 0..ctus_y {
+        for col in 0..ctus_x {
+            for z in 0..QGS_PER_CTU {
+                let (qr, qc) = (0..QGS_PER_SIDE)
+                    .flat_map(|r| (0..QGS_PER_SIDE).map(move |c| (r, c)))
+                    .find(|&(r, c)| qg_z(r, c) == z)
+                    .expect("every Z index maps to a group");
+                let y0 = (row * 64 + qr * QG_SIZE) / sub_h;
+                let x0 = (col * 64 + qc * QG_SIZE) / sub_w;
+                if y0 >= ch || x0 >= cw {
+                    out.push(0);
+                    continue;
+                }
+                let (y1, x1) = ((y0 + qg_h).min(ch), (x0 + qg_w).min(cw));
+                let sum: f32 = (y0..y1)
+                    .flat_map(|y| {
+                        let row = y * cw;
+                        yuv.cb[row + x0..row + x1]
+                            .iter()
+                            .zip(&yuv.cr[row + x0..row + x1])
+                    })
+                    .map(|(&cb, &cr)| {
+                        (f32::from(cb) - neutral).abs() + (f32::from(cr) - neutral).abs()
+                    })
+                    .sum();
+                let sat = sum * scale / ((y1 - y0) * (x1 - x0)) as f32;
+                let t = ((sat - SAT_LOW) / (SAT_HIGH - SAT_LOW)).clamp(0.0, 1.0);
+                out.push((strength * 2.0 * (0.5 - t)).fast_round().clamp(-3.0, 3.0) as i8);
+            }
+        }
+    }
+    out
+}
+
 fn activity_qp_offsets_impl(
     yuv: &Yuv,
     ctus_x: usize,

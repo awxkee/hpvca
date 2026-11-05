@@ -37,6 +37,33 @@ pub(crate) struct SaoParam {
     pub eo_class: u8,
 }
 
+/// One CTU's SAO parameters for all three components. `cb` and `cr` share
+/// `type_idx` and, for edge offset, `eo_class` (§7.3.8.3: Cr inherits both
+/// from Cb); their offsets and band positions are independent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SaoCtu {
+    pub y: SaoParam,
+    pub cb: SaoParam,
+    pub cr: SaoParam,
+}
+
+/// One component plane as the SAO search sees it: statistics come from the
+/// visible `width × height` samples, while the coded picture (`stride ×
+/// coded_height`) bounds edge-offset neighbours exactly as the decoder
+/// classifies them. `ctb_w × ctb_h` is the CTB size in this plane's samples.
+#[derive(Clone, Copy)]
+pub(crate) struct SaoPlane<'a> {
+    pub original: &'a [u16],
+    pub rec: &'a [u16],
+    pub stride: usize,
+    pub width: usize,
+    pub height: usize,
+    pub coded_height: usize,
+    pub ctb_w: usize,
+    pub ctb_h: usize,
+    pub bit_depth: u8,
+}
+
 #[inline]
 fn rounded_offset(sum: i64, count: u32, lo: i32, hi: i32) -> i32 {
     if count == 0 {
@@ -86,8 +113,18 @@ fn select_offset(
     best
 }
 
+#[inline]
+fn eo_direction(eo_class: u8) -> (i32, i32) {
+    match eo_class {
+        0 => (1, 0),
+        1 => (0, 1),
+        2 => (1, 1),
+        _ => (1, -1),
+    }
+}
+
 /// One sample of `source` (a coded picture `stride` wide, `height` tall)
-/// after SAO with `param`, exactly as [`apply_luma`] filters it.
+/// after SAO with `param`, exactly as [`apply_plane`] filters it.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn sao_sample(
@@ -112,12 +149,7 @@ fn sao_sample(
             }
         }
         2 => {
-            let (dx, dy): (i32, i32) = match param.eo_class {
-                0 => (1, 0),
-                1 => (0, 1),
-                2 => (1, 1),
-                _ => (1, -1),
-            };
+            let (dx, dy) = eo_direction(param.eo_class);
             let (xa, ya, xb, yb) = (x as i32 + dx, y as i32 + dy, x as i32 - dx, y as i32 - dy);
             if xa < 0
                 || ya < 0
@@ -147,44 +179,49 @@ fn sao_sample(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn analyze_ctu(
-    original: &[u16],
-    rec: &[u16],
-    stride: usize,
-    width: usize,
-    height: usize,
-    coded_height: usize,
-    x0: usize,
-    y0: usize,
-    bit_depth: u8,
-    lambda: f32,
-) -> SaoParam {
-    let x1 = (x0 + 64).min(width);
-    let y1 = (y0 + 64).min(height);
-    let max_offset = if bit_depth <= 8 { 7 } else { 31 };
-    let shift = bit_depth - 5;
+/// A candidate parameter set for one CTB of one component with its
+/// distortion change (relative to SAO off) and syntax bits. `bits` counts
+/// the component's own offset syntax plus, for the component that carries
+/// them, the type bypass bin and the band position / edge class.
+#[derive(Clone, Copy)]
+struct Candidate {
+    param: SaoParam,
+    delta: i64,
+    bits: u32,
+}
 
+impl Candidate {
+    fn cost(&self, lambda: f32) -> f64 {
+        self.delta as f64 + f64::from(lambda) * f64::from(self.bits)
+    }
+}
+
+/// The best band-offset parameters of one CTB (`x0`, `y0` in plane samples).
+fn band_candidate(plane: SaoPlane<'_>, x0: usize, y0: usize, lambda: f32) -> Candidate {
+    let x1 = (x0 + plane.ctb_w).min(plane.width);
+    let y1 = (y0 + plane.ctb_h).min(plane.height);
+    let max_offset = if plane.bit_depth <= 8 { 7 } else { 31 };
+    let shift = plane.bit_depth - 5;
     let mut bo_count = [0u32; 32];
     let mut bo_sum = [0i64; 32];
     for y in y0..y1 {
         for x in x0..x1 {
-            let idx = y * stride + x;
-            let band = (rec[idx] >> shift) as usize;
+            let idx = y * plane.stride + x;
+            let band = (plane.rec[idx] >> shift) as usize;
             bo_count[band] += 1;
-            bo_sum[band] += i64::from(original[idx]) - i64::from(rec[idx]);
+            bo_sum[band] += i64::from(plane.original[idx]) - i64::from(plane.rec[idx]);
         }
     }
-
-    // OFF codes one context bin. Candidate costs are relative to OFF, so the
-    // type prefix contributes roughly one extra bit for enabled SAO.
+    let mut best = Candidate {
+        param: SaoParam::default(),
+        delta: 0,
+        bits: 0,
+    };
     let mut best_cost = 0.0f64;
-    let mut best = SaoParam::default();
-    let mut best_bits = 0u32;
     for band in 0..=28usize {
         let mut offsets = [0i8; 4];
         let mut delta = 0i64;
-        let mut bits = 1 + 5; // enabled/type bypass + sao_band_position
+        let mut bits = 1 + 5; // type bypass + sao_band_position
         for k in 0..4 {
             let (o, class_delta, class_bits) = select_offset(
                 bo_sum[band + k],
@@ -199,95 +236,120 @@ fn analyze_ctu(
             delta += class_delta;
             bits += class_bits;
         }
-        let cost = delta as f64 + f64::from(lambda) * f64::from(bits);
-        if cost < best_cost {
-            best_cost = cost;
-            best_bits = bits;
-            best = SaoParam {
+        let candidate = Candidate {
+            param: SaoParam {
                 type_idx: 1,
                 offsets,
                 band_pos: band as u8,
                 eo_class: 0,
-            };
-        }
-    }
-
-    for eo_class in 0..4u8 {
-        let (dx, dy): (i32, i32) = match eo_class {
-            0 => (1, 0),
-            1 => (0, 1),
-            2 => (1, 1),
-            _ => (1, -1),
+            },
+            delta,
+            bits,
         };
-        let mut count = [0u32; 4];
-        let mut sum = [0i64; 4];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let xa = x as i32 + dx;
-                let ya = y as i32 + dy;
-                let xb = x as i32 - dx;
-                let yb = y as i32 - dy;
-                // Neighbor availability is the decoder's: the coded picture
-                // (stride × coded_height), not the visible crop.
-                if xa < 0
-                    || ya < 0
-                    || xb < 0
-                    || yb < 0
-                    || xa as usize >= stride
-                    || xb as usize >= stride
-                    || ya as usize >= coded_height
-                    || yb as usize >= coded_height
-                {
-                    continue;
-                }
-                let idx = y * stride + x;
-                let s = rec[idx];
-                let a = rec[ya as usize * stride + xa as usize];
-                let b = rec[yb as usize * stride + xb as usize];
-                let sign = |p: u16, q: u16| (p > q) as i32 - (p < q) as i32;
-                let edge = sign(s, a) + sign(s, b) + 2;
-                let class = match edge {
-                    0 => Some(0),
-                    1 => Some(1),
-                    3 => Some(2),
-                    4 => Some(3),
-                    _ => None,
-                };
-                if let Some(class) = class {
-                    count[class] += 1;
-                    sum[class] += i64::from(original[idx]) - i64::from(s);
-                }
-            }
-        }
-        let mut offsets = [0i8; 4];
-        let mut delta = 0i64;
-        let mut bits = 1 + 2; // enabled/type bypass + sao_eo_class
-        for k in 0..4 {
-            let (lo, hi) = if k < 2 {
-                (0, max_offset)
-            } else {
-                (-max_offset, 0)
-            };
-            let (o, class_delta, class_bits) =
-                select_offset(sum[k], count[k], lo, hi, max_offset, lambda, false);
-            offsets[k] = o as i8;
-            delta += class_delta;
-            bits += class_bits;
-        }
-        let cost = delta as f64 + f64::from(lambda) * f64::from(bits);
+        let cost = candidate.cost(lambda);
         if cost < best_cost {
             best_cost = cost;
-            best_bits = bits;
-            best = SaoParam {
-                type_idx: 2,
-                offsets,
-                band_pos: 0,
-                eo_class,
-            };
+            best = candidate;
         }
     }
-    if best.type_idx == 0 {
-        return best;
+    best
+}
+
+/// The best edge-offset parameters of one CTB for the given class.
+fn edge_candidate(
+    plane: SaoPlane<'_>,
+    x0: usize,
+    y0: usize,
+    eo_class: u8,
+    lambda: f32,
+) -> Candidate {
+    let x1 = (x0 + plane.ctb_w).min(plane.width);
+    let y1 = (y0 + plane.ctb_h).min(plane.height);
+    let max_offset = if plane.bit_depth <= 8 { 7 } else { 31 };
+    let (dx, dy) = eo_direction(eo_class);
+    let mut count = [0u32; 4];
+    let mut sum = [0i64; 4];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let xa = x as i32 + dx;
+            let ya = y as i32 + dy;
+            let xb = x as i32 - dx;
+            let yb = y as i32 - dy;
+            // Neighbor availability is the decoder's: the coded picture
+            // (stride × coded_height), not the visible crop.
+            if xa < 0
+                || ya < 0
+                || xb < 0
+                || yb < 0
+                || xa as usize >= plane.stride
+                || xb as usize >= plane.stride
+                || ya as usize >= plane.coded_height
+                || yb as usize >= plane.coded_height
+            {
+                continue;
+            }
+            let idx = y * plane.stride + x;
+            let s = plane.rec[idx];
+            let a = plane.rec[ya as usize * plane.stride + xa as usize];
+            let b = plane.rec[yb as usize * plane.stride + xb as usize];
+            let sign = |p: u16, q: u16| (p > q) as i32 - (p < q) as i32;
+            let edge = sign(s, a) + sign(s, b) + 2;
+            let class = match edge {
+                0 => Some(0),
+                1 => Some(1),
+                3 => Some(2),
+                4 => Some(3),
+                _ => None,
+            };
+            if let Some(class) = class {
+                count[class] += 1;
+                sum[class] += i64::from(plane.original[idx]) - i64::from(s);
+            }
+        }
+    }
+    let mut offsets = [0i8; 4];
+    let mut delta = 0i64;
+    let mut bits = 1 + 2; // type bypass + sao_eo_class
+    for k in 0..4 {
+        let (lo, hi) = if k < 2 {
+            (0, max_offset)
+        } else {
+            (-max_offset, 0)
+        };
+        let (o, class_delta, class_bits) =
+            select_offset(sum[k], count[k], lo, hi, max_offset, lambda, false);
+        offsets[k] = o as i8;
+        delta += class_delta;
+        bits += class_bits;
+    }
+    Candidate {
+        param: SaoParam {
+            type_idx: 2,
+            offsets,
+            band_pos: 0,
+            eo_class,
+        },
+        delta,
+        bits,
+    }
+}
+
+/// Luma SAO parameters of one CTU.
+fn analyze_luma_ctu(plane: SaoPlane<'_>, x0: usize, y0: usize, lambda: f32) -> SaoParam {
+    // OFF codes one context bin. Candidate costs are relative to OFF, so the
+    // type prefix contributes roughly one extra bit for enabled SAO.
+    let mut best = band_candidate(plane, x0, y0, lambda);
+    let mut best_cost = best.cost(lambda).min(0.0);
+    for eo_class in 0..4u8 {
+        let candidate = edge_candidate(plane, x0, y0, eo_class, lambda);
+        let cost = candidate.cost(lambda);
+        if cost < best_cost {
+            best_cost = cost;
+            best = candidate;
+        }
+    }
+    if best_cost >= 0.0 || best.param.type_idx == 0 {
+        return SaoParam::default();
     }
     // The offsets above are chosen in plain SSE, but every other decision of
     // this encoder measures the perceptually weighted error, which discounts
@@ -296,54 +358,93 @@ fn analyze_ctu(
     // the decoder filters it): −0.22% ssimulacra2 / −0.13% CVVDP BD-rate,
     // every image better, no measurable time. Re-choosing among the per-type
     // winners by weighted J measured the same.
-    let (x1, y1) = ((x0 + 64).min(stride), (y0 + 64).min(coded_height));
+    let (stride, coded_height, bit_depth) = (plane.stride, plane.coded_height, plane.bit_depth);
+    let (x1, y1) = (
+        (x0 + plane.ctb_w).min(stride),
+        (y0 + plane.ctb_h).min(coded_height),
+    );
     let (h, w) = (y1 - y0, x1 - x0);
     let max_value = ((1u32 << bit_depth) - 1) as i32;
+    let (original, rec) = (plane.original, plane.rec);
     let off = crate::cost::weighted_sse(h, w, |r, c| {
         let idx = (y0 + r) * stride + x0 + c;
         i32::from(original[idx]) - i32::from(rec[idx])
     });
     let on = crate::cost::weighted_sse(h, w, |r, c| {
         let (y, x) = (y0 + r, x0 + c);
-        let filtered = sao_sample(best, rec, stride, coded_height, x, y, bit_depth, max_value);
+        let filtered = sao_sample(
+            best.param,
+            rec,
+            stride,
+            coded_height,
+            x,
+            y,
+            bit_depth,
+            max_value,
+        );
         i32::from(original[y * stride + x]) - i32::from(filtered)
     });
-    if f64::from(on) + f64::from(lambda) * f64::from(best_bits) < f64::from(off) {
-        best
+    if f64::from(on) + f64::from(lambda) * f64::from(best.bits) < f64::from(off) {
+        best.param
     } else {
         SaoParam::default()
     }
 }
 
-/// Per-CTU luma SAO parameters. Statistics come from the visible
-/// `width × height` samples only; the coded picture (`stride × coded_height`)
-/// bounds edge-offset neighbours, exactly as the decoder classifies them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn analyze_luma(
-    original: &[u16],
-    rec: &[u16],
-    stride: usize,
-    width: usize,
-    height: usize,
-    coded_height: usize,
-    bit_depth: u8,
+/// Joint Cb/Cr SAO parameters of one CTU: the type and the edge class are
+/// shared, so each is chosen on the summed cost of both components, with
+/// their offsets and band positions optimised independently inside it. Cr
+/// carries neither the type bypass bin nor the band/class syntax, so its
+/// candidate bits are reduced accordingly.
+fn analyze_chroma_ctu(
+    cb: SaoPlane<'_>,
+    cr: SaoPlane<'_>,
+    x0: usize,
+    y0: usize,
     lambda: f32,
-) -> Vec<SaoParam> {
-    let cols = width.div_ceil(64);
-    let rows = height.div_ceil(64);
+) -> (SaoParam, SaoParam) {
+    let off = (SaoParam::default(), SaoParam::default());
+    let mut best = off;
+    let mut best_cost = 0.0f64;
+    let (b_cb, b_cr) = (
+        band_candidate(cb, x0, y0, lambda),
+        band_candidate(cr, x0, y0, lambda),
+    );
+    if b_cb.param.type_idx == 1 || b_cr.param.type_idx == 1 {
+        let (mut p_cb, mut p_cr) = (b_cb.param, b_cr.param);
+        p_cb.type_idx = 1;
+        p_cr.type_idx = 1;
+        let bits = b_cb.bits.max(1 + 5) + b_cr.bits.max(1 + 5) - 1;
+        let cost = (b_cb.delta + b_cr.delta) as f64 + f64::from(lambda) * f64::from(bits);
+        if cost < best_cost {
+            best_cost = cost;
+            best = (p_cb, p_cr);
+        }
+    }
+    for eo_class in 0..4u8 {
+        let e_cb = edge_candidate(cb, x0, y0, eo_class, lambda);
+        let e_cr = edge_candidate(cr, x0, y0, eo_class, lambda);
+        let bits = e_cb.bits + e_cr.bits - 3;
+        let cost = (e_cb.delta + e_cr.delta) as f64 + f64::from(lambda) * f64::from(bits);
+        if cost < best_cost {
+            best_cost = cost;
+            best = (e_cb.param, e_cr.param);
+        }
+    }
+    best
+}
+
+/// Per-CTU luma SAO parameters of a picture.
+pub(crate) fn analyze_luma(plane: SaoPlane<'_>, lambda: f32) -> Vec<SaoParam> {
+    let cols = plane.width.div_ceil(plane.ctb_w);
+    let rows = plane.height.div_ceil(plane.ctb_h);
     let mut out = Vec::with_capacity(cols * rows);
     for ry in 0..rows {
         for rx in 0..cols {
-            out.push(analyze_ctu(
-                original,
-                rec,
-                stride,
-                width,
-                height,
-                coded_height,
-                rx * 64,
-                ry * 64,
-                bit_depth,
+            out.push(analyze_luma_ctu(
+                plane,
+                rx * plane.ctb_w,
+                ry * plane.ctb_h,
                 lambda,
             ));
         }
@@ -351,25 +452,23 @@ pub(crate) fn analyze_luma(
     out
 }
 
-pub(crate) fn encode_luma<W: CabacWriter>(
-    enc: &mut W,
-    ctx: &mut ContextSet,
-    param: SaoParam,
-    left_available: bool,
-    up_available: bool,
-    bit_depth: u8,
-) {
-    if left_available {
-        enc.encode_bin(0, &mut ctx.sao_merge_flag);
+/// Per-CTU chroma SAO parameters of a picture, written into `out[i].cb` /
+/// `out[i].cr` (one entry per CTU in raster order).
+pub(crate) fn analyze_chroma(cb: SaoPlane<'_>, cr: SaoPlane<'_>, lambda: f32, out: &mut [SaoCtu]) {
+    let cols = cb.width.div_ceil(cb.ctb_w);
+    let rows = cb.height.div_ceil(cb.ctb_h);
+    debug_assert_eq!(out.len(), cols * rows);
+    for ry in 0..rows {
+        for rx in 0..cols {
+            let (p_cb, p_cr) = analyze_chroma_ctu(cb, cr, rx * cb.ctb_w, ry * cb.ctb_h, lambda);
+            let ctu = &mut out[ry * cols + rx];
+            ctu.cb = p_cb;
+            ctu.cr = p_cr;
+        }
     }
-    if up_available {
-        enc.encode_bin(0, &mut ctx.sao_merge_flag);
-    }
-    enc.encode_bin(u8::from(param.type_idx != 0), &mut ctx.sao_type_idx);
-    if param.type_idx == 0 {
-        return;
-    }
-    enc.encode_bypass(u8::from(param.type_idx == 2));
+}
+
+fn encode_offsets<W: CabacWriter>(enc: &mut W, param: SaoParam, bit_depth: u8) {
     let max = if bit_depth <= 8 { 7 } else { 31 };
     for &offset in &param.offsets {
         let magnitude = i32::from(offset).abs();
@@ -389,37 +488,85 @@ pub(crate) fn encode_luma<W: CabacWriter>(
         for bit in (0..5).rev() {
             enc.encode_bypass((param.band_pos >> bit) & 1);
         }
-    } else {
-        enc.encode_bypass((param.eo_class >> 1) & 1);
-        enc.encode_bypass(param.eo_class & 1);
     }
 }
 
+/// The `sao()` syntax of one CTU (§7.3.8.3). Merge flags are always coded
+/// as 0. `chroma` is `slice_sao_chroma_flag`: Cb carries the shared type and
+/// edge class, Cr only its offsets and band position.
+pub(crate) fn encode_ctu<W: CabacWriter>(
+    enc: &mut W,
+    ctx: &mut ContextSet,
+    param: &SaoCtu,
+    left_available: bool,
+    up_available: bool,
+    bit_depth: u8,
+    chroma: bool,
+) {
+    if left_available {
+        enc.encode_bin(0, &mut ctx.sao_merge_flag);
+    }
+    if up_available {
+        enc.encode_bin(0, &mut ctx.sao_merge_flag);
+    }
+    enc.encode_bin(u8::from(param.y.type_idx != 0), &mut ctx.sao_type_idx);
+    if param.y.type_idx != 0 {
+        enc.encode_bypass(u8::from(param.y.type_idx == 2));
+        encode_offsets(enc, param.y, bit_depth);
+        if param.y.type_idx == 2 {
+            enc.encode_bypass((param.y.eo_class >> 1) & 1);
+            enc.encode_bypass(param.y.eo_class & 1);
+        }
+    }
+    if !chroma {
+        return;
+    }
+    debug_assert_eq!(param.cb.type_idx, param.cr.type_idx);
+    debug_assert!(param.cb.type_idx != 2 || param.cb.eo_class == param.cr.eo_class);
+    enc.encode_bin(u8::from(param.cb.type_idx != 0), &mut ctx.sao_type_idx);
+    if param.cb.type_idx == 0 {
+        return;
+    }
+    enc.encode_bypass(u8::from(param.cb.type_idx == 2));
+    encode_offsets(enc, param.cb, bit_depth);
+    if param.cb.type_idx == 2 {
+        enc.encode_bypass((param.cb.eo_class >> 1) & 1);
+        enc.encode_bypass(param.cb.eo_class & 1);
+    }
+    encode_offsets(enc, param.cr, bit_depth);
+}
+
+/// Apply SAO to one coded plane (`stride × height`, CTBs of `ctb_w × ctb_h`
+/// samples); `param_at(i)` gives the parameters of CTB `i` in raster order.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_luma(
+pub(crate) fn apply_plane(
     plane: &mut [u16],
     stride: usize,
-    width: usize,
     height: usize,
+    ctb_w: usize,
+    ctb_h: usize,
     bit_depth: u8,
-    params: &[SaoParam],
+    param_at: impl Fn(usize) -> SaoParam,
     source_scratch: &mut Vec<u16>,
 ) {
     source_scratch.clear();
-    source_scratch.extend_from_slice(plane);
+    source_scratch.extend_from_slice(&plane[..stride * height]);
     let source: &[u16] = source_scratch;
-    let cols = width.div_ceil(64);
+    let width = stride;
+    let cols = width.div_ceil(ctb_w);
+    let rows = height.div_ceil(ctb_h);
     let max_value = ((1u32 << bit_depth) - 1) as i32;
-    for (index, &param) in params.iter().enumerate() {
+    for index in 0..cols * rows {
+        let param = param_at(index);
         if param.type_idx == 0 {
             continue;
         }
         let rx = index % cols;
         let ry = index / cols;
-        let x0 = rx * 64;
-        let y0 = ry * 64;
-        let x1 = (x0 + 64).min(width);
-        let y1 = (y0 + 64).min(height);
+        let x0 = rx * ctb_w;
+        let y0 = ry * ctb_h;
+        let x1 = (x0 + ctb_w).min(width);
+        let y1 = (y0 + ctb_h).min(height);
         if param.type_idx == 1 {
             let shift = bit_depth - 5;
             for y in y0..y1 {
@@ -435,12 +582,7 @@ pub(crate) fn apply_luma(
                 }
             }
         } else {
-            let (dx, dy): (i32, i32) = match param.eo_class {
-                0 => (1, 0),
-                1 => (0, 1),
-                2 => (1, 1),
-                _ => (1, -1),
-            };
+            let (dx, dy) = eo_direction(param.eo_class);
             for y in y0..y1 {
                 for x in x0..x1 {
                     let xa = x as i32 + dx;
@@ -496,11 +638,120 @@ mod tests {
     fn band_search_finds_quantization_bias() {
         let original = vec![100u16; 64 * 64];
         let rec = vec![96u16; 64 * 64];
-        let p = analyze_luma(&original, &rec, 64, 64, 64, 64, 8, 1.0);
+        let plane = SaoPlane {
+            original: &original,
+            rec: &rec,
+            stride: 64,
+            width: 64,
+            height: 64,
+            coded_height: 64,
+            ctb_w: 64,
+            ctb_h: 64,
+            bit_depth: 8,
+        };
+        let p = analyze_luma(plane, 1.0);
         assert_eq!(p[0].type_idx, 1);
         assert!(p[0].offsets.contains(&4));
         let mut filtered = rec;
-        apply_luma(&mut filtered, 64, 64, 64, 8, &p, &mut Vec::new());
+        apply_plane(&mut filtered, 64, 64, 64, 64, 8, |i| p[i], &mut Vec::new());
         assert_eq!(filtered, original);
+    }
+
+    #[test]
+    fn chroma_search_shares_the_type_and_corrects_both_components() {
+        // 4:2:0 chroma CTBs are 32×32: Cb is biased by −3, Cr by +2.
+        let orig_cb = vec![100u16; 32 * 32];
+        let rec_cb = vec![97u16; 32 * 32];
+        let orig_cr = vec![120u16; 32 * 32];
+        let rec_cr = vec![122u16; 32 * 32];
+        fn plane<'a>(original: &'a [u16], rec: &'a [u16]) -> SaoPlane<'a> {
+            SaoPlane {
+                original,
+                rec,
+                stride: 32,
+                width: 32,
+                height: 32,
+                coded_height: 32,
+                ctb_w: 32,
+                ctb_h: 32,
+                bit_depth: 8,
+            }
+        }
+        let mut params = vec![SaoCtu::default(); 1];
+        analyze_chroma(
+            plane(&orig_cb, &rec_cb),
+            plane(&orig_cr, &rec_cr),
+            1.0,
+            &mut params,
+        );
+        assert_eq!(params[0].cb.type_idx, 1);
+        assert_eq!(params[0].cr.type_idx, 1);
+        let mut cb = rec_cb;
+        let mut cr = rec_cr;
+        apply_plane(
+            &mut cb,
+            32,
+            32,
+            32,
+            32,
+            8,
+            |i| params[i].cb,
+            &mut Vec::new(),
+        );
+        apply_plane(
+            &mut cr,
+            32,
+            32,
+            32,
+            32,
+            8,
+            |i| params[i].cr,
+            &mut Vec::new(),
+        );
+        assert_eq!(cb, orig_cb);
+        assert_eq!(cr, orig_cr);
+    }
+
+    #[test]
+    fn chroma_syntax_codes_cr_offsets_without_type_or_class() {
+        use crate::cabac::CabacEstimator;
+        let mut ctx = ContextSet::init_islice(30);
+        let luma_only = SaoCtu::default();
+        let mut est = CabacEstimator::default();
+        encode_ctu(&mut est, &mut ctx, &luma_only, false, false, 8, false);
+        let luma_bits = est.bits();
+        // Chroma off adds exactly the one context-coded sao_type_idx_chroma bin.
+        let mut ctx2 = ContextSet::init_islice(30);
+        let mut est2 = CabacEstimator::default();
+        encode_ctu(&mut est2, &mut ctx2, &luma_only, false, false, 8, true);
+        assert!(est2.bits() > luma_bits && est2.bits() < luma_bits + 2.0);
+        // Edge offset: Cb carries the class, Cr only four offsets (the
+        // zero offsets cost one bypass bin each).
+        let eo = SaoParam {
+            type_idx: 2,
+            offsets: [1, 0, 0, -1],
+            band_pos: 0,
+            eo_class: 3,
+        };
+        let both = SaoCtu {
+            y: SaoParam::default(),
+            cb: eo,
+            cr: SaoParam {
+                offsets: [0, 0, 0, 0],
+                ..eo
+            },
+        };
+        let mut ctx3 = ContextSet::init_islice(30);
+        let mut est3 = CabacEstimator::default();
+        encode_ctu(&mut est3, &mut ctx3, &both, false, false, 8, true);
+        // luma off + chroma type (1 ctx bin coded as 1, 1 bypass) + Cb offsets
+        // (2+1+1+2 = 6 bypass) + class (2 bypass) + Cr offsets (4 bypass).
+        let type_bits = {
+            let mut ctx = ContextSet::init_islice(30);
+            ctx.sao_type_idx.estimate_and_update(0);
+            ctx.sao_type_idx.estimated_bits(1)
+        };
+        let bypass = 1.0 + 6.0 + 2.0 + 4.0;
+        assert!((est3.bits() - luma_bits - type_bits - bypass).abs() < 0.01);
     }
 }
