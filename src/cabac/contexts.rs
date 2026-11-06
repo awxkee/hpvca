@@ -71,6 +71,10 @@ pub(crate) struct ContextSet {
     // cu_qp_delta_abs (2 contexts), initType0 = {154, 154}. The first unary
     // bin uses context 0 and every subsequent prefix bin uses context 1.
     pub(crate) cu_qp_delta_abs: [CtxModel; 2],
+    /// RExt `cu_chroma_qp_offset_flag` / `cu_chroma_qp_offset_idx` (one
+    /// context each, initValue 154 in every init type).
+    pub(crate) cu_chroma_qp_offset_flag: CtxModel,
+    pub(crate) cu_chroma_qp_offset_idx: CtxModel,
 
     /// Persistent Rice adaptation (RExt): `StatCoeff[k]`, k = 0..3, indexed by
     /// (chroma ? 2 : 0) + (transform-skipped or transquant-bypass ? 1 : 0).
@@ -87,6 +91,14 @@ pub(crate) struct ContextSet {
     /// Whether the PPS sets `transform_skip_enabled_flag`. When set, every 4×4
     /// TB of a non-bypass CU carries a transform_skip_flag (§7.3.8.11).
     pub(crate) transform_skip_enabled: bool,
+    /// Whether the SPS sets `transform_skip_context_enabled_flag` (RExt
+    /// §9.3.4.2.5): transform-skipped and transquant-bypass TBs code every
+    /// sig_coeff_flag with one dedicated context (luma 42, chroma 43) instead
+    /// of the position-dependent ones.
+    pub(crate) transform_skip_context: bool,
+    /// Whether every CU of the picture is transquant-bypass (lossless), the
+    /// other half of the single-context condition above.
+    pub(crate) transquant_bypass: bool,
 
     /// Cross-component prediction (RExt): `log2_res_scale_abs_plus1`
     /// (ctxInc = 4·c + binIdx) and `res_scale_sign_flag` (ctxInc = c), c = 0
@@ -179,7 +191,8 @@ impl ContextSet {
                 qp,
             ),
 
-            // significant_coeff_flag — initType0 row (42 values + 2 pad)
+            // significant_coeff_flag — initType0 row: 42 values + the two RExt
+            // transform_skip_context contexts (luma 141, chroma 111)
             sig_coeff_flag: arr(
                 [
                     111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107,
@@ -209,12 +222,16 @@ impl ContextSet {
             sao_type_idx: c(200, qp),
 
             cu_qp_delta_abs: arr([154, 154], qp),
+            cu_chroma_qp_offset_flag: c(154, qp),
+            cu_chroma_qp_offset_idx: c(154, qp),
 
             // cu_transquant_bypass_flag initValue 154 (all init types).
             stat_coeff: [0; 4],
             persistent_rice: false,
             transform_skip_flag: arr([139, 139], qp),
             transform_skip_enabled: false,
+            transform_skip_context: false,
+            transquant_bypass: false,
             log2_res_scale_abs_plus1: arr([154; 8], qp),
             res_scale_sign_flag: arr([154; 2], qp),
             cross_component: false,
@@ -260,9 +277,10 @@ impl ContextSet {
                 for (slot, &iv) in models.iter_mut().zip(P_SIG_COEFF_FLAG.iter()) {
                     *slot = CtxModel::init(iv, qp);
                 }
-                // The 44-slot array pads the 42 normative values with the last.
-                models[42] = CtxModel::init(P_SIG_COEFF_FLAG[41], qp);
-                models[43] = CtxModel::init(P_SIG_COEFF_FLAG[41], qp);
+                // RExt transform_skip_context contexts, initType 1: 140, 140
+                // (HM INIT_SIG_FLAG).
+                models[42] = CtxModel::init(140, qp);
+                models[43] = CtxModel::init(140, qp);
                 models
             },
             coded_sub_block_flag: arr([121, 140, 61, 154], qp),
@@ -271,10 +289,14 @@ impl ContextSet {
             sao_merge_flag: c(153, qp),
             sao_type_idx: c(185, qp),
             cu_qp_delta_abs: arr([154, 154], qp),
+            cu_chroma_qp_offset_flag: c(154, qp),
+            cu_chroma_qp_offset_idx: c(154, qp),
             stat_coeff: [0; 4],
             persistent_rice,
             transform_skip_flag: arr([139, 139], qp),
             transform_skip_enabled: false,
+            transform_skip_context: false,
+            transquant_bypass: false,
             log2_res_scale_abs_plus1: arr([154; 8], qp),
             res_scale_sign_flag: arr([154; 2], qp),
             cross_component: false,

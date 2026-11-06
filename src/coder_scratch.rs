@@ -56,8 +56,10 @@ pub(crate) struct CoderScratch {
     pub(crate) bv_map: Vec<i32>,
     /// Per-4×4 QpY map for AQ deblocking (empty when AQ is off).
     pub(crate) qp_map: Vec<u8>,
-    /// Padded source luma for the SAO statistics pass.
+    /// Padded source planes for the SAO statistics pass.
     pub(crate) sao_original: Vec<u16>,
+    pub(crate) sao_original_cb: Vec<u16>,
+    pub(crate) sao_original_cr: Vec<u16>,
     /// Pre-filter source snapshot consumed by `sao::apply_luma`.
     pub(crate) sao_apply: Vec<u16>,
     /// Donated YUV conversion planes, reclaimed from the encoded [`crate::Yuv`].
@@ -84,6 +86,8 @@ impl CoderScratch {
             bv_map: Vec::new(),
             qp_map: Vec::new(),
             sao_original: Vec::new(),
+            sao_original_cb: Vec::new(),
+            sao_original_cr: Vec::new(),
             sao_apply: Vec::new(),
             conv_y: Vec::new(),
             conv_cb: Vec::new(),

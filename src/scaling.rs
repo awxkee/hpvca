@@ -65,21 +65,6 @@ use std::sync::OnceLock;
 use crate::hevc::BitWriter;
 use crate::hevc_transform::QUANT_SCALE;
 
-/// HEVC Table 7-6, default 8×8 intra scaling list, raster order (row-major).
-/// Symmetric in (row, col), so the encoder's coefficient orientation and the
-/// decoder's `ScalingFactor[x][y]` agree without a transpose.
-#[rustfmt::skip]
-static DEFAULT_INTRA_8X8: [u8; 64] = [
-    16, 16, 16, 16, 17, 18, 21, 24,
-    16, 16, 16, 16, 17, 19, 22, 25,
-    16, 16, 17, 18, 20, 22, 25, 29,
-    16, 16, 18, 21, 24, 27, 31, 36,
-    17, 17, 20, 24, 30, 35, 41, 47,
-    18, 19, 22, 27, 35, 44, 54, 65,
-    21, 22, 25, 31, 41, 54, 70, 88,
-    24, 25, 29, 36, 47, 65, 88, 115,
-];
-
 /// Up-right diagonal scan of an N×N block (§6.5.3), `(x, y)` per position.
 /// `scaling_list_data()` sends the 4×4 and 8×8 coefficients in this order.
 const fn diag_scan<const N: usize, const NN: usize>() -> [(usize, usize); NN] {
@@ -162,15 +147,9 @@ const DEFAULT_INTER_8X8: [u8; 64] = [
     24, 25, 28, 33, 41, 54, 71, 91,
 ];
 
-/// Which HEVC default matrix the shape comes from: the shipped inter list,
-/// or the intra one for `HPVCA_SL_SHAPE=0` experiments.
+/// The shape's base matrix: the HEVC default inter list.
 fn base_8x8() -> &'static [u8; 64] {
-    static INTRA: OnceLock<bool> = OnceLock::new();
-    if *INTRA.get_or_init(|| std::env::var("HPVCA_SL_SHAPE").as_deref() == Ok("0")) {
-        &DEFAULT_INTRA_8X8
-    } else {
-        &DEFAULT_INTER_8X8
-    }
+    &DEFAULT_INTER_8X8
 }
 
 /// `m = 16 · (D / 16)^s`, clamped to the 1..=255 the syntax can carry.
@@ -330,36 +309,17 @@ const STRENGTH_ZERO_QP: u8 = 40;
 /// the 4×4 optimum is 1.5 on both tiers; 2.0 gives back ss2 at q85–92).
 const LUMA_STRENGTH: Strength = Strength { s8: 1.0, s4: 1.5 };
 
-/// `NAME=a[,b]` as two floats, the second defaulting to the first.
-fn env_pair(name: &str) -> Option<[f32; 2]> {
-    let v = std::env::var(name).ok()?;
-    let mut it = v.split(',').map(|s| s.trim().parse::<f32>().ok());
-    let a = it.next()??;
-    let b = it.next().flatten().unwrap_or(a);
-    Some([a, b])
-}
-
 /// Luma/chroma strengths for a picture QP, or `None` to leave scaling lists
-/// off. `HPVCA_SL=sy[,sc]` (8×8) and `HPVCA_SL4=sy[,sc]` (4×4) override the
-/// table for experiments.
+/// off. Chroma lists stay flat.
 fn strengths_for_qp(qp: u8) -> Option<[Strength; 2]> {
-    static ENV: OnceLock<[Option<[f32; 2]>; 2]> = OnceLock::new();
-    let [env8, env4] = ENV.get_or_init(|| [env_pair("HPVCA_SL"), env_pair("HPVCA_SL4")]);
     let taper = f32::from(STRENGTH_ZERO_QP.saturating_sub(qp.max(FULL_STRENGTH_QP)))
         / f32::from(STRENGTH_ZERO_QP - FULL_STRENGTH_QP);
-    let s8 = env8.unwrap_or([LUMA_STRENGTH.s8 * taper, 0.0]);
-    let s4 = env4.unwrap_or([LUMA_STRENGTH.s4 * taper, 0.0]);
-    let out = [
-        Strength {
-            s8: s8[0],
-            s4: s4[0],
-        },
-        Strength {
-            s8: s8[1],
-            s4: s4[1],
-        },
-    ];
-    out.iter().any(|s| s.s8 > 0.0 || s.s4 > 0.0).then_some(out)
+    let luma = Strength {
+        s8: LUMA_STRENGTH.s8 * taper,
+        s4: LUMA_STRENGTH.s4 * taper,
+    };
+    let chroma = Strength { s8: 0.0, s4: 0.0 };
+    (luma.s8 > 0.0 || luma.s4 > 0.0).then_some([luma, chroma])
 }
 
 /// The picture's scaling lists for a picture QP (`None` = flat, flag off).

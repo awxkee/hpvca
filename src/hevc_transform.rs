@@ -29,10 +29,10 @@
 
 //! Spec-faithful HEVC integer transform, quantization, and dequantization.
 
-use crate::cabac::residual::sig_coeff_ctx;
+use crate::cabac::residual::{sig_coeff_ctx, single_sig_coeff_ctx};
 use crate::cabac::{ContextSet, MAX_PERSISTENT_RICE};
 use crate::scaling::ScalingTable;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 /// 4×4 HEVC transform matrix.
 pub(crate) static T4: [[i32; 4]; 4] = [
@@ -136,7 +136,6 @@ pub(crate) struct RdoqScratch {
     pub(crate) perceptual: bool,
     /// Whether the sign-data-hiding parity repair is RD-priced
     /// (`rd_sign_hiding_repair`) instead of error-only (`Speed::rd_sign_hiding`).
-    /// `HPVCA_SBH_RD` overrides it in both directions for experiments.
     pub(crate) rd_sign_hiding: bool,
     cost_coeff: [f32; MAX_TB],
     cost_coeff0: [f32; MAX_TB],
@@ -706,6 +705,16 @@ fn fwd_transform_32(res: &[i32], bit_depth: u8, out: &mut [i32; MAX_TB], tmp: &m
     }
 }
 
+/// Starting Rice parameter of a coefficient group under persistent Rice
+/// adaptation (RExt §9.3.3.11). The statistic is banked by component and by
+/// whether the block is transformed; RDOQ never sees transquant-bypass blocks,
+/// so transform skip alone selects the "non-transformed" bank — the same index
+/// `encode_residual` updates when the levels are coded.
+#[inline]
+fn persistent_rice_seed(ctx: &ContextSet, is_luma: bool, transform_skip: bool) -> u32 {
+    u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2 + usize::from(transform_skip)] / 4)
+}
+
 #[inline]
 fn coeff_remaining_bits(value: u32, rice: u32) -> f32 {
     if value < (4u32 << rice) {
@@ -867,6 +876,10 @@ pub(crate) struct RdoqTb<'a> {
     /// The picture's scaling list for this TB size and component, `None`
     /// when flat.
     pub scaling: Option<&'a ScalingTable>,
+    /// Whether the TB is transform-skipped: with RExt
+    /// `transform_skip_context_enabled_flag` its sig_coeff_flags are priced
+    /// on the dedicated single context.
+    pub transform_skip: bool,
 }
 
 /// Per-coefficient quantizer multiplier and scaling factor of a TB: the flat
@@ -939,9 +952,11 @@ fn rdoq_with_sign_hiding_into(
         scan_idx,
         lambda,
         scaling,
+        transform_skip,
     } = *tb;
     let lambda = lambda * rdoq_lambda_scale();
     let weights = rdoq_weights_for(n, is_luma, scratch.perceptual);
+    let single_sig_ctx = ctx.transform_skip_context && (transform_skip || ctx.transquant_bypass);
     const GROUP_SIZE: usize = 16;
     const C1_FLAGS: u32 = 8;
 
@@ -1000,13 +1015,12 @@ fn rdoq_with_sign_hiding_into(
         let mut c1_idx = 0u32;
         let mut c2_idx = 0u32;
         // Persistent Rice adaptation seeds each coefficient group from the
-        // running statistic instead of 0. RDOQ is lossy-only (transquant-bypass
-        // blocks never reach it), so the statistic index is the "transformed"
-        // half. The statistic itself is not updated here: RDOQ prices a single
-        // candidate block, and the real update happens when the chosen levels
-        // are coded.
+        // running statistic instead of 0, read from the same bank the emitter
+        // uses (see [`persistent_rice_seed`]). The statistic itself is not
+        // updated here: RDOQ prices a single candidate block, and the real
+        // update happens when the chosen levels are coded.
         let mut rice = if ctx.persistent_rice {
-            u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+            persistent_rice_seed(ctx, is_luma, transform_skip)
         } else {
             0
         };
@@ -1041,8 +1055,12 @@ fn rdoq_with_sign_hiding_into(
                 last_group = group;
             }
             let is_last = last_scan_pos == Some(scan_pos);
-            let sig_ctx = sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
-                .min(ctx.sig_coeff_flag.len() - 1);
+            let sig_ctx = if single_sig_ctx {
+                single_sig_coeff_ctx(is_luma)
+            } else {
+                sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
+                    .min(ctx.sig_coeff_flag.len() - 1)
+            };
             let sig0 = if is_last {
                 0.0
             } else {
@@ -1248,37 +1266,14 @@ fn rdoq_with_sign_hiding_into(
             levels[pos] = -levels[pos];
         }
     }
-    let stat = sbh_stat_enabled();
-    let rd_mode = sbh_rd_mode(rd_sign_hiding);
-    let rd = rd_mode != 0;
-    if !stat && !rd {
+    if !rd_sign_hiding {
         apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan, scaling);
         return;
     }
-    let p = FrozenTbCost {
-        is_luma,
-        cbf_depth,
-        weights,
-    };
-    let pre = *levels;
-    if rd {
-        let p_repair = if rd_mode == 2 {
-            FrozenTbCost { weights: None, ..p }
-        } else {
-            p
-        };
-        rd_sign_hiding_repair(tb, levels, ctx, &p_repair);
-    }
+    let p = FrozenTbCost { is_luma, weights };
+    rd_sign_hiding_repair(tb, levels, ctx, &p);
     // Safety net: a no-op once every eligible group's parity holds.
-    let mid = *levels;
     apply_sign_hiding_to_levels(levels, coeff, n, qp, bit_depth, scan, scaling);
-    if rd && stat && mid[..n * n] != levels[..n * n] {
-        sbh_stats().net_fired += 1;
-    }
-    if stat {
-        let untruncated = best_last_p1 == initial_last + 1;
-        sbh_stat_record(tb, &pre, levels, ctx, &p, untruncated.then_some(best_cost));
-    }
 }
 
 /// Winner-only RDOQ for a committed luma mode.
@@ -1603,6 +1598,66 @@ pub(crate) fn transform_skip_inv_into(coeff: &[i32], n: usize, bit_depth: u8, ou
     }
 }
 
+/// Closed-loop quantization of a transform-skipped intra TB under implicit
+/// RDPCM (RExt §8.6.8 applied to lossy transform skip): along each
+/// prediction line (`vertical` = mode 26, else mode 10) the decoder adds the
+/// reconstructed residual of the previous sample, so every sample is quantized
+/// against its reconstructed predecessor, exactly as HM's
+/// `applyForwardRDPCM` does (`transformSkipQuantOneSample` with the
+/// half-rounding offset, then `invTrSkipDeQuantOneSample`). `rotate` is
+/// `transform_skip_rotation_enabled_flag`: coefficient position
+/// `n² − 1 − p` carries sample `p` (§8.6.4.2), which also selects the scaling
+/// list entry. Writes the raster coefficient levels to `levels` and the
+/// reconstructed raster residual to `inverse`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rdpcm_transform_skip_quantize_into(
+    residual: &[i32],
+    n: usize,
+    qp: u8,
+    bit_depth: u8,
+    scaling: Option<&ScalingTable>,
+    vertical: bool,
+    rotate: bool,
+    levels: &mut [i16; MAX_TB],
+    inverse: &mut [i32; MAX_TB],
+) {
+    let len = n * n;
+    debug_assert!(residual.len() >= len);
+    let log2n = n.trailing_zeros() as i64;
+    let bd = i64::from(bit_depth);
+    let fwd_shift = 15 - bd - log2n;
+    let q_bits = 14 + i64::from(qp) / 6 + fwd_shift;
+    let cs = CoeffScale::new(qp, scaling);
+    let half = 1i64 << (q_bits - 1);
+    let dq_shift = bd + log2n - 5;
+    let dq_add = 1i64 << (dq_shift - 1);
+    let dq_factor = DEQUANT_SCALE[(qp % 6) as usize] << (i64::from(qp) / 6);
+    let ts_shift = 5 + log2n;
+    let bd_shift = 20 - bd;
+    let bd_add = 1i64 << (bd_shift - 1);
+    for line in 0..n {
+        let mut accumulator = 0i64;
+        for step in 0..n {
+            let pos = if vertical {
+                step * n + line
+            } else {
+                line * n + step
+            };
+            let coeff_pos = if rotate { len - 1 - pos } else { pos };
+            let delta = i64::from(residual[pos]) - accumulator;
+            let scaled = (delta.abs() << fwd_shift) * cs.qs(coeff_pos);
+            let magnitude = ((scaled + half) >> q_bits).min(i64::from(i16::MAX));
+            let level = if delta < 0 { -magnitude } else { magnitude };
+            levels[coeff_pos] = level as i16;
+            let dequant =
+                ((level * cs.m(coeff_pos) * dq_factor + dq_add) >> dq_shift).clamp(-32768, 32767);
+            let reconstructed = ((dequant << ts_shift) + bd_add) >> bd_shift;
+            accumulator += reconstructed;
+            inverse[pos] = accumulator as i32;
+        }
+    }
+}
+
 /// Inverse integer transform (spec 8.6.4.2) into reusable output/intermediate
 /// buffers. Only the first `n*n` entries are touched.
 #[inline]
@@ -1806,6 +1861,58 @@ fn inv_transform_32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdpcm_transform_skip_quantizer_reconstructs_closed_loop() {
+        // A horizontal ramp under horizontal RDPCM: every delta is the same,
+        // so the decoder's accumulation must land within one quantization
+        // step of the original at every sample, with no drift along the line.
+        let mut residual = [0i32; MAX_TB];
+        for row in 0..4 {
+            for col in 0..4 {
+                residual[row * 4 + col] = 5 * col as i32 + row as i32 - 3;
+            }
+        }
+        for rotate in [false, true] {
+            let mut levels = [0i16; MAX_TB];
+            let mut inverse = [0i32; MAX_TB];
+            rdpcm_transform_skip_quantize_into(
+                &residual,
+                4,
+                20,
+                8,
+                None,
+                false,
+                rotate,
+                &mut levels,
+                &mut inverse,
+            );
+            // Decoder model: un-rotate, dequantize, transform-skip scale, then
+            // accumulate left to right.
+            let mut recon = [0i32; 16];
+            for (pos, r) in recon.iter_mut().enumerate() {
+                let coeff_pos = if rotate { 15 - pos } else { pos };
+                let d = i64::from(levels[coeff_pos]) * 16 * (DEQUANT_SCALE[20 % 6] << 3);
+                let d = (d + (1 << 4)) >> 5; // bdShift = 8 + 2 − 5
+                *r = (((d << 7) + (1 << 11)) >> 12) as i32;
+            }
+            for row in 0..4 {
+                for col in 1..4 {
+                    recon[row * 4 + col] += recon[row * 4 + col - 1];
+                }
+            }
+            assert_eq!(&recon[..], &inverse[..16]);
+            let step = 1 << (20 / 6); // QP 20: step ≈ 2^(QP/6) · 1.26
+            for pos in 0..16 {
+                assert!(
+                    (recon[pos] - residual[pos]).abs() <= step,
+                    "pos {pos}: {} vs {}",
+                    recon[pos],
+                    residual[pos]
+                );
+            }
+        }
+    }
 
     #[test]
     fn transform_skip_scaling_round_trips() {
@@ -2074,6 +2181,7 @@ mod tests {
             scan_idx,
             lambda,
             scaling: None,
+            transform_skip: false,
         };
         rdoq_luma_with_sign_hiding_into(&tb, ctx, &mut levels, &mut scratch);
         levels
@@ -2099,6 +2207,7 @@ mod tests {
             scan_idx: 0,
             lambda: 0.57 * 2f32.powf((22.0 - 12.0) / 3.0),
             scaling: None,
+            transform_skip: false,
         };
         rdoq_chroma_with_sign_hiding_into(&tb, &ctx, &mut levels, &mut scratch);
         assert!(levels[..16].iter().any(|&level| level != 0));
@@ -2321,98 +2430,9 @@ pub(crate) fn quantized_tb_stats(
     stats
 }
 
-// ---------------------------------------------------------------------------
-// Measurement: cost of the post-hoc sign-hiding repair.
-//
-// Enabled with `HPVCA_SBH_STAT=1`. Prices the RDOQ winner under the frozen
-// context model (the same estimator RDOQ optimizes against) immediately before
-// and after `apply_sign_hiding_to_levels`, and accumulates the difference in
-// λ-normalized bits. The "before" cost credits the hidden sign bit as if parity
-// were already satisfied, so the accumulated delta is an upper bound on what a
-// parity-aware joint optimizer could recover relative to the current pipeline.
-// ---------------------------------------------------------------------------
-
-// A mutex rather than 64-bit atomics: those are missing on 32-bit targets such
-// as powerpc, and the lock is only taken when `HPVCA_SBH_STAT` is set.
-static SBH_STATS: Mutex<SbhRepairStats> = Mutex::new(SbhRepairStats::ZERO);
-static SBH_STAT_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn sbh_stats() -> MutexGuard<'static, SbhRepairStats> {
-    SBH_STATS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn sbh_stat_enabled() -> bool {
-    *SBH_STAT_ENABLED.get_or_init(|| std::env::var("HPVCA_SBH_STAT").is_ok())
-}
-
-/// Accumulated sign-hiding repair statistics (see [`sbh_repair_stats_take`]).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SbhRepairStats {
-    /// Lossy TBs that reached the repair step with at least one level.
-    pub tbs: u64,
-    /// TBs whose levels were changed by the repair.
-    pub tbs_repaired: u64,
-    /// Coefficient groups eligible for sign hiding before repair.
-    pub groups_eligible: u64,
-    /// Eligible groups whose parity disagreed with the hidden sign.
-    pub groups_violating: u64,
-    /// Estimated λ-normalized cost (bits) of all winners before repair.
-    pub pre_bits: f64,
-    /// Same after repair.
-    pub post_bits: f64,
-    /// Sum of positive per-TB deltas (repair made the TB worse), bits.
-    pub delta_pos_bits: f64,
-    /// Sum of negative per-TB deltas (repair happened to improve), bits.
-    pub delta_neg_bits: f64,
-    /// Distortion part of the delta, λ-normalized bits.
-    pub delta_dist_bits: f64,
-    /// Rate part of the delta, bits.
-    pub delta_rate_bits: f64,
-    /// Frozen-model rate (bits, sign hiding credited) of all winners before repair.
-    pub pre_rate_bits: f64,
-    /// Untruncated TBs where the evaluator was compared against RDOQ's own cost.
-    pub checked: u64,
-    /// Of those, TBs where the two disagreed by more than 0.01 bits.
-    pub mismatch: u64,
-    /// Largest disagreement seen, bits.
-    pub mismatch_max_bits: f64,
-    /// TBs where the HDQ safety net still changed a level after the RD repair.
-    pub net_fired: u64,
-    /// Winning RD-repair candidate classes: 0 nz toward real value, 1 nz away,
-    /// 2 zero inside span, 3 zero above last, 4 zero below first.
-    pub class: [u64; 5],
-}
-
-impl SbhRepairStats {
-    const ZERO: Self = Self {
-        tbs: 0,
-        tbs_repaired: 0,
-        groups_eligible: 0,
-        groups_violating: 0,
-        pre_bits: 0.0,
-        post_bits: 0.0,
-        delta_pos_bits: 0.0,
-        delta_neg_bits: 0.0,
-        delta_dist_bits: 0.0,
-        delta_rate_bits: 0.0,
-        pre_rate_bits: 0.0,
-        checked: 0,
-        mismatch: 0,
-        mismatch_max_bits: 0.0,
-        net_fired: 0,
-        class: [0; 5],
-    };
-}
-
-/// Take and reset the accumulated repair statistics.
-pub fn sbh_repair_stats_take() -> SbhRepairStats {
-    std::mem::replace(&mut *sbh_stats(), SbhRepairStats::ZERO)
-}
-
 #[derive(Clone, Copy)]
 struct FrozenTbCost {
     is_luma: bool,
-    cbf_depth: usize,
     /// RDOQ distortion weights (`rdoq_weights_for`); `None` is plain SSE.
     weights: Option<&'static [f32]>,
 }
@@ -2486,7 +2506,7 @@ fn price_group(
     let mut c1_idx = 0u32;
     let mut c2_idx = 0u32;
     let mut rice = if ctx.persistent_rice {
-        u32::from(ctx.stat_coeff[usize::from(!is_luma) * 2] / 4)
+        persistent_rice_seed(ctx, is_luma, tb.transform_skip)
     } else {
         0
     };
@@ -2511,8 +2531,14 @@ fn price_group(
             bits += match sig_bits {
                 Some(t) => t[k][(level != 0) as usize],
                 None => {
-                    let sig_ctx = sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
-                        .min(ctx.sig_coeff_flag.len() - 1);
+                    let sig_ctx = if ctx.transform_skip_context
+                        && (tb.transform_skip || ctx.transquant_bypass)
+                    {
+                        single_sig_coeff_ctx(is_luma)
+                    } else {
+                        sig_coeff_ctx(col, row, prev_csbf, log2_size, scan_idx, is_luma)
+                            .min(ctx.sig_coeff_flag.len() - 1)
+                    };
                     ctx.sig_coeff_flag[sig_ctx].estimated_bits((level != 0) as u8)
                 }
             };
@@ -2576,103 +2602,10 @@ fn group_csbf_neighbors(
     }
 }
 
-/// Price a complete level set under the frozen context model RDOQ uses.
-/// Returns `(distortion, bits)`; `bits` includes cbf, last position, coded
-/// sub-block flags, significance, levels and one sign bit per non-zero level,
-/// minus one for every group eligible for sign hiding when `hide_signs`.
-fn frozen_tb_cost(
-    tb: &RdoqTb<'_>,
-    levels: &[i16; MAX_TB],
-    ctx: &ContextSet,
-    p: &FrozenTbCost,
-    hide_signs: bool,
-) -> (f32, f32) {
-    const GROUP_SIZE: usize = 16;
-    let RdoqTb {
-        n, scan, scan_idx, ..
-    } = *tb;
-    let is_luma = p.is_luma;
-    let num_coeffs = n * n;
-    let log2_size = n.trailing_zeros();
-    let num_groups = num_coeffs / GROUP_SIZE;
-
-    let mut dist = 0.0f32;
-    for group in 0..num_groups {
-        dist += group_dist(tb, levels, p, group);
-    }
-    let last_scan_pos = (0..num_coeffs).rev().find(|&sp| {
-        let (row, col) = scan[sp];
-        levels[row * n + col] != 0
-    });
-    let cbf = if is_luma {
-        ctx.cbf_luma[if p.cbf_depth == 0 { 1 } else { 0 }]
-    } else {
-        ctx.cbf_chroma[p.cbf_depth.min(4)]
-    };
-    let Some(last) = last_scan_pos else {
-        return (dist, cbf.estimated_bits(0));
-    };
-    let mut bits = cbf.estimated_bits(1);
-    {
-        let (row, col) = scan[last];
-        bits += last_sig_bits(ctx, col, row, log2_size, scan_idx, is_luma);
-    }
-    let last_group = last / GROUP_SIZE;
-    let mut prev_csbf = [0u8; 64];
-    group_csbf_neighbors(tb, levels, last_group, &mut prev_csbf);
-    let mut carry_c1 = 1i32;
-    for group in (0..=last_group).rev() {
-        let (b, carry) = price_group(
-            tb,
-            levels,
-            ctx,
-            p,
-            group,
-            last_group,
-            last,
-            prev_csbf[group],
-            carry_c1,
-            hide_signs,
-            None,
-        );
-        bits += b;
-        carry_c1 = carry;
-    }
-    (dist, bits)
-}
-
-static SBH_RD_MODE: OnceLock<Option<u8>> = OnceLock::new();
-
-/// `HPVCA_SBH_RD` override: unset = the tier's choice (`RdoqScratch::rd_sign_hiding`),
-/// 0 = HDQ repair, 1 = RD repair with RDOQ's weighted distortion, 2 = RD repair
-/// with plain SSE distortion.
-fn sbh_rd_env() -> Option<u8> {
-    *SBH_RD_MODE.get_or_init(|| {
-        std::env::var("HPVCA_SBH_RD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
-}
-
-/// Effective repair mode for a TB: 0 = HDQ, 1 = RD weighted, 2 = RD plain SSE.
-fn sbh_rd_mode(tier_rd: bool) -> u8 {
-    sbh_rd_env().unwrap_or(tier_rd as u8)
-}
-
-static SBH_RD_TOP_M: OnceLock<usize> = OnceLock::new();
-
-/// `HPVCA_SBH_RD_TOPM`: candidates fully priced per group after proxy
-/// ranking; 0 prices every legal candidate. Measured (8 images, Fast 4:2:0,
-/// ssimulacra2 BD-rate vs the HDQ repair): exhaustive −0.81%, 8 −0.75%,
-/// 4 −0.83%, all within noise, so 4 is the default.
-fn sbh_rd_top_m() -> usize {
-    *SBH_RD_TOP_M.get_or_init(|| {
-        std::env::var("HPVCA_SBH_RD_TOPM")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
-    })
-}
+/// Candidates fully priced per group after proxy ranking. Measured (8 images,
+/// Fast 4:2:0, ssimulacra2 BD-rate vs the HDQ repair): exhaustive −0.81%,
+/// 8 −0.75%, 4 −0.83%, all within noise, so 4 it is.
+const SBH_RD_TOP_M: usize = 4;
 
 /// Rate-distortion aware sign-data-hiding repair.
 ///
@@ -2700,7 +2633,6 @@ fn rd_sign_hiding_repair(
     let lambda = tb.lambda * rdoq_lambda_scale();
     let log2_size = n.trailing_zeros();
     let num_coeffs = n * n;
-    let q_bits = 14 + tb.qp as i64 / 6 + (15 - tb.bit_depth as i64 - log2_size as i64);
     let cs = CoeffScale::new(tb.qp, tb.scaling);
     let idx = |sp: usize| {
         let (row, col) = scan[sp];
@@ -2783,8 +2715,12 @@ fn rd_sign_hiding_repair(
         let mut sig_bits = [[0f32; 2]; GROUP_SIZE];
         for (k, sb) in sig_bits.iter_mut().enumerate() {
             let (row, col) = scan[gs + k];
-            let c = sig_coeff_ctx(col, row, prev_csbf[group], log2_size, scan_idx, p.is_luma)
-                .min(ctx.sig_coeff_flag.len() - 1);
+            let c = if ctx.transform_skip_context && (tb.transform_skip || ctx.transquant_bypass) {
+                single_sig_coeff_ctx(p.is_luma)
+            } else {
+                sig_coeff_ctx(col, row, prev_csbf[group], log2_size, scan_idx, p.is_luma)
+                    .min(ctx.sig_coeff_flag.len() - 1)
+            };
             *sb = [
                 ctx.sig_coeff_flag[c].estimated_bits(0),
                 ctx.sig_coeff_flag[c].estimated_bits(1),
@@ -2819,7 +2755,7 @@ fn rd_sign_hiding_repair(
             ctx_set += 1;
         }
         let rice0 = if ctx.persistent_rice {
-            u32::from(ctx.stat_coeff[usize::from(!p.is_luma) * 2] / 4)
+            persistent_rice_seed(ctx, p.is_luma, tb.transform_skip)
         } else {
             0
         };
@@ -2874,7 +2810,7 @@ fn rd_sign_hiding_repair(
         };
 
         // Enumerate legal single ±1 changes with a proxy cost.
-        let mut cands: [(f32, u8, i16, u8); 2 * GROUP_SIZE] = [(0.0, 0, 0, 0); 2 * GROUP_SIZE];
+        let mut cands: [(f32, u8, i16); 2 * GROUP_SIZE] = [(0.0, 0, 0); 2 * GROUP_SIZE];
         let mut ncand = 0usize;
         for k in 0..=search_top {
             let pos = idx(gs + k);
@@ -2918,37 +2854,20 @@ fn rd_sign_hiding_repair(
                 ) * weight[k]
                     - dist_k[k];
                 let dr = own_bits(k, new) - own_bits(k, old);
-                let class = if old != 0 {
-                    let toward = ((coeff[pos] as i64).abs() * cs.qs(pos)
-                        > (old.unsigned_abs() as i64) << q_bits)
-                        == (dir > 0);
-                    (!toward) as u8
-                } else if k > last_k {
-                    3
-                } else if k < first_k {
-                    4
-                } else {
-                    2
-                };
-                cands[ncand] = (dd + lambda * dr, k as u8, new, class);
+                cands[ncand] = (dd + lambda * dr, k as u8, new);
                 ncand += 1;
             }
         }
         let cands = &mut cands[..ncand];
-        let top_m = sbh_rd_top_m();
-        if top_m != 0 && cands.len() > top_m {
-            cands.select_nth_unstable_by(top_m - 1, |a, b| a.0.total_cmp(&b.0));
+        if cands.len() > SBH_RD_TOP_M {
+            cands.select_nth_unstable_by(SBH_RD_TOP_M - 1, |a, b| a.0.total_cmp(&b.0));
         }
-        let n_full = if top_m == 0 {
-            cands.len()
-        } else {
-            cands.len().min(top_m)
-        };
+        let n_full = cands.len().min(SBH_RD_TOP_M);
 
         // Full pricing of the shortlisted candidates under the group model.
         let mut best_cost = f32::MAX;
         let mut best = None;
-        for &(_, k, new, class) in cands[..n_full].iter() {
+        for &(_, k, new) in cands[..n_full].iter() {
             let k = k as usize;
             let pos = idx(gs + k);
             let old = levels[pos];
@@ -2983,14 +2902,11 @@ fn rd_sign_hiding_repair(
             let cost = group_dist(tb, levels, p, group) + lambda * bits;
             if cost < best_cost {
                 best_cost = cost;
-                best = Some((pos, new, new_last, carry_out, class as usize));
+                best = Some((pos, new, new_last, carry_out));
             }
             levels[pos] = old;
         }
-        if let Some((pos, new, new_last, carry_out, class)) = best {
-            if sbh_stat_enabled() {
-                sbh_stats().class[class] += 1;
-            }
+        if let Some((pos, new, new_last, carry_out)) = best {
             levels[pos] = new;
             last = new_last;
             if group > 0 {
@@ -2998,79 +2914,4 @@ fn rd_sign_hiding_repair(
             }
         }
     }
-}
-
-/// Count sign-hiding-eligible groups and those whose parity would need repair.
-fn sbh_group_census(tb: &RdoqTb<'_>, levels: &[i16; MAX_TB]) -> (u64, u64) {
-    const GROUP_SIZE: usize = 16;
-    let n = tb.n;
-    let mut eligible = 0;
-    let mut violating = 0;
-    for group in 0..(n * n / GROUP_SIZE) {
-        let idx = |k: usize| {
-            let (row, col) = tb.scan[group * GROUP_SIZE + k];
-            row * n + col
-        };
-        let Some(first) = (0..GROUP_SIZE).find(|&k| levels[idx(k)] != 0) else {
-            continue;
-        };
-        let last = (0..GROUP_SIZE)
-            .rev()
-            .find(|&k| levels[idx(k)] != 0)
-            .unwrap();
-        if last - first < 4 {
-            continue;
-        }
-        eligible += 1;
-        let sum: i32 = (first..=last).map(|k| levels[idx(k)] as i32).sum();
-        let sign_bit = (levels[idx(first)] < 0) as i32;
-        if sign_bit != (sum & 1) {
-            violating += 1;
-        }
-    }
-    (eligible, violating)
-}
-
-fn sbh_stat_record(
-    tb: &RdoqTb<'_>,
-    pre: &[i16; MAX_TB],
-    post: &[i16; MAX_TB],
-    ctx: &ContextSet,
-    p: &FrozenTbCost,
-    rdoq_cost: Option<f32>,
-) {
-    let lambda = tb.lambda * rdoq_lambda_scale();
-    if let Some(rdoq_cost) = rdoq_cost {
-        let (d, r) = frozen_tb_cost(tb, pre, ctx, p, false);
-        let diff = ((d + lambda * r) - rdoq_cost) / lambda;
-        let mut s = sbh_stats();
-        s.checked += 1;
-        if diff.abs() > 0.01 {
-            s.mismatch += 1;
-            s.mismatch_max_bits = s.mismatch_max_bits.max(diff.abs() as f64);
-        }
-    }
-    let (d0, r0) = frozen_tb_cost(tb, pre, ctx, p, true);
-    let (d1, r1) = frozen_tb_cost(tb, post, ctx, p, true);
-    let pre_bits = d0 / lambda + r0;
-    let post_bits = d1 / lambda + r1;
-    let delta = post_bits - pre_bits;
-    let (eligible, violating) = sbh_group_census(tb, pre);
-    let nn = tb.n * tb.n;
-    let changed = pre[..nn] != post[..nn];
-    let mut s = sbh_stats();
-    s.tbs += 1;
-    s.tbs_repaired += changed as u64;
-    s.groups_eligible += eligible;
-    s.groups_violating += violating;
-    s.pre_bits += pre_bits as f64;
-    s.pre_rate_bits += r0 as f64;
-    s.post_bits += post_bits as f64;
-    if delta >= 0.0 {
-        s.delta_pos_bits += delta as f64;
-    } else {
-        s.delta_neg_bits += delta as f64;
-    }
-    s.delta_dist_bits += ((d1 - d0) / lambda) as f64;
-    s.delta_rate_bits += (r1 - r0) as f64;
 }

@@ -63,8 +63,6 @@ pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunc
 pub use error::EncodeError;
 pub use fmt::{BitDepth, ChromaFormat};
 pub use gain_map::{GainMap, GainMapPixels, IsoGainMap, apple_decode, apple_encode};
-#[doc(hidden)]
-pub use hevc_transform::{SbhRepairStats, sbh_repair_stats_take};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use yuv::Yuv;
 
@@ -168,7 +166,7 @@ pub struct EncodeConfig {
     /// How the picture is parallelized and packaged. See [`ParallelismStrategy`];
     /// defaults to [`ParallelismStrategy::Wpp`].
     pub parallelism: ParallelismStrategy,
-    /// Enable luma Sample Adaptive Offset filtering. Its parameters are chosen
+    /// Enable Sample Adaptive Offset filtering (luma and chroma). Its parameters are chosen
     /// after the picture is coded and spliced in by replaying the recorded
     /// CABAC bins, so it costs only the analysis and the replay (a few percent
     /// of encode time) plus ~2 bytes of memory per coded bin while a region is
@@ -183,6 +181,8 @@ pub struct EncodeConfig {
     pub screen_content: bool,
     /// Enable `implicit_rdpcm_enabled_flag` for lossless coding. Off by
     /// default; see [`with_implicit_rdpcm`](EncodeConfig::with_implicit_rdpcm).
+    /// Lossy pictures use the tool on their transform-skipped blocks
+    /// regardless, wherever the profile already permits it (4:4:4).
     pub implicit_rdpcm: bool,
     /// Enable `persistent_rice_adaptation_enabled_flag` where the profile
     /// permits it. On by default; see
@@ -241,7 +241,7 @@ impl EncodeConfig {
         self
     }
 
-    /// Enable or disable luma Sample Adaptive Offset filtering.
+    /// Enable or disable Sample Adaptive Offset filtering (luma and chroma).
     pub fn with_sao(mut self, sao: bool) -> Self {
         self.sao = sao;
         self
@@ -265,7 +265,10 @@ impl EncodeConfig {
     }
 
     /// Enable implicit residual DPCM for lossless coding (HEVC Range
-    /// Extensions `implicit_rdpcm_enabled_flag`).
+    /// Extensions `implicit_rdpcm_enabled_flag`), together with the 4×4
+    /// residual rotation (`transform_skip_rotation_enabled_flag`) and the
+    /// single significance context (`transform_skip_context_enabled_flag`)
+    /// of the same tool set.
     pub fn with_implicit_rdpcm(mut self, implicit_rdpcm: bool) -> Self {
         self.implicit_rdpcm = implicit_rdpcm;
         self
@@ -1064,6 +1067,7 @@ fn encode_yuv_raw(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError>
         0,
         None,
         None,
+        None,
         cfg.screen_content,
         cfg.implicit_rdpcm,
         cfg.persistent_rice,
@@ -1172,7 +1176,8 @@ where
 }
 
 /// Picture-wide decisions for a grid, made once on the full source: the
-/// per-QG AQ map, the Cb/Cr QP offset and `transform_skip_enabled_flag`.
+/// per-QG AQ map, the Cb/Cr QP offset, `transform_skip_enabled_flag` and the
+/// screen-content classification behind the lossless RExt tool gating.
 /// Every tile item decodes with tile 0's hvcC, so anything that lands in the
 /// SPS/PPS must come from here, never from a cell's own content (an edge
 /// cell's replicated padding looks like screen content).
@@ -1186,11 +1191,8 @@ fn grid_global_aq_map(
     chroma: ChromaFormat,
     quality: u8,
     lossless: bool,
-) -> (Option<Vec<i8>>, i8, bool) {
+) -> (Option<Vec<i8>>, i8, bool, bool) {
     let qp = hevc::quality_to_qp(quality);
-    if lossless {
-        return (None, 0, false);
-    }
     let luma_yuv = if channels == 2 {
         // Interleaved gray+alpha: analysis wants the luma channel only.
         let y: Vec<u16> = src.iter().step_by(2).copied().collect();
@@ -1205,10 +1207,14 @@ fn grid_global_aq_map(
             &yuv::YcbcrMatrix::new(None, bit_depth),
         )
     };
+    let screen = hevc::screen_like(&luma_yuv);
+    if lossless {
+        return (None, 0, false, screen);
+    }
     let cqo = hevc::adaptive_chroma_qp_offset(&luma_yuv, chroma, false);
     let transform_skip = hevc::transform_skip_for(&luma_yuv, qp, false);
     let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(&luma_yuv, qp));
-    (map, cqo, transform_skip)
+    (map, cqo, transform_skip, screen)
 }
 
 /// [`grid_global_aq_map`] for a source that is already a [`Yuv`].
@@ -1216,15 +1222,16 @@ fn grid_global_aq_map_from_yuv(
     yuv: &Yuv,
     quality: u8,
     lossless: bool,
-) -> (Option<Vec<i8>>, i8, bool) {
+) -> (Option<Vec<i8>>, i8, bool, bool) {
     let qp = hevc::quality_to_qp(quality);
+    let screen = hevc::screen_like(yuv);
     if lossless {
-        return (None, 0, false);
+        return (None, 0, false, screen);
     }
     let cqo = hevc::adaptive_chroma_qp_offset(yuv, yuv.chroma, false);
     let transform_skip = hevc::transform_skip_for(yuv, qp, false);
     let map = aq::activity_aq_enabled(qp, false).then(|| grid_aq_offsets(yuv, qp));
-    (map, cqo, transform_skip)
+    (map, cqo, transform_skip, screen)
 }
 
 fn grid_aq_offsets(luma_yuv: &Yuv, qp: u8) -> Vec<i8> {
@@ -1301,6 +1308,7 @@ fn encode_cell(
     qp_bias: i8,
     chroma_qp_offset: Option<i8>,
     transform_skip: Option<bool>,
+    screen: Option<bool>,
     screen_content: bool,
     implicit_rdpcm: bool,
     persistent_rice: bool,
@@ -1329,6 +1337,7 @@ fn encode_cell(
         qp_bias,
         chroma_qp_offset,
         transform_skip,
+        screen,
         screen_content,
         implicit_rdpcm,
         persistent_rice,
@@ -1359,7 +1368,7 @@ fn encode_rgb_tiled(
     }
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) = grid_global_aq_map(
         rgb,
         width,
         height,
@@ -1416,6 +1425,7 @@ fn encode_rgb_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1454,7 +1464,7 @@ fn encode_gray_tiled(
     let cell_wpp = cfg.parallelism.grid_cell_wpp();
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) = grid_global_aq_map(
         gray,
         width,
         height,
@@ -1499,6 +1509,7 @@ fn encode_gray_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1538,7 +1549,7 @@ fn encode_yuv_alpha_tiled(
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) =
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) =
         grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let pairs = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
@@ -1599,6 +1610,7 @@ fn encode_yuv_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1628,6 +1640,7 @@ fn encode_yuv_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
@@ -1675,7 +1688,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
     let c_src_h = (yuv.height / sh) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) =
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) =
         grid_global_aq_map_from_yuv(yuv, cfg.quality, cfg.lossless);
     let tile_streams = parallel_try_map(n, cfg.threads, |idx, cell_threads| {
         let row = idx as u32 / cols;
@@ -1736,6 +1749,7 @@ fn encode_yuv_tiled(yuv: &Yuv, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeErro
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1771,7 +1785,7 @@ fn encode_rgba_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) = grid_global_aq_map(
         rgba,
         width,
         height,
@@ -1833,6 +1847,7 @@ fn encode_rgba_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1861,6 +1876,7 @@ fn encode_rgba_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
@@ -1907,7 +1923,7 @@ fn encode_gray_alpha_tiled(
     let ts2 = (TILE_SIZE * TILE_SIZE) as usize;
 
     let n = (cols * rows) as usize;
-    let (aq_map, grid_cqo, grid_transform_skip) = grid_global_aq_map(
+    let (aq_map, grid_cqo, grid_transform_skip, grid_screen) = grid_global_aq_map(
         ya,
         width,
         height,
@@ -1962,6 +1978,7 @@ fn encode_gray_alpha_tiled(
             cell_qp_bias,
             Some(grid_cqo),
             Some(grid_transform_skip),
+            Some(grid_screen),
             cfg.screen_content,
             cfg.implicit_rdpcm,
             cfg.persistent_rice,
@@ -1989,6 +2006,7 @@ fn encode_gray_alpha_tiled(
             None,
             0,
             Some(0),
+            Some(false),
             Some(false),
             cfg.screen_content,
             cfg.implicit_rdpcm,
