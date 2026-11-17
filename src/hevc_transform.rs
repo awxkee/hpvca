@@ -1076,38 +1076,28 @@ fn rdoq_with_sign_hiding_into(
             let mut best_cost = dist0 + sig0;
             if max_abs > 0 {
                 let min_abs = if max_abs > 1 { max_abs - 1 } else { 1 };
-                for abs_level in [max_abs, min_abs] {
+                let coded = |abs_level: u32| {
                     let dist = distortion.coefficient_cost(coeff_abs, abs_level, m) * dist_weight;
                     let rate =
                         rdoq_level_bits(abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx);
-                    let coded_cost = dist + sig1 + lambda * rate;
-                    if coded_cost < best_cost || is_last && best_level == 0 {
-                        best_cost = coded_cost;
-                        best_level = abs_level;
-                    }
-                    if min_abs == max_abs {
-                        break;
-                    }
-                }
-                // HM directly tests zero for small levels. Larger all-zero
-                // choices are handled more efficiently by CG and last cleanup.
+                    dist + sig1 + lambda * rate
+                };
+                let cost_max = coded(max_abs);
+                let cost_min = if min_abs == max_abs {
+                    cost_max
+                } else {
+                    coded(min_abs)
+                };
                 if !is_last && max_abs >= 3 {
-                    best_cost = f32::MAX;
-                    for abs_level in [max_abs, min_abs] {
-                        let dist =
-                            distortion.coefficient_cost(coeff_abs, abs_level, m) * dist_weight;
-                        let rate = rdoq_level_bits(
-                            abs_level, ctx_set, c1, c1_idx, c2_idx, rice, is_luma, ctx,
-                        );
-                        let coded_cost = dist + sig1 + lambda * rate;
-                        if coded_cost < best_cost {
-                            best_cost = coded_cost;
-                            best_level = abs_level;
-                        }
-                        if min_abs == max_abs {
-                            break;
-                        }
-                    }
+                    // HM directly tests zero for small levels only. Larger
+                    // all-zero choices are handled more efficiently by CG
+                    // and last cleanup.
+                    (best_cost, best_level) = (cost_max, max_abs);
+                } else if cost_max < best_cost || is_last {
+                    (best_cost, best_level) = (cost_max, max_abs);
+                }
+                if min_abs != max_abs && cost_min < best_cost {
+                    (best_cost, best_level) = (cost_min, min_abs);
                 }
             }
 
@@ -1254,10 +1244,9 @@ fn rdoq_with_sign_hiding_into(
         }
     }
 
-    for (scan_pos, &(row, col)) in scan.iter().enumerate() {
-        if scan_pos >= best_last_p1 {
-            levels[row * n + col] = 0;
-        }
+    // Everything above the first candidate last position is zero already.
+    for &(row, col) in &scan[best_last_p1..=initial_last] {
+        levels[row * n + col] = 0;
     }
 
     for &(row, col) in scan.iter().take(best_last_p1) {

@@ -30,12 +30,14 @@
 mod aq;
 mod dequant;
 mod math;
+mod motion;
 mod satd;
 mod transform;
 mod weighted_sse;
 
 pub(crate) use aq::{block_log_variances_avx2_fma, ctu_qg_log_variances_avx2_fma};
 pub(crate) use dequant::{dequantize_avx2, dequantize_scaled_avx2};
+pub(crate) use motion::{bi_average_sse41, interpolate_sse41, sad_sse41};
 pub(crate) use satd::satd_avx2;
 pub(crate) use transform::{fwd_transform_avx2, inv_transform_avx2};
 pub(crate) use weighted_sse::weighted_sse_avx2_fma;

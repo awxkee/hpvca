@@ -269,42 +269,47 @@ fn edge_candidate(
     let (dx, dy) = eo_direction(eo_class);
     let mut count = [0u32; 4];
     let mut sum = [0i64; 4];
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let xa = x as i32 + dx;
-            let ya = y as i32 + dy;
-            let xb = x as i32 - dx;
-            let yb = y as i32 - dy;
-            // Neighbor availability is the decoder's: the coded picture
-            // (stride × coded_height), not the visible crop.
-            if xa < 0
-                || ya < 0
-                || xb < 0
-                || yb < 0
-                || xa as usize >= plane.stride
-                || xb as usize >= plane.stride
-                || ya as usize >= plane.coded_height
-                || yb as usize >= plane.coded_height
-            {
-                continue;
+    // Neighbor availability is the decoder's: the coded picture
+    // (stride × coded_height), not the visible crop. Within these bounds
+    // both neighbors of every sample exist.
+    let (reach_x, reach_y) = (dx.unsigned_abs() as usize, dy.unsigned_abs() as usize);
+    let (xs, xe) = (
+        x0.max(reach_x),
+        x1.min(plane.stride.saturating_sub(reach_x)),
+    );
+    let (ys, ye) = (
+        y0.max(reach_y),
+        y1.min(plane.coded_height.saturating_sub(reach_y)),
+    );
+    // Edge index (0..=4, 2 for "no edge") and source error of one row at a
+    // time, in loops simple enough to vectorize.
+    let mut edge = [2u8; 64];
+    let mut error = [0i32; 64];
+    let n = xe.saturating_sub(xs).min(64);
+    for y in ys..ye {
+        if n == 0 {
+            break;
+        }
+        let at = |x: usize, y: usize| y * plane.stride + x;
+        let s = &plane.rec[at(xs, y)..][..n];
+        let a = &plane.rec[at((xs as i32 + dx) as usize, (y as i32 + dy) as usize)..][..n];
+        let b = &plane.rec[at((xs as i32 - dx) as usize, (y as i32 - dy) as usize)..][..n];
+        let original = &plane.original[at(xs, y)..][..n];
+        for i in 0..n {
+            let above = u8::from(s[i] > a[i]) + u8::from(s[i] > b[i]);
+            let below = u8::from(s[i] < a[i]) + u8::from(s[i] < b[i]);
+            edge[i] = 2 + above - below;
+            error[i] = i32::from(original[i]) - i32::from(s[i]);
+        }
+        for (class, index) in [0u8, 1, 3, 4].into_iter().enumerate() {
+            let (mut hits, mut total) = (0u32, 0i32);
+            for i in 0..n {
+                let hit = edge[i] == index;
+                hits += u32::from(hit);
+                total += if hit { error[i] } else { 0 };
             }
-            let idx = y * plane.stride + x;
-            let s = plane.rec[idx];
-            let a = plane.rec[ya as usize * plane.stride + xa as usize];
-            let b = plane.rec[yb as usize * plane.stride + xb as usize];
-            let sign = |p: u16, q: u16| (p > q) as i32 - (p < q) as i32;
-            let edge = sign(s, a) + sign(s, b) + 2;
-            let class = match edge {
-                0 => Some(0),
-                1 => Some(1),
-                3 => Some(2),
-                4 => Some(3),
-                _ => None,
-            };
-            if let Some(class) = class {
-                count[class] += 1;
-                sum[class] += i64::from(plane.original[idx]) - i64::from(s);
-            }
+            count[class] += hits;
+            sum[class] += i64::from(total);
         }
     }
     let mut offsets = [0i8; 4];
@@ -438,37 +443,52 @@ fn analyze_chroma_ctu(
 }
 
 /// Per-CTU luma SAO parameters of a picture.
-pub(crate) fn analyze_luma(plane: SaoPlane<'_>, lambda: f32) -> Vec<SaoParam> {
+pub(crate) fn analyze_luma(
+    plane: SaoPlane<'_>,
+    lambda: f32,
+    pool: &crate::pool::ThreadPool,
+) -> Vec<SaoParam> {
     let cols = plane.width.div_ceil(plane.ctb_w);
     let rows = plane.height.div_ceil(plane.ctb_h);
-    let mut out = Vec::with_capacity(cols * rows);
-    for ry in 0..rows {
-        for rx in 0..cols {
-            out.push(analyze_luma_ctu(
-                plane,
-                rx * plane.ctb_w,
-                ry * plane.ctb_h,
-                lambda,
-            ));
+    let mut out = vec![SaoParam::default(); cols * rows];
+    // Every CTU is analysed on its own (merge flags are never used), so the
+    // CTU rows run in parallel and the result does not depend on how.
+    pool.scoped(|scope| {
+        for (ry, row) in out.chunks_mut(cols).enumerate() {
+            scope.spawn(move || {
+                for (rx, slot) in row.iter_mut().enumerate() {
+                    *slot = analyze_luma_ctu(plane, rx * plane.ctb_w, ry * plane.ctb_h, lambda);
+                }
+            });
         }
-    }
+    });
     out
 }
 
 /// Per-CTU chroma SAO parameters of a picture, written into `out[i].cb` /
 /// `out[i].cr` (one entry per CTU in raster order).
-pub(crate) fn analyze_chroma(cb: SaoPlane<'_>, cr: SaoPlane<'_>, lambda: f32, out: &mut [SaoCtu]) {
+pub(crate) fn analyze_chroma(
+    cb: SaoPlane<'_>,
+    cr: SaoPlane<'_>,
+    lambda: f32,
+    out: &mut [SaoCtu],
+    pool: &crate::pool::ThreadPool,
+) {
     let cols = cb.width.div_ceil(cb.ctb_w);
     let rows = cb.height.div_ceil(cb.ctb_h);
     debug_assert_eq!(out.len(), cols * rows);
-    for ry in 0..rows {
-        for rx in 0..cols {
-            let (p_cb, p_cr) = analyze_chroma_ctu(cb, cr, rx * cb.ctb_w, ry * cb.ctb_h, lambda);
-            let ctu = &mut out[ry * cols + rx];
-            ctu.cb = p_cb;
-            ctu.cr = p_cr;
+    pool.scoped(|scope| {
+        for (ry, row) in out.chunks_mut(cols).enumerate() {
+            scope.spawn(move || {
+                for (rx, ctu) in row.iter_mut().enumerate() {
+                    let (p_cb, p_cr) =
+                        analyze_chroma_ctu(cb, cr, rx * cb.ctb_w, ry * cb.ctb_h, lambda);
+                    ctu.cb = p_cb;
+                    ctu.cr = p_cr;
+                }
+            });
         }
-    }
+    });
 }
 
 fn encode_offsets<W: CabacWriter>(enc: &mut W, param: SaoParam, bit_depth: u8) {
@@ -652,7 +672,7 @@ mod tests {
             ctb_h: 64,
             bit_depth: 8,
         };
-        let p = analyze_luma(plane, 1.0);
+        let p = analyze_luma(plane, 1.0, &crate::pool::ThreadPool::new(2));
         assert_eq!(p[0].type_idx, 1);
         assert!(p[0].offsets.contains(&4));
         let mut filtered = rec;
@@ -686,6 +706,7 @@ mod tests {
             plane(&orig_cr, &rec_cr),
             1.0,
             &mut params,
+            &crate::pool::ThreadPool::new(2),
         );
         assert_eq!(params[0].cb.type_idx, 1);
         assert_eq!(params[0].cr.type_idx, 1);

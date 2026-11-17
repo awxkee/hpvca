@@ -27,8 +27,10 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -102,19 +104,26 @@ impl ThreadPool {
     /// Run `f`, which may [`spawn`](Scope::spawn) tasks onto the pool. Blocks
     /// until every task spawned in the scope has completed; the calling thread
     /// helps drain the queue meanwhile, so it is never merely idle.
-    pub(crate) fn scoped<'scope, F, R>(&'scope self, f: F) -> R
+    pub(crate) fn scoped<'env, F, R>(&'env self, f: F) -> R
     where
-        F: FnOnce(&Scope<'scope>) -> R,
+        F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R,
     {
         let scope = Scope {
             shared: &self.shared,
             pending: AtomicUsize::new(0),
-            panicked: AtomicBool::new(false),
+            panics: Mutex::new(Vec::new()),
             _marker: PhantomData,
         };
-        let out = f(&scope);
+        let out = catch_unwind(AssertUnwindSafe(|| f(&scope)));
         scope.wait();
-        out
+        let task_panic = scope.panics.lock().unwrap().pop();
+        match out {
+            Err(payload) => resume_unwind(payload),
+            Ok(value) => match task_panic {
+                Some(payload) => resume_unwind(payload),
+                None => value,
+            },
+        }
     }
 }
 
@@ -165,61 +174,36 @@ fn worker_loop(shared: &Shared) {
 }
 
 /// Handle for spawning borrowed tasks within [`ThreadPool::scoped`].
-pub(crate) struct Scope<'scope> {
-    shared: &'scope Shared,
+pub(crate) struct Scope<'scope, 'env: 'scope> {
+    shared: &'env Shared,
     pending: AtomicUsize,
-    /// Set when a task unwound. The panic is re-raised on the scope owner in
-    /// [`Scope::wait`] so a worker-thread failure surfaces as a normal panic
-    /// instead of vanishing with the worker.
-    panicked: AtomicBool,
-    _marker: PhantomData<&'scope ()>,
+    panics: Mutex<Vec<Box<dyn Any + Send>>>,
+    _marker: PhantomData<(&'scope mut &'scope (), &'env mut &'env ())>,
 }
 
-struct PendingGuard<'a> {
-    pending: &'a AtomicUsize,
-    panicked: &'a AtomicBool,
-}
-
-impl Drop for PendingGuard<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.panicked.store(true, Ordering::SeqCst);
-        }
-        self.pending.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl<'scope> Scope<'scope> {
+impl<'scope, 'env> Scope<'scope, 'env> {
     /// Queue `task` to run on the pool. It may borrow data living at least for
     /// `'scope`
-    pub(crate) fn spawn<F>(&self, task: F)
+    pub(crate) fn spawn<F>(&'scope self, task: F)
     where
         F: FnOnce() + Send + 'scope,
     {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        // `pending`/`panicked` live on the caller's stack for at least `'scope`.
-        let pending: &'scope AtomicUsize = unsafe { &*(&self.pending as *const AtomicUsize) };
-        let panicked: &'scope AtomicBool = unsafe { &*(&self.panicked as *const AtomicBool) };
         let job: Box<dyn FnOnce() + Send + 'scope> = Box::new(move || {
-            // The guard decrements on unwind too, so a panicking task can never
-            // strand `wait()`.
-            let _guard = PendingGuard { pending, panicked };
-            task();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(task)) {
+                self.panics.lock().unwrap().push(payload);
+            }
+            self.pending.fetch_sub(1, Ordering::SeqCst);
         });
-        // SAFETY: erase the `'scope` lifetime for the type-erased queue. `wait`
-        // blocks until `pending` reaches zero, i.e. until this task has run to
-        // completion, so the task never outlives the data it borrows.
+        // SAFETY: scoped waits for every task, including tasks spawned by
+        // other tasks, before returning or resuming an unwind.
         let job: Task =
             unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, Task>(job) };
+        self.pending.fetch_add(1, Ordering::SeqCst);
         self.shared.push(job);
     }
 
     fn wait(&self) {
-        // Consecutive idle spins (no task to steal, work still outstanding)
-        // before declaring the scope stuck. Each idle spin yields or sleeps, so
-        // this is minutes of no progress, never a false trip on slow encodes.
-        const STALL_LIMIT: u64 = 20_000_000;
-        let mut idle_spins: u64 = 0;
+        let mut idle_spins = 0;
         while self.pending.load(Ordering::SeqCst) != 0 {
             match self.shared.try_pop() {
                 Some(task) => {
@@ -227,18 +211,11 @@ impl<'scope> Scope<'scope> {
                     task();
                 }
                 None => {
-                    idle_spins += 1;
-                    assert!(
-                        idle_spins < STALL_LIMIT,
-                        "hpvca thread pool stalled: {} task(s) still pending with an empty \
-                         queue after {} idle spins — a task neither finished nor unwound",
-                        self.pending.load(Ordering::SeqCst),
-                        idle_spins,
-                    );
                     // Spin briefly (the common case is a task finishing within
                     // microseconds), then back off to sleeping so a long task
                     // does not pin this core at 100%.
                     if idle_spins < 1024 {
+                        idle_spins += 1;
                         std::hint::spin_loop();
                         std::thread::yield_now();
                     } else {
@@ -247,11 +224,6 @@ impl<'scope> Scope<'scope> {
                 }
             }
         }
-        assert!(
-            !self.panicked.load(Ordering::SeqCst),
-            "hpvca thread pool: a worker task panicked (see the panic printed by the \
-             worker thread above)"
-        );
     }
 }
 
@@ -279,6 +251,38 @@ mod tests {
             result.is_err(),
             "a task that panicked on a worker must surface as a panic, not a hang"
         );
+    }
+
+    #[test]
+    fn caller_unwind_still_drains_pending_tasks() {
+        let pool = ThreadPool::new(0);
+        let ran = AtomicBool::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            pool.scoped(|scope| {
+                scope.spawn(|| ran.store(true, Ordering::SeqCst));
+                panic!("scope callback");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn panicking_task_on_caller_still_drains_nested_work() {
+        let pool = ThreadPool::new(0);
+        let ran = AtomicBool::new(false);
+        let ran_ref = &ran;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            pool.scoped(|scope| {
+                scope.spawn(move || {
+                    scope.spawn(|| ran_ref.store(true, Ordering::SeqCst));
+                    panic!("caller task");
+                });
+            });
+        }));
+        let payload = result.unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"caller task"));
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[test]
