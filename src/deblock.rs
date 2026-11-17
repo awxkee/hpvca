@@ -91,7 +91,22 @@ pub(crate) fn deblock(
     edge_h: &[u8],
 ) {
     deblock_impl(
-        y, w, h, cb, cr, cw, ch, qp, bit_depth, chroma, cqo, edge_v, edge_h, None, 0,
+        y,
+        w,
+        h,
+        cb,
+        cr,
+        cw,
+        ch,
+        qp,
+        bit_depth,
+        chroma,
+        cqo,
+        edge_v,
+        edge_h,
+        None,
+        0,
+        kernels(),
     );
 }
 
@@ -132,6 +147,7 @@ pub(crate) fn deblock_with_qp_map(
         edge_h,
         Some(qp_map),
         qp_stride,
+        kernels(),
     );
 }
 
@@ -152,6 +168,7 @@ fn deblock_impl(
     edge_h: &[u8],
     qp_map: Option<&[u8]>,
     qp_stride: usize,
+    k: &Kernels,
 ) {
     let edge_stride = w / 4;
     for &vertical in &[true, false] {
@@ -167,6 +184,7 @@ fn deblock_impl(
             edge_stride,
             qp_map,
             qp_stride,
+            k,
         );
         if !chroma.is_monochrome() {
             deblock_chroma(
@@ -182,6 +200,7 @@ fn deblock_impl(
                 edge_stride,
                 qp_map,
                 qp_stride,
+                k,
             );
             deblock_chroma(
                 cr,
@@ -196,6 +215,7 @@ fn deblock_impl(
                 edge_stride,
                 qp_map,
                 qp_stride,
+                k,
             );
         }
     }
@@ -235,7 +255,137 @@ fn edge_qp(
     (i32::from(map[py * stride + px]) + i32::from(map[qy * stride + qx]) + 1) >> 1
 }
 
-/// Luma-only deblocking, for monochrome (4:0:0) pictures that have no chroma.
+/// Per-4-line luma deblock decision (§8.7.2.5.3), computed once from lines 0 and
+/// 3 and applied uniformly to all 4 lines. `Weak` carries the dEp/dEq gates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LumaDecision {
+    Skip,
+    Strong,
+    Weak { do_p1: bool, do_q1: bool },
+}
+
+/// Compute the segment decision from lines 0 and 3. `g(line, tap)` reads a sample
+/// (tap: -1=p0,-2=p1,-3=p2,-4=p3, 0=q0,1=q1,2=q2,3=q3).
+#[inline]
+fn luma_decision(beta: i32, tc: i32, g: impl Fn(usize, i32) -> i32) -> LumaDecision {
+    let dp0 = (g(0, -3) - 2 * g(0, -2) + g(0, -1)).abs();
+    let dp3 = (g(3, -3) - 2 * g(3, -2) + g(3, -1)).abs();
+    let dq0 = (g(0, 2) - 2 * g(0, 1) + g(0, 0)).abs();
+    let dq3 = (g(3, 2) - 2 * g(3, 1) + g(3, 0)).abs();
+    if dp0 + dp3 + dq0 + dq3 >= beta {
+        return LumaDecision::Skip;
+    }
+    let dsam = |line: usize, dpq: i32| -> bool {
+        2 * dpq < (beta >> 2)
+            && (g(line, -4) - g(line, -1)).abs() + (g(line, 0) - g(line, 3)).abs() < (beta >> 3)
+            && (g(line, -1) - g(line, 0)).abs() < (5 * tc + 1) >> 1
+    };
+    if dsam(0, dp0 + dq0) && dsam(3, dp3 + dq3) {
+        LumaDecision::Strong
+    } else {
+        let side_thr = (beta + (beta >> 1)) >> 3;
+        LumaDecision::Weak {
+            do_p1: dp0 + dp3 < side_thr,
+            do_q1: dq0 + dq3 < side_thr,
+        }
+    }
+}
+
+type LumaPlaneFn = fn(&mut [u16], usize, usize, usize, usize, LumaDecision, i32, i32);
+type LumaPairFn =
+    fn(&mut [u16], usize, usize, usize, usize, LumaDecision, i32, LumaDecision, i32, i32);
+type ChromaPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32);
+type ChromaPairFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
+
+/// Filter kernels. Decisions are made scalar; the chosen filter is applied by
+/// these (SIMD where available). Pair kernels filter two adjacent 4-sample
+/// segments of the same edge at once.
+#[derive(Clone, Copy)]
+struct Kernels {
+    luma_v: LumaPlaneFn,
+    luma_h: LumaPlaneFn,
+    luma_v_pair: Option<LumaPairFn>,
+    luma_h_pair: Option<LumaPairFn>,
+    chroma_v: ChromaPlaneFn,
+    chroma_h: ChromaPlaneFn,
+    chroma_v_pair: Option<ChromaPairFn>,
+    chroma_h_pair: Option<ChromaPairFn>,
+}
+
+const SCALAR_KERNELS: Kernels = Kernels {
+    luma_v: luma_vertical_plane_scalar,
+    luma_h: luma_horizontal_plane_scalar,
+    luma_v_pair: None,
+    luma_h_pair: None,
+    chroma_v: chroma_vertical_plane_scalar,
+    chroma_h: chroma_horizontal_plane_scalar,
+    chroma_v_pair: None,
+    chroma_h_pair: None,
+};
+
+fn kernels() -> &'static Kernels {
+    static K: std::sync::OnceLock<Kernels> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        #[allow(unused_mut)]
+        let mut k = SCALAR_KERNELS;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            k.luma_v = crate::neon::luma_vertical_plane_neon;
+            k.luma_h = crate::neon::luma_horizontal_plane_neon;
+            k.chroma_v = crate::neon::chroma_vertical_plane_neon;
+            k.chroma_h = crate::neon::chroma_horizontal_plane_neon;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                k.luma_v = crate::avx::luma_vertical_plane_avx2;
+                k.luma_h = crate::avx::luma_horizontal_plane_avx2;
+                k.luma_v_pair = Some(crate::avx::luma_vertical_plane_pair_avx2);
+                k.luma_h_pair = Some(crate::avx::luma_horizontal_plane_pair_avx2);
+                k.chroma_v = crate::avx::chroma_vertical_plane_avx2;
+                k.chroma_h = crate::avx::chroma_horizontal_plane_avx2;
+                k.chroma_v_pair = Some(crate::avx::chroma_vertical_plane_pair_avx2);
+                k.chroma_h_pair = Some(crate::avx::chroma_horizontal_plane_pair_avx2);
+            }
+        }
+        k
+    })
+}
+
+/// Run `single` over 4-sample segments `pos, pos+4, ...` while `pos + 4 <= end`,
+/// pairing two adjacent filtered segments into one `pair` call when available.
+/// `params(plane, pos)` returns `None` for segments that are not filtered.
+/// Adjacent segments of one edge touch disjoint samples, so evaluating both
+/// decisions before filtering is equivalent to the sequential order.
+#[inline]
+fn walk_segments<T: Copy>(
+    plane: &mut [u16],
+    end: usize,
+    has_pair: bool,
+    params: impl Fn(&[u16], usize) -> Option<T>,
+    single: impl Fn(&mut [u16], usize, T),
+    pair: impl Fn(&mut [u16], usize, T, T),
+) {
+    let mut pos = 0;
+    while pos + 4 <= end {
+        let Some(a) = params(plane, pos) else {
+            pos += 4;
+            continue;
+        };
+        if has_pair && pos + 8 <= end {
+            match params(plane, pos + 4) {
+                Some(b) => pair(plane, pos, a, b),
+                // `pos + 4` was evaluated and is unfiltered.
+                None => single(plane, pos, a),
+            }
+            pos += 8;
+            continue;
+        }
+        single(plane, pos, a);
+        pos += 4;
+    }
+}
+
 /// Luma deblocking for all edges of one orientation on the 8-sample grid.
 #[allow(clippy::too_many_arguments)]
 fn deblock_luma(
@@ -249,197 +399,158 @@ fn deblock_luma(
     edge_stride: usize,
     qp_map: Option<&[u8]>,
     qp_stride: usize,
+    k: &Kernels,
 ) {
     let bdshift = (bit_depth - 8) as i32;
     let max_val = (1i32 << bit_depth) - 1;
 
     // Edges lie on the 8-sample grid; the boundary is at coordinate `e` for
-    // e = 8, 16, 24, ... (never the picture border at 0).
-    if vertical {
-        // vertical edges at column x = 8,16,... ; filter 4-row segments down each.
-        let mut x = 8;
-        while x < w {
-            let mut yk = 0;
-            while yk + 4 <= h {
-                let bs = edges[(yk / 4) * edge_stride + x / 4];
-                if bs != 0 {
-                    let qp_l = edge_qp(qp, qp_map, qp_stride, x, yk, true);
-                    let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
-                    let tc = TC_TABLE[clip3(0, 53, qp_l + tc_offset(bs)) as usize] << bdshift;
-                    filter_luma_segment(y, w, x, yk, true, beta, tc, max_val);
-                }
-                yk += 4;
+    // e = 8, 16, 24, ... (never the picture border at 0). Segments run along
+    // the edge in steps of 4 samples.
+    let (edge_end, seg_end) = if vertical { (w, h) } else { (h, w) };
+    let mut e = 8;
+    while e < edge_end {
+        let params = |y: &[u16], pos: usize| -> Option<(LumaDecision, i32)> {
+            let (lx, ly) = if vertical { (e, pos) } else { (pos, e) };
+            let bs = edges[(ly / 4) * edge_stride + lx / 4];
+            if bs == 0 {
+                return None;
             }
-            x += 8;
-        }
-    } else {
-        let mut yy = 8;
-        while yy < h {
-            let mut xk = 0;
-            while xk + 4 <= w {
-                let bs = edges[(yy / 4) * edge_stride + xk / 4];
-                if bs != 0 {
-                    let qp_l = edge_qp(qp, qp_map, qp_stride, xk, yy, false);
-                    let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
-                    let tc = TC_TABLE[clip3(0, 53, qp_l + tc_offset(bs)) as usize] << bdshift;
-                    filter_luma_segment(y, w, xk, yy, false, beta, tc, max_val);
-                }
-                xk += 4;
+            let qp_l = edge_qp(qp, qp_map, qp_stride, lx, ly, vertical);
+            let beta = BETA_TABLE[clip3(0, 51, qp_l) as usize] << bdshift;
+            let tc = TC_TABLE[clip3(0, 53, qp_l + tc_offset(bs)) as usize] << bdshift;
+            if tc == 0 {
+                // Both the strong (±2tc) and weak (|Δ| < 10tc) filters are
+                // identities at tc = 0.
+                return None;
             }
-            yy += 8;
+            let dec = if vertical {
+                luma_decision(beta, tc, |line, tap| {
+                    y[(pos + line) * w + (e as isize + tap as isize) as usize] as i32
+                })
+            } else {
+                luma_decision(beta, tc, |line, tap| {
+                    y[(e as isize + tap as isize) as usize * w + pos + line] as i32
+                })
+            };
+            (dec != LumaDecision::Skip).then_some((dec, tc))
+        };
+        let (single, pair) = if vertical {
+            (k.luma_v, k.luma_v_pair)
+        } else {
+            (k.luma_h, k.luma_h_pair)
+        };
+        walk_segments(
+            y,
+            seg_end,
+            pair.is_some(),
+            params,
+            |y, pos, (d, tc)| single(y, w, e, pos, 0, d, tc, max_val),
+            |y, pos, (d0, tc0), (d1, tc1)| {
+                pair.unwrap()(y, w, e, pos, 0, d0, tc0, d1, tc1, max_val)
+            },
+        );
+        e += 8;
+    }
+}
+
+/// Apply a precomputed per-segment `decision` uniformly to the 4 lines of a luma
+/// edge segment. `at(line, tap)` gives the flat index (see `luma_decision`).
+#[inline]
+fn apply_luma_decision(
+    plane: &mut [u16],
+    decision: LumaDecision,
+    tc: i32,
+    max_val: i32,
+    at: impl Fn(usize, i32) -> usize,
+) {
+    let (strong, do_p1, do_q1) = match decision {
+        LumaDecision::Skip => return,
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    };
+    let tc2 = tc >> 1;
+    let g = |plane: &[u16], line: usize, tap: i32| plane[at(line, tap)] as i32;
+    for line in 0..4 {
+        let p0 = g(plane, line, -1);
+        let p1 = g(plane, line, -2);
+        let p2 = g(plane, line, -3);
+        let p3 = g(plane, line, -4);
+        let q0 = g(plane, line, 0);
+        let q1 = g(plane, line, 1);
+        let q2 = g(plane, line, 2);
+        let q3 = g(plane, line, 3);
+        if strong {
+            // §8.7.2.5.7: each strongly-filtered sample is clipped to ±2·tc
+            // around its original value.
+            let c = |orig: i32, v: i32| -> u16 {
+                clip_sample(clip3(orig - 2 * tc, orig + 2 * tc, v), max_val)
+            };
+            plane[at(line, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            plane[at(line, -2)] = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
+            plane[at(line, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+            plane[at(line, 0)] = c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            plane[at(line, 1)] = c(q1, (p0 + q0 + q1 + q2 + 2) >> 2);
+            plane[at(line, 2)] = c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+        } else {
+            let delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+            if delta0.abs() < tc * 10 {
+                let delta = clip3(-tc, tc, delta0);
+                plane[at(line, -1)] = clip_sample(p0 + delta, max_val);
+                plane[at(line, 0)] = clip_sample(q0 - delta, max_val);
+                if do_p1 {
+                    let dp1 = clip3(-tc2, tc2, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
+                    plane[at(line, -2)] = clip_sample(p1 + dp1, max_val);
+                }
+                if do_q1 {
+                    let dq1 = clip3(-tc2, tc2, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
+                    plane[at(line, 1)] = clip_sample(q1 + dq1, max_val);
+                }
+            }
         }
     }
 }
 
-/// Filter one 4-sample luma edge segment. For a vertical edge, (ex,ey) is the
-/// top sample of the boundary column (q side at column ex, p side at ex-1), and
-/// the segment spans rows ey..ey+4. For a horizontal edge it is transposed.
+/// Scalar reference: apply `decision` to a vertical-edge segment (4 rows
+/// starting at global row `s`; `pix` local row 0 is global row `row0`).
 #[allow(clippy::too_many_arguments)]
-fn filter_luma_segment(
-    y: &mut [u16],
-    stride: usize,
-    ex: usize,
-    ey: usize,
-    vertical: bool,
-    beta: i32,
+pub(crate) fn luma_vertical_plane_scalar(
+    pix: &mut [u16],
+    w: usize,
+    edge: usize,
+    s: usize,
+    row0: usize,
+    decision: LumaDecision,
     tc: i32,
-    max_val: i32,
+    maxv: i32,
 ) {
-    let at = |yref: &[u16], r: usize, c: usize| yref[r * stride + c] as i32;
-    let mut p = [[0i32; 4]; 4];
-    let mut q = [[0i32; 4]; 4];
-    for k in 0..4 {
-        for i in 0..4 {
-            if vertical {
-                let r = ey + k;
-                q[k][i] = at(y, r, ex + i);
-                p[k][i] = at(y, r, ex - 1 - i);
-            } else {
-                let c = ex + k;
-                q[k][i] = at(y, ey + i, c);
-                p[k][i] = at(y, ey.wrapping_sub(i + 1), c);
-            }
-        }
-    }
+    apply_luma_decision(pix, decision, tc, maxv, |line, tap| {
+        let col = (edge as i32 + tap) as usize;
+        (s + line - row0) * w + col
+    });
+}
 
-    // Decision (8.7.2.4.3)
-    let dp0 = (p[0][2] - 2 * p[0][1] + p[0][0]).abs();
-    let dp3 = (p[3][2] - 2 * p[3][1] + p[3][0]).abs();
-    let dq0 = (q[0][2] - 2 * q[0][1] + q[0][0]).abs();
-    let dq3 = (q[3][2] - 2 * q[3][1] + q[3][0]).abs();
-    let dpq0 = dp0 + dq0;
-    let dpq3 = dp3 + dq3;
-    let dp = dp0 + dp3;
-    let dq = dq0 + dq3;
-    let d = dpq0 + dpq3;
-
-    if d >= beta {
-        return;
-    }
-
-    let d_sam0 = 2 * dpq0 < (beta >> 2)
-        && (p[0][3] - p[0][0]).abs() + (q[0][0] - q[0][3]).abs() < (beta >> 3)
-        && (p[0][0] - q[0][0]).abs() < ((5 * tc + 1) >> 1);
-    let d_sam3 = 2 * dpq3 < (beta >> 2)
-        && (p[3][3] - p[3][0]).abs() + (q[3][0] - q[3][3]).abs() < (beta >> 3)
-        && (p[3][0] - q[3][0]).abs() < ((5 * tc + 1) >> 1);
-
-    let de = if d_sam0 && d_sam3 { 2 } else { 1 };
-    let dep = if dp < ((beta + (beta >> 1)) >> 3) {
-        1
-    } else {
-        0
-    };
-    let deq = if dq < ((beta + (beta >> 1)) >> 3) {
-        1
-    } else {
-        0
-    };
-
-    // Apply (8.7.2.4.4 / kernel). filterP=filterQ=true (no PCM/transquant-bypass).
-    let set = |y: &mut [u16], r: usize, c: usize, v: u16| {
-        y[r * stride + c] = v;
-    };
-    for k in 0..4 {
-        let (p0, p1, p2, p3) = (p[k][0], p[k][1], p[k][2], p[k][3]);
-        let (q0, q1, q2, q3) = (q[k][0], q[k][1], q[k][2], q[k][3]);
-        if de == 2 {
-            let pn0 = clip3(
-                p0 - 2 * tc,
-                p0 + 2 * tc,
-                (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3,
-            );
-            let pn1 = clip3(p1 - 2 * tc, p1 + 2 * tc, (p2 + p1 + p0 + q0 + 2) >> 2);
-            let pn2 = clip3(
-                p2 - 2 * tc,
-                p2 + 2 * tc,
-                (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3,
-            );
-            let qn0 = clip3(
-                q0 - 2 * tc,
-                q0 + 2 * tc,
-                (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3,
-            );
-            let qn1 = clip3(q1 - 2 * tc, q1 + 2 * tc, (p0 + q0 + q1 + q2 + 2) >> 2);
-            let qn2 = clip3(
-                q2 - 2 * tc,
-                q2 + 2 * tc,
-                (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3,
-            );
-            let pn = [pn0, pn1, pn2];
-            let qn = [qn0, qn1, qn2];
-            for i in 0..3 {
-                if vertical {
-                    set(y, ey + k, ex - 1 - i, clip_sample(pn[i], max_val));
-                    set(y, ey + k, ex + i, clip_sample(qn[i], max_val));
-                } else {
-                    set(y, ey - 1 - i, ex + k, clip_sample(pn[i], max_val));
-                    set(y, ey + i, ex + k, clip_sample(qn[i], max_val));
-                }
-            }
-        } else {
-            let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-            if delta.abs() < tc * 10 {
-                let delta = clip3(-tc, tc, delta);
-                if vertical {
-                    set(y, ey + k, ex - 1, clip_sample(p0 + delta, max_val));
-                    set(y, ey + k, ex, clip_sample(q0 - delta, max_val));
-                } else {
-                    set(y, ey - 1, ex + k, clip_sample(p0 + delta, max_val));
-                    set(y, ey, ex + k, clip_sample(q0 - delta, max_val));
-                }
-                if dep == 1 {
-                    let dpv = clip3(
-                        -(tc >> 1),
-                        tc >> 1,
-                        (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
-                    );
-                    if vertical {
-                        set(y, ey + k, ex - 2, clip_sample(p1 + dpv, max_val));
-                    } else {
-                        set(y, ey - 2, ex + k, clip_sample(p1 + dpv, max_val));
-                    }
-                }
-                if deq == 1 {
-                    let dqv = clip3(
-                        -(tc >> 1),
-                        tc >> 1,
-                        (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
-                    );
-                    if vertical {
-                        set(y, ey + k, ex + 1, clip_sample(q1 + dqv, max_val));
-                    } else {
-                        set(y, ey + 1, ex + k, clip_sample(q1 + dqv, max_val));
-                    }
-                }
-            }
-        }
-    }
+/// Scalar reference: apply `decision` to a horizontal-edge segment (4 cols).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luma_horizontal_plane_scalar(
+    pix: &mut [u16],
+    w: usize,
+    edge: usize,
+    scan: usize,
+    row0: usize,
+    decision: LumaDecision,
+    tc: i32,
+    maxv: i32,
+) {
+    apply_luma_decision(pix, decision, tc, maxv, |line, tap| {
+        let row = (edge as i32 + tap) as usize - row0;
+        row * w + (scan + line)
+    });
 }
 
 /// Chroma deblocking. Chroma edges sit on the 8-chroma-sample grid (16 luma
 /// samples along a subsampled axis, 8 otherwise), processed in 4-sample
-/// segments. bS = 2 always.
+/// segments. Only bS = 2 edges are filtered.
 #[allow(clippy::too_many_arguments)]
 fn deblock_chroma(
     c: &mut [u16],
@@ -454,81 +565,87 @@ fn deblock_chroma(
     edge_stride: usize,
     qp_map: Option<&[u8]>,
     qp_stride: usize,
+    k: &Kernels,
 ) {
     let bdshift = (bit_depth - 8) as i32;
     let max_val = (1i32 << bit_depth) - 1;
 
-    if vertical {
-        // chroma vertical edges at chroma column x = 8,16,...
-        let mut x = 8;
-        while x < cw {
-            let mut yk = 0;
-            while yk + 4 <= chh {
-                let lx = x * chroma.sub_w();
-                let ly = (yk + 1) * chroma.sub_h();
-                if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
-                    let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, true);
-                    let qp_c = chroma_qp(qpi, chroma, cqo);
-                    let tc = TC_TABLE[clip3(0, 53, qp_c + tc_offset(2)) as usize] << bdshift;
-                    filter_chroma_segment(c, cw, x, yk, true, tc, max_val);
-                }
-                yk += 4;
-            }
-            x += 8;
-        }
+    let (edge_end, seg_end) = if vertical { (cw, chh) } else { (chh, cw) };
+    let (single, pair) = if vertical {
+        (k.chroma_v, k.chroma_v_pair)
     } else {
-        let mut yy = 8;
-        while yy < chh {
-            let mut xk = 0;
-            while xk + 4 <= cw {
-                let lx = (xk + 1) * chroma.sub_w();
-                let ly = yy * chroma.sub_h();
-                if edges[(ly / 4) * edge_stride + lx / 4] == 2 {
-                    let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, false);
-                    let qp_c = chroma_qp(qpi, chroma, cqo);
-                    let tc = TC_TABLE[clip3(0, 53, qp_c + tc_offset(2)) as usize] << bdshift;
-                    filter_chroma_segment(c, cw, xk, yy, false, tc, max_val);
-                }
-                xk += 4;
+        (k.chroma_h, k.chroma_h_pair)
+    };
+    let mut e = 8;
+    while e < edge_end {
+        let params = |pos: usize| -> Option<i32> {
+            let (lx, ly) = if vertical {
+                (e * chroma.sub_w(), (pos + 1) * chroma.sub_h())
+            } else {
+                ((pos + 1) * chroma.sub_w(), e * chroma.sub_h())
+            };
+            if edges[(ly / 4) * edge_stride + lx / 4] != 2 {
+                return None;
             }
-            yy += 8;
-        }
+            let qpi = edge_qp(qp, qp_map, qp_stride, lx, ly, vertical);
+            let qp_c = chroma_qp(qpi, chroma, cqo);
+            let tc = TC_TABLE[clip3(0, 53, qp_c + tc_offset(2)) as usize] << bdshift;
+            // Δ is clipped to ±tc, so tc = 0 is an identity.
+            (tc != 0).then_some(tc)
+        };
+        walk_segments(
+            c,
+            seg_end,
+            pair.is_some(),
+            |_, pos| params(pos),
+            |c, pos, tc| single(c, cw, e, pos, 0, tc, max_val),
+            |c, pos, tc0, tc1| pair.unwrap()(c, cw, e, pos, 0, tc0, tc1, max_val),
+        );
+        e += 8;
     }
 }
 
-fn filter_chroma_segment(
-    c: &mut [u16],
-    stride: usize,
-    ex: usize,
-    ey: usize,
-    vertical: bool,
-    tc: i32,
-    max_val: i32,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_vertical_plane_scalar(
+    pix: &mut [u16],
+    cw: usize,
+    edge: usize,
+    s: usize,
+    crow0: usize,
+    tc_c: i32,
+    maxv_c: i32,
 ) {
-    let at = |cref: &[u16], r: usize, col: usize| cref[r * stride + col] as i32;
-    for k in 0..4 {
-        let (p0, p1, q0, q1);
-        if vertical {
-            let r = ey + k;
-            q0 = at(c, r, ex);
-            q1 = at(c, r, ex + 1);
-            p0 = at(c, r, ex - 1);
-            p1 = at(c, r, ex - 2);
-        } else {
-            let col = ex + k;
-            q0 = at(c, ey, col);
-            q1 = at(c, ey + 1, col);
-            p0 = at(c, ey - 1, col);
-            p1 = at(c, ey - 2, col);
-        }
-        let delta = clip3(-tc, tc, (((q0 - p0) * 4) + p1 - q1 + 4) >> 3);
-        if vertical {
-            c[(ey + k) * stride + (ex - 1)] = clip_sample(p0 + delta, max_val);
-            c[(ey + k) * stride + ex] = clip_sample(q0 - delta, max_val);
-        } else {
-            c[(ey - 1) * stride + (ex + k)] = clip_sample(p0 + delta, max_val);
-            c[ey * stride + (ex + k)] = clip_sample(q0 - delta, max_val);
-        }
+    for r in s..s + 4 {
+        let lr = r - crow0;
+        let p0 = pix[lr * cw + edge - 1] as i32;
+        let p1 = pix[lr * cw + edge - 2] as i32;
+        let q0 = pix[lr * cw + edge] as i32;
+        let q1 = pix[lr * cw + edge + 1] as i32;
+        let delta = clip3(-tc_c, tc_c, ((q0 - p0) * 4 + p1 - q1 + 4) >> 3);
+        pix[lr * cw + edge - 1] = clip_sample(p0 + delta, maxv_c);
+        pix[lr * cw + edge] = clip_sample(q0 - delta, maxv_c);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_horizontal_plane_scalar(
+    pix: &mut [u16],
+    cw: usize,
+    edge: usize,
+    scan: usize,
+    crow0: usize,
+    tc_c: i32,
+    maxv_c: i32,
+) {
+    for c in scan..scan + 4 {
+        let base = |gy: usize| (gy - crow0) * cw + c;
+        let p0 = pix[base(edge - 1)] as i32;
+        let p1 = pix[base(edge - 2)] as i32;
+        let q0 = pix[base(edge)] as i32;
+        let q1 = pix[base(edge + 1)] as i32;
+        let delta = clip3(-tc_c, tc_c, ((q0 - p0) * 4 + p1 - q1 + 4) >> 3);
+        pix[base(edge - 1)] = clip_sample(p0 + delta, maxv_c);
+        pix[base(edge)] = clip_sample(q0 - delta, maxv_c);
     }
 }
 
@@ -566,6 +683,96 @@ mod tests {
         );
         assert_ne!(&y[..4 * w], &before[..4 * w]);
         assert_eq!(&y[4 * w..], &before[4 * w..]);
+    }
+
+    /// SIMD filter kernels (NEON / AVX2 incl. pair kernels) must be
+    /// bit-exact with the scalar reference across bit depths, chroma formats,
+    /// boundary strengths and per-QG QPs. On builds without SIMD the dispatched
+    /// kernels are scalar and this is trivially true.
+    #[test]
+    fn simd_kernels_match_scalar() {
+        use crate::fmt::{BitDepth, ChromaFormat};
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (w, h) = (64usize, 48usize);
+        let mut changed = 0usize;
+        for bits in [8u8, 10, 12] {
+            let max = (1u32 << bits) - 1;
+            for chroma in [
+                ChromaFormat::Monochrome,
+                ChromaFormat::Yuv420,
+                ChromaFormat::Yuv422,
+                ChromaFormat::Yuv444,
+            ] {
+                for trial in 0..24 {
+                    // Blocky content: per-8x8 DC plus small noise, so strong,
+                    // weak and skip decisions all occur.
+                    let mut plane = |pw: usize, ph: usize| -> Vec<u16> {
+                        let bw = pw.div_ceil(8);
+                        let dcs: Vec<u32> = (0..bw * ph.div_ceil(8))
+                            .map(|_| rnd() as u32 % (max + 1))
+                            .collect();
+                        let noise = 1 + (trial as u32 % 4) * (max >> 6);
+                        (0..pw * ph)
+                            .map(|i| {
+                                let (x, y) = (i % pw, i / pw);
+                                let v = dcs[(y / 8) * bw + x / 8] as i64
+                                    + (rnd() as u32 % (2 * noise + 1)) as i64
+                                    - noise as i64;
+                                v.clamp(0, max as i64) as u16
+                            })
+                            .collect()
+                    };
+                    let (cw, ch) = if chroma.is_monochrome() {
+                        (0, 0)
+                    } else {
+                        (w / chroma.sub_w(), h / chroma.sub_h())
+                    };
+                    let y0 = plane(w, h);
+                    let cb0 = plane(cw, ch);
+                    let cr0 = plane(cw, ch);
+                    let n4 = (w / 4) * (h / 4);
+                    let edge_v: Vec<u8> = (0..n4).map(|_| (rnd() % 3) as u8).collect();
+                    let edge_h: Vec<u8> = (0..n4).map(|_| (rnd() % 3) as u8).collect();
+                    let qp_map: Vec<u8> = (0..n4).map(|_| 18 + (rnd() % 34) as u8).collect();
+                    let use_map = trial % 2 == 1;
+                    let qp = 22 + (trial as u8 % 6) * 4;
+                    let run = |k: &Kernels| {
+                        let (mut y, mut cb, mut cr) = (y0.clone(), cb0.clone(), cr0.clone());
+                        deblock_impl(
+                            &mut y,
+                            w,
+                            h,
+                            &mut cb,
+                            &mut cr,
+                            cw,
+                            ch,
+                            qp,
+                            BitDepth::from_bits(bits),
+                            chroma,
+                            -2,
+                            &edge_v,
+                            &edge_h,
+                            use_map.then_some(&qp_map[..]),
+                            w / 4,
+                            k,
+                        );
+                        (y, cb, cr)
+                    };
+                    let reference = run(&SCALAR_KERNELS);
+                    let simd = run(kernels());
+                    changed += usize::from(reference.0 != y0)
+                        + usize::from(reference.1 != cb0 || reference.2 != cr0);
+                    assert_eq!(reference, simd, "bits={bits} {chroma:?} trial={trial}");
+                }
+            }
+        }
+        assert!(changed > 100, "test content barely filtered: {changed}");
     }
 
     #[test]

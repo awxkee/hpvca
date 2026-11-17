@@ -28,6 +28,7 @@
  */
 
 mod aq;
+mod deblock;
 mod dequant;
 mod math;
 mod motion;
@@ -36,6 +37,11 @@ mod transform;
 mod weighted_sse;
 
 pub(crate) use aq::{block_log_variances_avx2_fma, ctu_qg_log_variances_avx2_fma};
+pub(crate) use deblock::{
+    chroma_horizontal_plane_avx2, chroma_horizontal_plane_pair_avx2, chroma_vertical_plane_avx2,
+    chroma_vertical_plane_pair_avx2, luma_horizontal_plane_avx2, luma_horizontal_plane_pair_avx2,
+    luma_vertical_plane_avx2, luma_vertical_plane_pair_avx2,
+};
 pub(crate) use dequant::{dequantize_avx2, dequantize_scaled_avx2};
 pub(crate) use motion::{bi_average_sse41, interpolate_sse41, sad_sse41};
 pub(crate) use satd::satd_avx2;
