@@ -53,7 +53,7 @@ pub(crate) struct CoderScratch {
     /// Per-4×4 block-vector map for IntraBC: [`crate::hevc::BV_INTRA`] where the
     /// block is intra (or palette), otherwise a packed integer luma BV. Feeds
     /// AMVP prediction and deblocking boundary strength.
-    pub(crate) bv_map: Vec<i32>,
+    pub(crate) bv_map: Vec<crate::ibc::FieldEntry>,
     /// Per-4×4 QpY map for AQ deblocking (empty when AQ is off).
     pub(crate) qp_map: Vec<u8>,
     /// Padded source planes for the SAO statistics pass.

@@ -20,6 +20,8 @@ rust-version = "1.94.0"
 default = ["avx", "neon"]
 avx = []
 neon = []
+# Video (multi-picture) encoding. Under construction; off by default.
+video = []
 
 [dependencies]
 

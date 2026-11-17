@@ -47,6 +47,9 @@ pub enum EncodeError {
     },
     /// The attached gain map or its metadata is invalid.
     GainMap(&'static str),
+    /// The video encoder does not support the requested configuration yet.
+    #[cfg(feature = "video")]
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -69,6 +72,8 @@ impl fmt::Display for EncodeError {
                 MAX_DIM
             ),
             EncodeError::GainMap(msg) => write!(f, "Gain map error: {msg}"),
+            #[cfg(feature = "video")]
+            EncodeError::Unsupported(msg) => write!(f, "Unsupported by the video encoder: {msg}"),
         }
     }
 }

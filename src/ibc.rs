@@ -32,17 +32,21 @@
 use std::collections::HashMap;
 
 /// `bv_map` entry for a block that is not an IntraBC copy (intra or palette).
-pub(crate) const BV_INTRA: i32 = i32::MIN;
+pub(crate) const BV_INTRA: FieldEntry = FieldEntry::MIN;
+
+/// One `bv_map` entry: a packed block vector here, or the motion of an inter
+/// block ([`crate::motion::Motion`]) in a video picture.
+pub(crate) type FieldEntry = i64;
 
 /// Pack an integer-sample block vector into a `bv_map` entry.
 #[inline]
-pub(crate) fn pack_bv(x: i16, y: i16) -> i32 {
-    ((x as i32) << 16) | (y as u16 as i32)
+pub(crate) fn pack_bv(x: i16, y: i16) -> FieldEntry {
+    FieldEntry::from(((x as i32) << 16) | (y as u16 as i32))
 }
 
 /// Unpack a `bv_map` entry; `None` for a non-IntraBC block.
 #[inline]
-pub(crate) fn unpack_bv(packed: i32) -> Option<(i16, i16)> {
+pub(crate) fn unpack_bv(packed: FieldEntry) -> Option<(i16, i16)> {
     if packed == BV_INTRA {
         return None;
     }
@@ -54,7 +58,7 @@ pub(crate) fn unpack_bv(packed: i32) -> Option<(i16, i16)> {
 /// PART_2Nx2N copy from the one reference picture, so the only inputs left are
 /// "is either side intra" and the block-vector difference.
 #[inline]
-pub(crate) fn boundary_strength(current: i32, neighbor: i32) -> u8 {
+pub(crate) fn boundary_strength(current: FieldEntry, neighbor: FieldEntry) -> u8 {
     match (unpack_bv(current), unpack_bv(neighbor)) {
         (Some(a), Some(b)) => {
             // The threshold is 4 quarter-pel units, i.e. one integer sample.

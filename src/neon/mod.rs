@@ -28,14 +28,21 @@
  */
 
 mod aq;
+mod deblock;
 mod dequant;
 mod math;
+mod motion;
 mod satd;
 mod transform;
 mod weighted_sse;
 
 pub(crate) use aq::{block_log_variances_neon, ctu_qg_log_variances_neon};
+pub(crate) use deblock::{
+    chroma_horizontal_plane_neon, chroma_vertical_plane_neon, luma_horizontal_plane_neon,
+    luma_vertical_plane_neon,
+};
 pub(crate) use dequant::{dequantize_neon, dequantize_scaled_neon};
+pub(crate) use motion::{bi_average_neon, interpolate_neon, sad_neon};
 pub(crate) use satd::satd_neon;
 pub(crate) use transform::{fwd_transform_neon, inv_transform_neon};
 pub(crate) use weighted_sse::weighted_sse_neon;

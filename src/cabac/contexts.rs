@@ -122,6 +122,10 @@ pub(crate) struct ContextSet {
     pub(crate) part_mode: [CtxModel; 4],
 
     pub(crate) cu_skip_flag: [CtxModel; 3],
+    /// Whether the CU to the left of / above the one being coded is a
+    /// skipped CU. Not a context variable: the CU coder refreshes it before
+    /// each CU of a video P picture, and it stays `false` everywhere else.
+    pub(crate) skip_neighbors: [bool; 2],
     pub(crate) pred_mode_flag: CtxModel,
     pub(crate) merge_flag: CtxModel,
     /// merge_idx and ref_idx exist so the context set matches the decoder's
@@ -134,6 +138,9 @@ pub(crate) struct ContextSet {
     /// abs_mvd_greater0_flag (ctx 0) and abs_mvd_greater1_flag (ctx 1).
     pub(crate) abs_mvd_greater01: [CtxModel; 2],
     pub(crate) mvp_flag: CtxModel,
+    /// inter_pred_idc: contexts 0–3 by coding quadtree depth (PRED_BI or
+    /// not), context 4 for the list of a uni-directional unit.
+    pub(crate) inter_pred_idc: [CtxModel; 5],
     pub(crate) rqt_root_cbf: CtxModel,
 
     /// Palette-mode contexts (SCC). Present in every context set so the WPP
@@ -246,9 +253,11 @@ impl ContextSet {
             ref_idx: arr([153, 153], qp),
             abs_mvd_greater01: arr([140, 198], qp),
             mvp_flag: c(168, qp),
+            inter_pred_idc: arr([95, 79, 63, 31, 31], qp),
             rqt_root_cbf: c(79, qp),
 
             palette: PaletteContexts::init(qp),
+            skip_neighbors: [false; 2],
         }
     }
 
@@ -257,6 +266,14 @@ impl ContextSet {
     /// every context — including the ones only intra CUs use — switches to the
     /// P column of the initialization tables. Values from libde265
     /// `contextmodel.cc`, cross-checked against the sibling `hpvcd` decoder.
+    /// The `cu_skip_flag` context of the CU being coded: its increment counts
+    /// the skipped left and above neighbors (§9.3.4.2.2).
+    #[inline]
+    pub(crate) fn skip_ctx(&mut self) -> &mut CtxModel {
+        let inc = usize::from(self.skip_neighbors[0]) + usize::from(self.skip_neighbors[1]);
+        &mut self.cu_skip_flag[inc]
+    }
+
     pub(crate) fn init_pslice_ext(qp: u8, persistent_rice: bool) -> Self {
         fn c(iv: u8, qp: u8) -> CtxModel {
             CtxModel::init(iv, qp)
@@ -310,9 +327,11 @@ impl ContextSet {
             ref_idx: arr([153, 153], qp),
             abs_mvd_greater01: arr([140, 198], qp),
             mvp_flag: c(168, qp),
+            inter_pred_idc: arr([95, 79, 63, 31, 31], qp),
             rqt_root_cbf: c(79, qp),
 
             palette: PaletteContexts::init(qp),
+            skip_neighbors: [false; 2],
         }
     }
 }

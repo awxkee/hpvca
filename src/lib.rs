@@ -46,6 +46,7 @@ mod intra;
 mod isobmff;
 mod math;
 mod metadata;
+mod motion;
 mod palette;
 mod pool;
 mod sao;
@@ -57,6 +58,8 @@ mod yuv;
 mod avx;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
+#[cfg(feature = "video")]
+pub mod video;
 
 use crate::math::FastRound;
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
